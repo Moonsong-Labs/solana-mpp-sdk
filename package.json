@@ -1,0 +1,40 @@
+{
+  "name": "solana-mpp-sdk",
+  "version": "0.1.0",
+  "description": "Solana payment method for the MPP protocol",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./server": {
+      "types": "./src/server/index.ts",
+      "default": "./src/server/index.ts"
+    },
+    "./client": {
+      "types": "./src/client/index.ts",
+      "default": "./src/client/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "example:server": "npx tsx examples/server.ts",
+    "example:client": "npx tsx examples/client.ts"
+  },
+  "dependencies": {
+    "@solana-program/system": "^0.11.0",
+    "@solana-program/token": "^0.11.0"
+  },
+  "peerDependencies": {
+    "@solana/kit": ">=6.1.0",
+    "mppx": ">=0.3.15"
+  },
+  "devDependencies": {
+    "@solana/kit": "^6.4.0",
+    "@types/node": "^25.5.0",
+    "mppx": "^0.3.15",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
