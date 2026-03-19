@@ -181,23 +181,25 @@ export default function SwigPlayground() {
           </button>
         </div>
 
-        {SWIG_ENDPOINTS.map((entry, index) => (
-          <button
-            key={entry.path}
-            style={{
-              ...s.endpointBtn,
-              background: index === selectedIdx ? '#1A1A2A' : 'transparent',
-              borderColor: index === selectedIdx ? '#9945FF' : '#222',
-            }}
-            onClick={() => {
-              setSelectedIdx(index)
-              setParamValues({})
-            }}
-          >
-            <span style={s.endpointMethod}>{entry.method}</span>
-            <span style={s.endpointDesc}>{entry.description}</span>
-          </button>
-        ))}
+        <div style={s.endpointList}>
+          {SWIG_ENDPOINTS.map((entry, index) => (
+            <button
+              key={entry.path}
+              style={{
+                ...s.endpointBtn,
+                background: index === selectedIdx ? '#1A1A2A' : 'transparent',
+                borderColor: index === selectedIdx ? '#9945FF' : '#222',
+              }}
+              onClick={() => {
+                setSelectedIdx(index)
+                setParamValues({})
+              }}
+            >
+              <span style={s.endpointMethod}>{entry.method}</span>
+              <span style={s.endpointDesc}>{entry.description}</span>
+            </button>
+          ))}
+        </div>
 
         <div style={s.sidebarBottom}>
           <div style={s.infoCard}>
@@ -375,7 +377,8 @@ function shortAddress(value: string | null): string {
 const s: Record<string, React.CSSProperties> = {
   layout: {
     display: 'flex',
-    minHeight: '100vh',
+    height: '100vh',
+    overflow: 'hidden',
     background: '#0A0A0A',
   },
   layoutCompact: {
@@ -387,6 +390,7 @@ const s: Record<string, React.CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     background: '#0D0D0D',
+    overflow: 'hidden',
   },
   sidebarCompact: {
     width: '100%',
@@ -421,6 +425,11 @@ const s: Record<string, React.CSSProperties> = {
     fontSize: 11,
     cursor: 'pointer',
   },
+  endpointList: {
+    flex: 1,
+    overflow: 'auto',
+    minHeight: 0,
+  },
   endpointBtn: {
     display: 'flex',
     alignItems: 'center',
@@ -444,9 +453,11 @@ const s: Record<string, React.CSSProperties> = {
     fontSize: 12,
   },
   sidebarBottom: {
-    marginTop: 'auto',
+    flexShrink: 0,
     padding: 12,
     borderTop: '1px solid #222',
+    overflow: 'auto',
+    maxHeight: '50vh',
   },
   infoCard: {
     padding: 10,
