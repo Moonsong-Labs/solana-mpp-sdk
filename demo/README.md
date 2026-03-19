@@ -39,8 +39,8 @@ npm run demo:app
 
 Open http://localhost:5173 in your browser.
 
-- Charge demo: http://localhost:5173/playground
-- Swig session demo: http://localhost:5173/swig
+- Charge demo: http://localhost:5173/charges
+- Swig session demo: http://localhost:5173/sessions
 
 ### Importing a Wallet
 

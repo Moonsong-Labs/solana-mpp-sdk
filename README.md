@@ -180,8 +180,8 @@ With fee sponsorship, the client partially signs (transfer authority only) and t
 
 An interactive playground with a React frontend and Express backend, running against [Surfpool](https://surfpool.run).
 
-- Charge flow demo: `http://localhost:5173/playground`
-- Swig session demo: `http://localhost:5173/swig`
+- Charge flow demo: `http://localhost:5173/charges`
+- Session flow demo: `http://localhost:5173/sessions`
 
 ```bash
 surfpool start
