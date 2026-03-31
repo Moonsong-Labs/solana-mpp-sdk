@@ -10,6 +10,7 @@ repository = "https://github.com/solana-foundation/mpp-sdk"
 default = ["server", "client"]
 server = ["dep:tokio"]
 client = ["dep:reqwest"]
+gcp_kms = ["solana-keychain/gcp_kms"]
 
 [dependencies]
 # Signing — solana-keychain with sdk-v3 (fix/deps branch pins solana-signature <3.3)
