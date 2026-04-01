@@ -288,6 +288,7 @@ impl Mpp {
     /// Verify a payment credential (simple API).
     ///
     /// Decodes the charge request from the echoed challenge automatically.
+    #[tracing::instrument(skip_all, name = "mpp.verify_credential")]
     pub async fn verify_credential(
         &self,
         credential: &PaymentCredential,
@@ -422,6 +423,7 @@ impl Mpp {
     // ── Settlement ──
 
     /// Pull mode: deserialize tx, optionally co-sign, simulate, broadcast, verify.
+    #[tracing::instrument(skip_all, fields(currency = %request.currency, amount = %request.amount))]
     async fn verify_pull(
         &self,
         transaction_b64: &str,
@@ -440,11 +442,15 @@ impl Mpp {
         let t0 = std::time::Instant::now();
 
         // Verify the transaction instructions BEFORE co-signing or broadcasting.
-        verify_transaction_pre_broadcast(&tx, request, method_details)?;
-        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "verify_pull: pre-broadcast check done");
+        {
+            let _span = tracing::info_span!("pre_broadcast_check").entered();
+            verify_transaction_pre_broadcast(&tx, request, method_details)?;
+        }
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "pre-broadcast check");
 
         // Co-sign if server is fee payer (only after verification passes).
         if method_details.fee_payer.unwrap_or(false) {
+            let _span = tracing::info_span!("kms_cosign").entered();
             let signer = self.fee_payer_signer.as_ref().ok_or_else(|| {
                 VerificationError::new("Fee payer enabled but no signer configured")
             })?;
@@ -467,26 +473,30 @@ impl Mpp {
                 })?;
             tx.signatures[idx] = sig;
         }
-        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "verify_pull: co-sign done");
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "co-sign");
 
         // Simulate before broadcasting (prevent fee loss).
-        let sim = self
-            .rpc
-            .simulate_transaction(&tx)
-            .map_err(|e| VerificationError::network_error(format!("Simulation RPC error: {e}")))?;
-        if let Some(err) = sim.value.err {
-            return Err(VerificationError::transaction_failed(format!(
-                "Simulation failed: {err}"
-            )));
+        {
+            let _span = tracing::info_span!("simulate").entered();
+            let sim = self.rpc.simulate_transaction(&tx).map_err(|e| {
+                VerificationError::network_error(format!("Simulation RPC error: {e}"))
+            })?;
+            if let Some(err) = sim.value.err {
+                return Err(VerificationError::transaction_failed(format!(
+                    "Simulation failed: {err}"
+                )));
+            }
         }
-        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "verify_pull: simulation done");
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "simulate");
 
         // Broadcast.
-        let signature = self
-            .rpc
-            .send_and_confirm_transaction(&tx)
-            .map_err(|e| VerificationError::network_error(format!("Broadcast failed: {e}")))?;
-        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "verify_pull: broadcast confirmed");
+        let signature = {
+            let _span = tracing::info_span!("broadcast").entered();
+            self.rpc
+                .send_and_confirm_transaction(&tx)
+                .map_err(|e| VerificationError::network_error(format!("Broadcast failed: {e}")))?
+        };
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "broadcast confirmed");
 
         Ok(signature.to_string())
     }

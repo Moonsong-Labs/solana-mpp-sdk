@@ -48,6 +48,9 @@ sha2 = "0.10"
 # Time (expiration, timestamps)
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
+# Observability
+tracing = "0.1"
+
 # Errors
 thiserror = "2"
 
