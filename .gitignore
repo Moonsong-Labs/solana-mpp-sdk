@@ -29,3 +29,4 @@ __pycache__/
 .venv/
 *.pyc
 tests/interop/go-client/go-client
+.claude/
