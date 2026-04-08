@@ -1534,6 +1534,9 @@ mod tests {
 
     // ── Mpp::new() config validation tests ──
 
+    /// Guard so that tests touching SECRET_KEY_ENV_VAR don't race each other.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn new_missing_recipient_errors() {
         let err = Mpp::new(Config {
@@ -1566,9 +1569,10 @@ mod tests {
 
     #[test]
     fn new_missing_secret_key_without_env_errors() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Temporarily ensure the env var is not set.
         let prev = std::env::var(SECRET_KEY_ENV_VAR).ok();
-        std::env::remove_var(SECRET_KEY_ENV_VAR);
+        unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
 
         let err = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
@@ -1581,14 +1585,15 @@ mod tests {
 
         // Restore.
         if let Some(v) = prev {
-            std::env::set_var(SECRET_KEY_ENV_VAR, v);
+            unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, v) };
         }
     }
 
     #[test]
     fn new_secret_key_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var(SECRET_KEY_ENV_VAR).ok();
-        std::env::set_var(SECRET_KEY_ENV_VAR, "env-secret");
+        unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, "env-secret") };
 
         let result = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
@@ -1598,9 +1603,9 @@ mod tests {
 
         // Restore before asserting (so we don't leak state on failure).
         if let Some(v) = prev {
-            std::env::set_var(SECRET_KEY_ENV_VAR, v);
+            unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, v) };
         } else {
-            std::env::remove_var(SECRET_KEY_ENV_VAR);
+            unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
         }
 
         assert!(result.is_ok());
