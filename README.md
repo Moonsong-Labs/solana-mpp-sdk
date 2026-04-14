@@ -8,9 +8,6 @@ Solana payment method for the [Machine Payments Protocol](https://mpp.dev).
 
 **MPP** is [an open protocol proposal](https://paymentauth.org) that lets any HTTP API accept payments using the `402 Payment Required` flow.
 
-> [!IMPORTANT]
-> This repository is under active development. The [Solana MPP spec](https://github.com/tempoxyz/mpp-specs/pull/188) is not yet finalized — APIs and wire formats are subject to change.
-
 ## SDK Implementations
 
 The Solana MPP SDK is available in 5 languages. Every implementation follows the same protocol and is tested for cross-language interoperability.
