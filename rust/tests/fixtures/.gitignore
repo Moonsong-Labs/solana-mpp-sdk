@@ -1,0 +1,2 @@
+# The program .so is fetched/built; don't commit it.
+*.so

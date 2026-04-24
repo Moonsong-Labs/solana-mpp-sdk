@@ -11,6 +11,9 @@ default = ["server", "client"]
 server = ["dep:tokio"]
 client = ["dep:reqwest"]
 gcp_kms = ["solana-keychain/gcp_kms"]
+# Pull-mode session support via the multi-delegator program. Not supported in v1.
+# The code compiles under this flag but is untested and undocumented.
+pull-mode = []
 
 [dependencies]
 # Signing — solana-keychain with sdk-v3 (fix/deps branch pins solana-signature <3.3)
@@ -27,6 +30,32 @@ solana-signature = { version = "3.1", default-features = false, features = ["def
 solana-system-interface = { version = "2.0", default-features = false }
 solana-transaction = { version = "3.0", default-features = false }
 solana-transaction-status = { version = "3.1", default-features = false }
+
+# Added for payment-channels session (X3 fix). These crates are used only by the
+# session module. `rust/src/client/charge.rs` still hand-rolls its own blocking
+# RPC client, hand-rolled ComputeBudget ixs (lines 182-201, 501-527), and
+# hardcoded program IDs (lines 182-193). Aligning `charge.rs` with these new
+# deps is deferred as tech debt (see the "Follow-up: align charge.rs" note).
+# Tracking issue: TBD.
+solana-client = { version = "3.1", default-features = false }            # nonblocking::rpc_client::RpcClient, rpc_config::RpcAccountInfoConfig
+solana-sdk-ids = { version = "3.1", default-features = false }           # ed25519_program, sysvar::instructions
+solana-compute-budget-interface = { version = "3.0", default-features = false }  # ComputeBudgetInstruction builder (highest published 3.x is 3.0.0)
+spl-token = { version = "8", default-features = false }                  # classic SPL Token Program ID (v1: Token-2022 rejected at process_open)
+spl-token-2022 = { version = "8" }                                       # Token-2022 program ID, imported ONLY so the S3-M5 mint-owner check rejects it. Defaults required: v8 fails to compile with default-features = false (confidential_mint_burn references zk-ops-gated fn unconditionally).
+spl-associated-token-account-client = { version = "2", default-features = false }  # create_associated_token_account_idempotent (highest published is 2.0.0)
+
+# Upstream Codama-generated client for payment_channels. Pinned by rev; Cargo.lock
+# records the resolved revision. The `fetch` feature enables the optional
+# solana-client RPC helpers that `fetch_channel` / `fetch_maybe_channel` depend
+# on; leave it on by default.
+#
+# NOTE (rustc floor): `clients/rust/Cargo.toml` upstream declares
+# `edition = "2024"`, which requires rustc `>= 1.85`. Adding this dep raises
+# the SDK workspace's effective rustc floor to 1.85 transitively. If CI pins
+# an older toolchain, bump it alongside this dep; otherwise `cargo check`
+# fails with an "edition 2024 is unstable" style error before any SDK code
+# runs.
+payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "7ea24f4fc33f6c38cdab94c146184b3fcf5d6559", features = ["fetch"] }
 
 # Async
 tokio = { version = "1", features = ["full"], optional = true }
@@ -62,3 +91,13 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
+
+# Dev-only: used by session_l0_precompile.rs and the L1 integration oracles.
+# `solana-sdk` provides `Keypair`, `Transaction`, and
+# `ed25519_instruction::new_ed25519_instruction_with_signature` (the L0
+# oracle's canonical comparator). The 3.x line published to crates.io stops
+# at 3.0.0, so we pin `3.0` rather than the sibling 3.1 track used by the
+# atomic solana-* crates above; this is the highest published 3.x release.
+solana-sdk = { version = "3.0", default-features = false }
+# `ed25519-dalek` is already declared in [dependencies] above (used by the
+# voucher verification path), so it is not re-declared here.
