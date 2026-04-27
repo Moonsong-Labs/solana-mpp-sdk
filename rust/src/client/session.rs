@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports, unused_variables)]
-// Draft module pending rewrite alongside the high-level wiring layer.
+// Draft module: kept in tree as reference for the eventual rewrite, but
+// excluded from every build via the always-false `cfg(any())` gate below.
 #![cfg(any())]
 
 //! Client-side session intent implementation.

@@ -1,1 +1,1 @@
-//! Module stub: implementation lands in later commits (thin orchestration wrappers over Codama ixs).
+//! Module stub: thin orchestration wrappers over Codama-generated instructions. Not yet implemented.

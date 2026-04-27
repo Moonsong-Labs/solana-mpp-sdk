@@ -5,8 +5,8 @@
 //!   (Voucher shape; Borsh-signed bytes).
 //! - `solana-foundation/mpp-specs` — `draft-solana-session-00` (envelope shape).
 //!
-//! Divergences vs draft-00 are recorded in the SDK protocol notes. Notable: vouchers
-//! are signed over Borsh 48 bytes, not JCS JSON.
+//! Notable divergence vs draft-00: vouchers are signed over the 48-byte Borsh
+//! payload (`build_signed_payload`), not over JCS-canonical JSON.
 
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +78,8 @@ pub struct MethodDetails {
     /// the open/topup/close tx; server commits to this value for the co-sign and
     /// will NOT refresh it. If the blockhash expires before submit, the client
     /// must fetch a fresh 402 challenge and rebuild the tx. Present whenever
-    /// `fee_payer_key` is present (Model 1, server-provided preimage).
+    /// `fee_payer_key` is present (the server-co-signed flow, where the server
+    /// supplies both the fee payer and the blockhash the client must build over).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recent_blockhash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -196,9 +197,8 @@ pub struct OpenPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TopUpPayload {
-    // NOTE: the topup flow binds the on-chain top_up to the challenge issued in
-    // the prior 402, so a topup not preceded by a fresh challenge is rejected.
-    // The protocol doc must be updated to include this field before v1 ships.
+    // The topup flow binds the on-chain `top_up` to the challenge issued in the
+    // prior 402, so a topup not preceded by a fresh challenge is rejected.
     pub challenge_id: String,
     pub channel_id: String,
     pub additional_amount: String,

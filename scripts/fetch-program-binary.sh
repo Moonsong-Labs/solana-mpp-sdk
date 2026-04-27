@@ -83,11 +83,18 @@ if [[ -z "$EXPECTED" ]]; then
   echo "[BOOTSTRAP] writing hash for $FIXTURE"
   echo "$ACTUAL  payment_channels.so" > "$HASH_FILE"
 elif [[ "$ACTUAL" != "$EXPECTED_HASH" ]]; then
-  echo "BINARY HASH MISMATCH" >&2
-  echo "  expected: $EXPECTED_HASH" >&2
-  echo "  actual:   $ACTUAL  payment_channels.so" >&2
-  echo "Update program_binary.sha256 via --bootstrap if intentional (toolchain bump)." >&2
-  exit 1
+  if [[ "$BOOTSTRAP" -eq 1 ]]; then
+    echo "[BOOTSTRAP] hash changed; overwriting $HASH_FILE"
+    echo "  previous: $EXPECTED_HASH"
+    echo "  new:      $ACTUAL"
+    echo "$ACTUAL  payment_channels.so" > "$HASH_FILE"
+  else
+    echo "BINARY HASH MISMATCH" >&2
+    echo "  expected: $EXPECTED_HASH" >&2
+    echo "  actual:   $ACTUAL  payment_channels.so" >&2
+    echo "Update program_binary.sha256 via --bootstrap if intentional (toolchain bump)." >&2
+    exit 1
+  fi
 fi
 
 echo "program binary OK: $FIXTURE ($ACTUAL)"

@@ -4,7 +4,7 @@
 //! program uses; otherwise `open` creates an account the program cannot
 //! rediscover, and subsequent calls fail with a seeds mismatch. These tests
 //! pin the derivation against determinism, salt sensitivity, authorized-signer
-//! sensitivity, and canonical-bump invariance.
+//! sensitivity, payer/payee/mint sensitivity, and canonical-bump invariance.
 
 use solana_mpp::program::payment_channels::state::find_channel_pda;
 use solana_pubkey::Pubkey;
@@ -47,6 +47,48 @@ fn pda_differs_on_authorized_signer_change() {
 
     let (pda_a, _) = find_channel_pda(&payer, &payee, &mint, &s1, 1, &program_id);
     let (pda_b, _) = find_channel_pda(&payer, &payee, &mint, &s2, 1, &program_id);
+    assert_ne!(pda_a, pda_b);
+}
+
+#[test]
+fn pda_differs_on_payer_change() {
+    let p1 = Pubkey::new_from_array([1u8; 32]);
+    let p2 = Pubkey::new_from_array([2u8; 32]);
+    let payee = Pubkey::new_from_array([3u8; 32]);
+    let mint = Pubkey::new_from_array([4u8; 32]);
+    let signer = Pubkey::new_from_array([5u8; 32]);
+    let program_id = Pubkey::new_from_array([6u8; 32]);
+
+    let (pda_a, _) = find_channel_pda(&p1, &payee, &mint, &signer, 1, &program_id);
+    let (pda_b, _) = find_channel_pda(&p2, &payee, &mint, &signer, 1, &program_id);
+    assert_ne!(pda_a, pda_b);
+}
+
+#[test]
+fn pda_differs_on_payee_change() {
+    let payer = Pubkey::new_from_array([1u8; 32]);
+    let p1 = Pubkey::new_from_array([2u8; 32]);
+    let p2 = Pubkey::new_from_array([3u8; 32]);
+    let mint = Pubkey::new_from_array([4u8; 32]);
+    let signer = Pubkey::new_from_array([5u8; 32]);
+    let program_id = Pubkey::new_from_array([6u8; 32]);
+
+    let (pda_a, _) = find_channel_pda(&payer, &p1, &mint, &signer, 1, &program_id);
+    let (pda_b, _) = find_channel_pda(&payer, &p2, &mint, &signer, 1, &program_id);
+    assert_ne!(pda_a, pda_b);
+}
+
+#[test]
+fn pda_differs_on_mint_change() {
+    let payer = Pubkey::new_from_array([1u8; 32]);
+    let payee = Pubkey::new_from_array([2u8; 32]);
+    let m1 = Pubkey::new_from_array([3u8; 32]);
+    let m2 = Pubkey::new_from_array([4u8; 32]);
+    let signer = Pubkey::new_from_array([5u8; 32]);
+    let program_id = Pubkey::new_from_array([6u8; 32]);
+
+    let (pda_a, _) = find_channel_pda(&payer, &payee, &m1, &signer, 1, &program_id);
+    let (pda_b, _) = find_channel_pda(&payer, &payee, &m2, &signer, 1, &program_id);
     assert_ne!(pda_a, pda_b);
 }
 

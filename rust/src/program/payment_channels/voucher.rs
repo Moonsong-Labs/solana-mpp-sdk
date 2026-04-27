@@ -1,4 +1,4 @@
-//! Voucher signed-payload builder (Contract 1) and off-chain verification.
+//! Voucher signed-payload builder and off-chain verification.
 //!
 //! This module owns the 48-byte payload the authorized signer signs over for
 //! `settle` / `settleAndFinalize`. The on-chain layout is:

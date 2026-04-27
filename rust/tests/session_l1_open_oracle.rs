@@ -1,5 +1,5 @@
-//! L1 integration oracle for Contract 3 (Channel PDA derivation) and the
-//! SDK's open-ix account wiring.
+//! L1 integration oracle for `find_channel_pda` (Channel PDA derivation) and
+//! the SDK's open-ix account wiring.
 //!
 //! Loads the pinned program binary into litesvm, sets up a real SPL mint +
 //! payer ATA + channel ATA, derives the canonical PDA via the SDK's

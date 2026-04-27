@@ -13,8 +13,8 @@
 //! Rust values and never reach into the program boundary layout directly.
 
 // SDK-owned byte-contract implementations.
-pub mod voucher;  // Contract 1: 48-byte signed payload + Contract 2 composer (build_verify_ix)
-pub mod state;    // Contract 3: Channel PDA derivation + typed ChannelView
+pub mod voucher;  // 48-byte signed voucher payload + 160-byte ed25519 precompile ix composer
+pub mod state;    // Channel PDA derivation + typed ChannelView
 
 // SDK-owned orchestration and RPC helpers.
 pub mod ix;

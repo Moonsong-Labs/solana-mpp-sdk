@@ -5,7 +5,7 @@
 
 use payment_channels_client::types::ChannelStatus;
 use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
-use solana_client::client_error::ClientErrorKind;
+use solana_client::client_error::{ClientError, ClientErrorKind};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::RpcError;
@@ -36,15 +36,12 @@ fn account_info_config(commitment: CommitmentConfig) -> RpcAccountInfoConfig {
 /// return (`LegacyBinary` / `Base58` / `Base64` / `Base64Zstd`); it only
 /// returns `None` for `JsonParsed`, which we never request via
 /// `account_info_config`. Any `None` here therefore signals the RPC
-/// returned a shape we did not ask for, and is reported as a generic
-/// `Rpc` error rather than a new variant.
+/// returned a shape we did not ask for, and is surfaced as the typed
+/// `VerifyError::UnexpectedEncoding` variant.
 fn decode_ui_account(channel_id: &Pubkey, ui: &UiAccount) -> Result<Vec<u8>, VerifyError> {
-    ui.data.decode().ok_or_else(|| {
-        VerifyError::Rpc(format!(
-            "failed to decode UiAccount data for channel {channel_id}: \
-             unexpected encoding (expected Base64)"
-        ))
-    })
+    ui.data
+        .decode()
+        .ok_or(VerifyError::UnexpectedEncoding { channel_id: *channel_id })
 }
 
 /// Per-field on-chain state mismatches. Each variant carries the typed
@@ -65,6 +62,10 @@ pub enum Mismatch {
     Status { expected: u8, got: u8 },
     #[error("grace period mismatch: expected {expected}, got {got}")]
     GracePeriod { expected: u32, got: u32 },
+    /// Reserved for callers that need to verify a specific closure timestamp
+    /// (e.g. confirming a finalize landed within an expected window). No
+    /// helper currently constructs this variant; `verify_closing` only checks
+    /// that closure has started via `ClosureNotStarted`.
     #[error("closure_started_at mismatch: expected {expected}, got {got}")]
     ClosureStartedAt { expected: i64, got: i64 },
     #[error("payer mismatch: expected {expected}, got {got}")]
@@ -101,10 +102,12 @@ pub enum VerifyError {
     NotTombstoned { data_len: usize },
     #[error(transparent)]
     Mismatch(#[from] Mismatch),
-    #[error("rpc error: {0}")]
-    Rpc(String),
+    #[error("unexpected RPC encoding for channel {channel_id}: expected Base64")]
+    UnexpectedEncoding { channel_id: Pubkey },
+    #[error(transparent)]
+    Rpc(#[from] ClientError),
     #[error("channel decode failed: {0}")]
-    Decode(String),
+    Decode(#[from] std::io::Error),
 }
 
 pub struct ExpectedOpenState {
@@ -138,8 +141,7 @@ pub async fn verify_open(
 ) -> Result<(), VerifyError> {
     let ui_account = rpc
         .get_ui_account_with_config(channel_id, account_info_config(commitment))
-        .await
-        .map_err(|e| VerifyError::Rpc(format!("{e}")))?
+        .await?
         .value
         .ok_or(VerifyError::NotFound)?;
 
@@ -149,8 +151,7 @@ pub async fn verify_open(
         return Err(VerifyError::Tombstoned);
     }
 
-    let view = ChannelView::from_account_data(&data)
-        .map_err(|e| VerifyError::Decode(format!("failed to decode Channel PDA account: {e}")))?;
+    let view = ChannelView::from_account_data(&data)?;
 
     if view.version() != 1 {
         return Err(Mismatch::Version { got: view.version() }.into());
@@ -217,16 +218,24 @@ pub async fn verify_topup(
 ) -> Result<(), VerifyError> {
     let ui_account = rpc
         .get_ui_account_with_config(channel_id, account_info_config(commitment))
-        .await
-        .map_err(|e| VerifyError::Rpc(format!("{e}")))?
+        .await?
         .value
         .ok_or(VerifyError::NotFound)?;
     let data = decode_ui_account(channel_id, &ui_account)?;
     if data.len() == 8 {
         return Err(VerifyError::Tombstoned);
     }
-    let view = ChannelView::from_account_data(&data)
-        .map_err(|e| VerifyError::Decode(format!("failed to decode Channel PDA account: {e}")))?;
+    let view = ChannelView::from_account_data(&data)?;
+    if view.version() != 1 {
+        return Err(Mismatch::Version { got: view.version() }.into());
+    }
+    if view.status() != ChannelStatus::Open as u8 {
+        return Err(Mismatch::Status {
+            expected: ChannelStatus::Open as u8,
+            got: view.status(),
+        }
+        .into());
+    }
     if view.deposit() != expected_new_deposit {
         return Err(Mismatch::Deposit {
             expected: expected_new_deposit,
@@ -247,16 +256,14 @@ pub async fn verify_settled(
 ) -> Result<(), VerifyError> {
     let ui_account = rpc
         .get_ui_account_with_config(channel_id, account_info_config(commitment))
-        .await
-        .map_err(|e| VerifyError::Rpc(format!("{e}")))?
+        .await?
         .value
         .ok_or(VerifyError::NotFound)?;
     let data = decode_ui_account(channel_id, &ui_account)?;
     if data.len() == 8 {
         return Err(VerifyError::Tombstoned);
     }
-    let view = ChannelView::from_account_data(&data)
-        .map_err(|e| VerifyError::Decode(format!("failed to decode Channel PDA account: {e}")))?;
+    let view = ChannelView::from_account_data(&data)?;
 
     if view.version() != 1 {
         return Err(Mismatch::Version { got: view.version() }.into());
@@ -290,16 +297,14 @@ pub async fn verify_closing(
 ) -> Result<(), VerifyError> {
     let ui_account = rpc
         .get_ui_account_with_config(channel_id, account_info_config(commitment))
-        .await
-        .map_err(|e| VerifyError::Rpc(format!("{e}")))?
+        .await?
         .value
         .ok_or(VerifyError::NotFound)?;
     let data = decode_ui_account(channel_id, &ui_account)?;
     if data.len() == 8 {
         return Err(VerifyError::Tombstoned);
     }
-    let view = ChannelView::from_account_data(&data)
-        .map_err(|e| VerifyError::Decode(format!("failed to decode Channel PDA account: {e}")))?;
+    let view = ChannelView::from_account_data(&data)?;
 
     if view.version() != 1 {
         return Err(Mismatch::Version { got: view.version() }.into());
@@ -378,7 +383,7 @@ async fn tombstone_probe(
             ClientErrorKind::RpcError(RpcError::RpcResponseError { code: -32004, .. }) => {
                 Ok(TombstoneProbe::Absent)
             }
-            _ => Err(VerifyError::Rpc(format!("{e}"))),
+            _ => Err(e.into()),
         },
     }
 }

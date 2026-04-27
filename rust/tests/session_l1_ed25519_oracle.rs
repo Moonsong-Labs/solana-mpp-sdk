@@ -1,4 +1,5 @@
-//! L1 integration oracle for Contract 2 (160-byte ed25519 precompile ix).
+//! L1 integration oracle for the 160-byte ed25519 precompile instruction
+//! layout produced by `build_verify_ix`.
 //!
 //! Submits a transaction containing ONLY `build_verify_ix(...)` against
 //! Solana's native ed25519 precompile inside litesvm. If the SDK builder's

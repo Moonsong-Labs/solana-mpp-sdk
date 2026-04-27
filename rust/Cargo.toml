@@ -2,6 +2,7 @@
 name = "solana-mpp"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Solana payment method for the Machine Payments Protocol"
 license = "MIT"
 repository = "https://github.com/solana-foundation/mpp-sdk"
@@ -32,19 +33,17 @@ solana-system-interface = { version = "2.0", default-features = false }
 solana-transaction = { version = "3.0", default-features = false }
 solana-transaction-status = { version = "3.1", default-features = false }
 
-# Added for payment-channels session (X3 fix). These crates are used only by the
-# session module. `rust/src/client/charge.rs` still hand-rolls its own blocking
-# RPC client, hand-rolled ComputeBudget ixs (lines 182-201, 501-527), and
-# hardcoded program IDs (lines 182-193). Aligning `charge.rs` with these new
-# deps is deferred as tech debt (see the "Follow-up: align charge.rs" note).
-# Tracking issue: TBD.
+# Added for the payment-channels session module. These crates are used only by
+# that module. `rust/src/client/charge.rs` still hand-rolls its own blocking
+# RPC client, ComputeBudget ixs (lines 182-201, 501-527), and program IDs
+# (lines 182-193); aligning it with these new deps is deferred as tech debt.
 solana-client = { version = "3.1", default-features = false }            # nonblocking::rpc_client::RpcClient, rpc_config::RpcAccountInfoConfig
 solana-account-decoder-client-types = { version = "3.1", default-features = false } # UiAccount + UiAccountEncoding for get_ui_account_with_config (replaces deprecated get_account_with_config)
 solana-sdk-ids = { version = "3.1", default-features = false }           # ed25519_program, sysvar::instructions
 solana-ed25519-program = { version = "3.0", default-features = false }   # canonical builder for the ed25519 precompile instruction (extracted out of solana-sdk on the 3.x track)
 solana-compute-budget-interface = { version = "3.0", default-features = false }  # ComputeBudgetInstruction builder (highest published 3.x is 3.0.0)
 spl-token = { version = "8", default-features = false }                  # classic SPL Token Program ID (v1: Token-2022 rejected at process_open)
-spl-token-2022 = { version = "8" }                                       # Token-2022 program ID, imported ONLY so the S3-M5 mint-owner check rejects it. Defaults required: v8 fails to compile with default-features = false (confidential_mint_burn references zk-ops-gated fn unconditionally).
+spl-token-2022 = { version = "8" }                                       # Token-2022 program ID, imported ONLY so the open-ix mint-owner check can reject Token-2022 mints in v1. Defaults required: v8 fails to compile with default-features = false (confidential_mint_burn references zk-ops-gated fn unconditionally).
 spl-associated-token-account-client = { version = "2", default-features = false }  # create_associated_token_account_idempotent (highest published is 2.0.0)
 
 # Upstream Codama-generated client for payment_channels. Pinned by rev; Cargo.lock
@@ -112,7 +111,7 @@ solana-sdk = { version = "3.0", default-features = false, features = ["full"] }
 # `program/payment_channels/Cargo.toml`; we match those pins so toolchain
 # drift on these deps is bounded by upstream's own choice. The `precompiles`
 # feature on `litesvm` registers the native ed25519 precompile so the
-# Contract 2 oracle can submit a precompile-only tx without loading the
+# precompile-layout oracle can submit a precompile-only tx without loading the
 # program binary.
 litesvm = { version = "0.11", features = ["precompiles"] }
 litesvm-token = "0.11"
