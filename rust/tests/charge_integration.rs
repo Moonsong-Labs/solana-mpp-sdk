@@ -14,6 +14,19 @@ use std::sync::Arc;
 use surfpool_sdk::{Keypair, Signer, Surfnet};
 use tokio::time::{sleep, Duration};
 
+const SURFPOOL_DATASOURCE_RPC_URL_ENV: &str = "SURFPOOL_DATASOURCE_RPC_URL";
+
+async fn start_surfnet() -> Surfnet {
+    let datasource_rpc_url = std::env::var(SURFPOOL_DATASOURCE_RPC_URL_ENV)
+        .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+
+    Surfnet::builder()
+        .remote_rpc_url(datasource_rpc_url)
+        .start()
+        .await
+        .unwrap()
+}
+
 /// Create a funded signer using surfpool cheatcodes.
 fn fund_signer(surfnet: &Surfnet) -> Arc<dyn solana_mpp::solana_keychain::SolanaSigner> {
     use solana_mpp::solana_keychain::memory::MemorySigner;
@@ -45,7 +58,7 @@ async fn wait_for_surfnet(surfnet: &Surfnet) {
 #[serial_test::serial]
 async fn sol_charge_full_flow() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::start().await.unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
     surfnet
         .cheatcodes()
@@ -90,7 +103,7 @@ async fn sol_charge_full_flow() {
 #[serial_test::serial]
 async fn sol_charge_wrong_amount_rejected_before_broadcast() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::start().await.unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
     surfnet
         .cheatcodes()
@@ -160,7 +173,7 @@ async fn sol_charge_wrong_amount_rejected_before_broadcast() {
 async fn sol_charge_wrong_recipient_rejected_before_broadcast() {
     let real_recipient = Keypair::new();
     let wrong_recipient = Keypair::new();
-    let surfnet = Surfnet::start().await.unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
     surfnet
         .cheatcodes()
@@ -223,7 +236,7 @@ async fn sol_charge_wrong_recipient_rejected_before_broadcast() {
 #[serial_test::serial]
 async fn sol_charge_replay_rejected() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::start().await.unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
     surfnet
         .cheatcodes()
@@ -274,7 +287,7 @@ async fn sol_charge_replay_rejected() {
 #[serial_test::serial]
 async fn sol_charge_expired_challenge_rejected() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::start().await.unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
     surfnet
         .cheatcodes()
@@ -325,7 +338,7 @@ async fn sol_charge_expired_challenge_rejected() {
 #[serial_test::serial]
 async fn sol_charge_www_authenticate_roundtrip() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::start().await.unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
     surfnet
         .cheatcodes()
@@ -373,11 +386,7 @@ async fn sol_charge_www_authenticate_roundtrip() {
 #[serial_test::serial]
 async fn usdc_charge_full_flow() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::builder()
-        .remote_rpc_url("https://api.mainnet-beta.solana.com")
-        .start()
-        .await
-        .unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
 
     surfnet
@@ -457,11 +466,7 @@ async fn usdc_charge_full_flow() {
 #[serial_test::serial]
 async fn usdc_charge_wrong_amount_no_broadcast() {
     let recipient = Keypair::new();
-    let surfnet = Surfnet::builder()
-        .remote_rpc_url("https://api.mainnet-beta.solana.com")
-        .start()
-        .await
-        .unwrap();
+    let surfnet = start_surfnet().await;
     wait_for_surfnet(&surfnet).await;
 
     surfnet
