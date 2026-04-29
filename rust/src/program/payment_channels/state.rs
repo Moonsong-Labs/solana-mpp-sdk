@@ -83,10 +83,10 @@ impl ChannelView {
 // takes `[u8; 32]`, so we go through `.to_bytes()` on the way out; both
 // types are wire-equivalent.
 //
-// Only the accessors required by `verify.rs` are exposed today (YAGNI).
-// Future call sites that need additional Channel fields (e.g. `paid_out`,
-// `payer_withdrawn_at`, `discriminator`) should add them alongside the call
-// site that uses them.
+// Only the accessors required by `verify.rs` and the L1 oracles are exposed
+// today. Future call sites that need additional Channel fields
+// (e.g. `paid_out`, `discriminator`) should add them alongside the call site
+// that uses them.
 impl ChannelView {
     pub fn version(&self) -> u8 {
         self.inner.version
@@ -105,6 +105,13 @@ impl ChannelView {
     }
     pub fn closure_started_at(&self) -> i64 {
         self.inner.closure_started_at
+    }
+    /// Unix ts of the payer's one-shot refund via `withdraw_payer`; 0 means
+    /// the `deposit - settled` refund leg has not run yet. Always 0 for
+    /// `Open` and `Closing` channels; advances once the channel is in
+    /// `Finalized`.
+    pub fn payer_withdrawn_at(&self) -> i64 {
+        self.inner.payer_withdrawn_at
     }
     pub fn grace_period(&self) -> u32 {
         self.inner.grace_period
