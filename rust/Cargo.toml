@@ -57,7 +57,7 @@ spl-associated-token-account-client = { version = "2", default-features = false 
 # an older toolchain, bump it alongside this dep; otherwise `cargo check`
 # fails with an "edition 2024 is unstable" style error before any SDK code
 # runs.
-payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "5e35626000a98b97b70fa2dab60f7455c9c5d091", features = ["fetch"] }
+payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "e211ccbacafff08f486d030e9d03cfd2261b239a", features = ["fetch"] }
 
 # Async
 tokio = { version = "1", features = ["full"], optional = true }
