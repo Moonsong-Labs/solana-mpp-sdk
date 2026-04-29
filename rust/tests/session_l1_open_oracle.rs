@@ -8,10 +8,12 @@
 //! submits. Upstream's `open` validates the PDA seeds and full account
 //! list; if either diverges, the tx fails.
 
+mod common;
+
+use common::{program_id_address, program_id_mpp, program_so_path, to_mpp};
 use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::OpenBuilder;
-use payment_channels_client::programs::PAYMENT_CHANNELS_ID;
 use payment_channels_client::types::{DistributionEntry, DistributionRecipients, OpenArgs};
 use solana_address::Address;
 use solana_message::Message;
@@ -21,22 +23,6 @@ use solana_pubkey_v2::Pubkey as AtaPubkey;
 use solana_sdk::{signature::Keypair, signer::Signer as _, transaction::Transaction};
 use solana_sdk_ids::{system_program, sysvar};
 use spl_associated_token_account_client::address::get_associated_token_address_with_program_id;
-
-fn program_so_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/payment_channels.so")
-}
-
-fn program_id_address() -> Address {
-    PAYMENT_CHANNELS_ID
-}
-
-fn program_id_mpp() -> MppPubkey {
-    MppPubkey::new_from_array(PAYMENT_CHANNELS_ID.to_bytes())
-}
-
-fn to_mpp(addr: &Address) -> MppPubkey {
-    MppPubkey::new_from_array(addr.to_bytes())
-}
 
 #[test]
 fn sdk_built_open_tx_lands_against_loaded_program() {

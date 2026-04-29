@@ -174,12 +174,18 @@ l1-oracle-ed25519:
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_ed25519_oracle -- --nocapture
 
 # Run the open-ix + PDA oracle. Requires the pinned program .so to be fetched
-# into rust/tests/fixtures. The single test is currently #[ignore]'d (pending
-# the upstream splits-canonicalization design that pins OpenArgs and
-# event_authority), so this recipe currently reports "0 run / 1 ignored".
-# Once the design lands and the placeholders go away, strip the #[ignore]
-# attribute on the test and this recipe becomes a real integration check.
+# into rust/tests/fixtures. Submits an SDK-built `open` against the loaded
+# program and asserts the resulting Channel PDA records the canonical bump.
 l1-oracle-open:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_open_oracle -- --nocapture
+
+# Run the top_up oracle. Requires the pinned program .so. Opens a channel
+# via the upstream `OpenBuilder`, submits a `top_up` ix via `TopUpBuilder`,
+# and asserts the SDK-decoded `ChannelView` shows the deposit advancing by
+# exactly the top-up amount with status / version / settled untouched.
+l1-oracle-topup:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_topup_oracle -- --nocapture
