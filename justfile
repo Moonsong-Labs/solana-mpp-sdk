@@ -189,3 +189,12 @@ l1-oracle-topup:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_topup_oracle -- --nocapture
+
+# Run the distribute oracle. Requires the pinned program .so. Opens a
+# channel via OpenBuilder with two bps recipients, settles one voucher
+# via SettleBuilder + ed25519 precompile, then submits a DistributeBuilder
+# tx and asserts each recipient ATA holds its floor share.
+l1-oracle-distribute:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_distribute_oracle -- --nocapture

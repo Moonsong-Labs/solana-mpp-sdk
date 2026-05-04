@@ -85,8 +85,8 @@ impl ChannelView {
 //
 // Only the accessors required by `verify.rs` and the L1 oracles are exposed
 // today. Future call sites that need additional Channel fields
-// (e.g. `paid_out`, `discriminator`) should add them alongside the call site
-// that uses them.
+// (e.g. `discriminator`) should add them alongside the call site that uses
+// them.
 impl ChannelView {
     pub fn version(&self) -> u8 {
         self.inner.version
@@ -102,6 +102,14 @@ impl ChannelView {
     }
     pub fn settled(&self) -> u64 {
         self.inner.settled
+    }
+    /// Cumulative amount the program has paid out across all `distribute`
+    /// calls so far. The next `distribute` only moves `settled - paid_out`,
+    /// so a stale `paid_out` would let a duplicate `distribute` re-pay the
+    /// same pool until escrow runs dry. The L1 distribute oracle asserts
+    /// this advances by the distributed sum to close that regression class.
+    pub fn paid_out(&self) -> u64 {
+        self.inner.paid_out
     }
     pub fn closure_started_at(&self) -> i64 {
         self.inner.closure_started_at
