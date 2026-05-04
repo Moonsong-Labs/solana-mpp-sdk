@@ -119,7 +119,7 @@ pub struct MethodDetails {
     ///
     /// `wire_to_typed` enforces the per-entry bounds; the sum check and the
     /// translation into the `distribution_hash` preimage stay with the
-    /// canonicalization layer (`splits_ext.rs`).
+    /// canonicalization layer (`splits.rs`).
     ///
     /// Note that the on-chain account at the currently pinned upstream rev
     /// still records fixed per-recipient amounts. The bps form here is the

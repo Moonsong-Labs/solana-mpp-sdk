@@ -20,5 +20,7 @@ pub mod state;    // Channel PDA derivation + typed ChannelView
 pub mod ix;
 pub mod verify;
 
-// Placeholder until the upstream splits-canonicalization design lands.
-pub mod splits_ext;
+// SDK-owned splits canonicalization. Mirrors upstream's preimage layout
+// and blake3 digest path so the SDK can compute distribution_hash values
+// that match what the on-chain `distribute` ix expects.
+pub mod splits;
