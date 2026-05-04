@@ -90,6 +90,13 @@ pub enum Mismatch {
     },
     #[error("closure not started: closure_started_at == 0 but verify_closing was called")]
     ClosureNotStarted,
+    #[error("distribution_hash mismatch: expected {expected_b58}, got {got_b58}",
+        expected_b58 = bs58::encode(expected).into_string(),
+        got_b58 = bs58::encode(got).into_string())]
+    DistributionHash {
+        expected: [u8; 32],
+        got: [u8; 32],
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,22 +129,23 @@ pub struct ExpectedOpenState {
 /// Fetch the Channel PDA at the caller-supplied commitment (typically
 /// `SessionConfig::commitment`; defaults to `Confirmed`) and assert the
 /// post-`open` invariants: account exists, not tombstoned, supported
-/// version, status `Open`, and every persistent field matches `expected`.
+/// version, status `Open`, every persistent identity field matches
+/// `expected`, and the on-chain `distribution_hash` matches the off-chain
+/// digest of `expected_splits`.
 ///
-/// The on-chain `Channel.distribution_hash` field is intentionally NOT
-/// verified here. The hash is computed from the splits canonicalization
-/// helper, and that helper is not yet finalized (see `splits_ext`). Once the
-/// canonicalization ships, splits-aware verification lands as a separate
-/// function (sketched as `verify_distribution_hash(rpc, commitment,
-/// channel_id, expected_hash) -> Result<(), VerifyError>` for callers to
-/// compose alongside `verify_open`). Keeping the splits check out of
-/// `verify_open` keeps the always-knowable invariants in one place and
-/// avoids the "optional forever, mandatory in practice" anti-pattern.
+/// `expected_splits` is a borrowed slice of the SDK's typed `Split` (the
+/// typed twin of the wire `BpsSplit`); the body converts to upstream
+/// `DistributionEntry` internally via the `From<&Split>` impls. `&[]` is
+/// the legal zero-recipients case (vanilla payer-payee channel, payee
+/// receives the full pool at distribute via the implicit-remainder rule).
+/// The hash check runs last so the cheaper field comparisons can
+/// short-circuit first.
 pub async fn verify_open(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
     expected: &ExpectedOpenState,
+    expected_splits: &[crate::protocol::intents::session::Split],
 ) -> Result<(), VerifyError> {
     let ui_account = rpc
         .get_ui_account_with_config(channel_id, account_info_config(commitment))
@@ -205,6 +213,20 @@ pub async fn verify_open(
         }
         .into());
     }
+
+    let expected_entries: Vec<payment_channels_client::types::DistributionEntry> =
+        expected_splits.iter().map(Into::into).collect();
+    let expected_hash =
+        crate::program::payment_channels::splits::distribution_hash(&expected_entries);
+    let got_hash = view.distribution_hash();
+    if got_hash != expected_hash {
+        return Err(Mismatch::DistributionHash {
+            expected: expected_hash,
+            got: got_hash,
+        }
+        .into());
+    }
+
     Ok(())
 }
 
