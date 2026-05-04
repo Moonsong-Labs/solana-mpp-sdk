@@ -30,7 +30,7 @@ fn single_entry_pins_layout_and_hash() {
         recipient: Address::new_from_array([0x11; 32]),
         bps: 1234,
     };
-    let preimage = canonical_preimage(&[entry.clone()]);
+    let preimage = canonical_preimage(std::slice::from_ref(&entry));
 
     let mut expected = Vec::with_capacity(35);
     expected.push(1u8);                       // count
