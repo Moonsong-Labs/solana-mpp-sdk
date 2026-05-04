@@ -121,3 +121,24 @@ litesvm-token = "0.11"
 # `solana-pubkey` 3.x; the 2.x line is already in the lockfile transitively, but
 # we need the type in scope at the call site to bridge through bytes.
 solana-pubkey-v2 = { package = "solana-pubkey", version = "2", default-features = false }
+
+# Targets that depend on feature-gated modules. Declared
+# explicitly so `cargo test --no-default-features` skips them instead of
+# failing to compile the bin / example / test stubs that reference
+# `solana_mpp::{client,server}` and the `reqwest` / `tokio` deps gated
+# behind the corresponding features.
+[[bin]]
+name = "interop_client"
+required-features = ["client"]
+
+[[bin]]
+name = "interop_server"
+required-features = ["server"]
+
+[[example]]
+name = "payment_link_server"
+required-features = ["server", "client"]
+
+[[test]]
+name = "charge_integration"
+required-features = ["server", "client"]
