@@ -212,6 +212,49 @@ pub fn typed_to_wire(splits: &[Split]) -> Vec<BpsSplit> {
         .collect()
 }
 
+// ── Conversion to / from upstream's typed wire shape ──────────────────────
+//
+// Convert between `Split` (typed Pubkey) and `DistributionEntry` (upstream
+// Address). Both types carry a 32-byte recipient and a u16 bps; the
+// conversion is byte-equivalent and infallible. The wire boundary between
+// `BpsSplit` (base58 strings) and `Split` is handled by `wire_to_typed` /
+// `typed_to_wire` above; this layer bridges typed Splits to the upstream
+// `DistributionEntry` consumed by `splits::canonical_preimage`.
+
+impl From<&Split> for payment_channels_client::types::DistributionEntry {
+    fn from(split: &Split) -> Self {
+        match split {
+            Split::Bps { recipient, share_bps } => {
+                payment_channels_client::types::DistributionEntry {
+                    recipient: solana_address::Address::new_from_array(recipient.to_bytes()),
+                    bps: *share_bps,
+                }
+            }
+        }
+    }
+}
+
+impl From<Split> for payment_channels_client::types::DistributionEntry {
+    fn from(split: Split) -> Self {
+        Self::from(&split)
+    }
+}
+
+impl From<&payment_channels_client::types::DistributionEntry> for Split {
+    fn from(entry: &payment_channels_client::types::DistributionEntry) -> Self {
+        Split::Bps {
+            recipient: solana_pubkey::Pubkey::new_from_array(entry.recipient.to_bytes()),
+            share_bps: entry.bps,
+        }
+    }
+}
+
+impl From<payment_channels_client::types::DistributionEntry> for Split {
+    fn from(entry: payment_channels_client::types::DistributionEntry) -> Self {
+        Self::from(&entry)
+    }
+}
+
 // ── Credential actions (Authorization header / POST bodies) ────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

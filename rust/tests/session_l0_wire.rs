@@ -578,3 +578,29 @@ fn voucher_data_rejects_missing_required_field() {
         "expected deserialization to reject voucher data missing cumulativeAmount, got {result:?}"
     );
 }
+
+#[test]
+fn split_distribution_entry_roundtrip() {
+    use payment_channels_client::types::DistributionEntry;
+    use solana_address::Address;
+    use solana_mpp::protocol::intents::session::Split;
+    use solana_pubkey::Pubkey;
+
+    // Build a typed Split with concrete values. The recipient is 32 bytes
+    // of 0x55; bps is 7500. Both halves of the conversion are infallible
+    // because Pubkey and Address are byte-equivalent.
+    let recipient_bytes = [0x55u8; 32];
+    let original = Split::Bps {
+        recipient: Pubkey::new_from_array(recipient_bytes),
+        share_bps: 7500,
+    };
+
+    // Split into DistributionEntry.
+    let entry: DistributionEntry = (&original).into();
+    assert_eq!(entry.recipient, Address::new_from_array(recipient_bytes));
+    assert_eq!(entry.bps, 7500);
+
+    // DistributionEntry back into Split. Roundtrip equality.
+    let back: Split = (&entry).into();
+    assert_eq!(back, original);
+}
