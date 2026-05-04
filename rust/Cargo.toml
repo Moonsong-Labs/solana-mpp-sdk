@@ -18,17 +18,24 @@ pull-mode = []
 
 [dependencies]
 # Signing — solana-keychain with sdk-v3 (fix/deps branch pins solana-signature <3.3)
-solana-keychain = { git = "https://github.com/solana-foundation/solana-keychain", rev = "abf75944", default-features = false, features = ["memory", "sdk-v3"] }
+solana-keychain = { git = "https://github.com/solana-foundation/solana-keychain", rev = "abf75944", default-features = false, features = [
+	"memory",
+	"sdk-v3",
+] }
 
 # Solana — atomic crates only
 solana-hash = { version = "3.1", default-features = false }
 solana-instruction = { version = "3.1", default-features = false }
 solana-message = { version = "3.0", default-features = false }
 solana-pubkey = { version = "3.0", default-features = false }
-solana-address = { version = "2", default-features = false, features = ["borsh"] }
+solana-address = { version = "2", default-features = false, features = [
+	"borsh",
+] }
 solana-commitment-config = { version = "3.0", default-features = false }
 solana-rpc-client = { version = "3.1", default-features = false }
-solana-signature = { version = "3.1", default-features = false, features = ["default"] }
+solana-signature = { version = "3.1", default-features = false, features = [
+	"default",
+] }
 solana-system-interface = { version = "2.0", default-features = false }
 solana-transaction = { version = "3.0", default-features = false }
 solana-transaction-status = { version = "3.1", default-features = false }
@@ -37,14 +44,14 @@ solana-transaction-status = { version = "3.1", default-features = false }
 # that module. `rust/src/client/charge.rs` still hand-rolls its own blocking
 # RPC client, ComputeBudget ixs (lines 182-201, 501-527), and program IDs
 # (lines 182-193); aligning it with these new deps is deferred as tech debt.
-solana-client = { version = "3.1", default-features = false }            # nonblocking::rpc_client::RpcClient, rpc_config::RpcAccountInfoConfig
+solana-client = { version = "3.1", default-features = false }                       # nonblocking::rpc_client::RpcClient, rpc_config::RpcAccountInfoConfig
 solana-account-decoder-client-types = { version = "3.1", default-features = false } # UiAccount + UiAccountEncoding for get_ui_account_with_config (replaces deprecated get_account_with_config)
-solana-sdk-ids = { version = "3.1", default-features = false }           # ed25519_program, sysvar::instructions
-solana-ed25519-program = { version = "3.0", default-features = false }   # canonical builder for the ed25519 precompile instruction (extracted out of solana-sdk on the 3.x track)
-solana-compute-budget-interface = { version = "3.0", default-features = false }  # ComputeBudgetInstruction builder (highest published 3.x is 3.0.0)
-spl-token = { version = "8", default-features = false }                  # classic SPL Token Program ID (v1: Token-2022 rejected at process_open)
-spl-token-2022 = { version = "8" }                                       # Token-2022 program ID, imported ONLY so the open-ix mint-owner check can reject Token-2022 mints in v1. Defaults required: v8 fails to compile with default-features = false (confidential_mint_burn references zk-ops-gated fn unconditionally).
-spl-associated-token-account-client = { version = "2", default-features = false }  # create_associated_token_account_idempotent (highest published is 2.0.0)
+solana-sdk-ids = { version = "3.1", default-features = false }                      # ed25519_program, sysvar::instructions
+solana-ed25519-program = { version = "3.0", default-features = false }              # canonical builder for the ed25519 precompile instruction (extracted out of solana-sdk on the 3.x track)
+solana-compute-budget-interface = { version = "3.0", default-features = false }     # ComputeBudgetInstruction builder (highest published 3.x is 3.0.0)
+spl-token = { version = "8", default-features = false }                             # classic SPL Token Program ID (v1: Token-2022 rejected at process_open)
+spl-token-2022 = { version = "8" }                                                  # Token-2022 program ID, imported ONLY so the open-ix mint-owner check can reject Token-2022 mints in v1. Defaults required: v8 fails to compile with default-features = false (confidential_mint_burn references zk-ops-gated fn unconditionally).
+spl-associated-token-account-client = { version = "2", default-features = false }   # create_associated_token_account_idempotent (highest published is 2.0.0)
 
 # Upstream Codama-generated client for payment_channels. Pinned by rev; Cargo.lock
 # records the resolved revision. The `fetch` feature enables the optional
@@ -57,7 +64,9 @@ spl-associated-token-account-client = { version = "2", default-features = false 
 # an older toolchain, bump it alongside this dep; otherwise `cargo check`
 # fails with an "edition 2024 is unstable" style error before any SDK code
 # runs.
-payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "e211ccbacafff08f486d030e9d03cfd2261b239a", features = ["fetch"] }
+payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "012cd8e4a77a2fd6a506d11c036a1a073c402213", features = [
+	"fetch",
+] }
 
 # Async
 tokio = { version = "1", features = ["full"], optional = true }
@@ -78,7 +87,9 @@ borsh = { version = "1", default-features = false, features = ["derive"] }
 hmac = "0.12"
 sha2 = "0.10"
 blake3 = "1"
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "2", default-features = false, features = [
+	"alloc",
+] }
 
 # Time (expiration, timestamps)
 time = { version = "0.3", features = ["formatting", "parsing"] }

@@ -94,22 +94,22 @@ fn sdk_built_open_tx_lands_against_loaded_program() {
         .to_bytes(),
     );
 
-    // The fixed-amount `DistributionRecipients` shape is what upstream pins
-    // at this rev. Future revs are expected to move to a basis-points model;
-    // when they do, this construction updates alongside the upstream type.
-    // The unused entries are zero-padded; only entries[0..count] are read by
-    // the program.
+    // Single recipient: the payee at 10_000 bps (full pool). This is the
+    // bps-form equivalent of the prior amount-equals-deposit setup; payee
+    // remainder is zero. Upstream rejects bps == 0 entries when count >= 1
+    // covers them, so the zero-padded tail still uses bps == 0 (entries
+    // 1..32 are not validated when count == 1).
     let deposit: u64 = 1_000_000;
     let grace_period: u32 = 60;
     let zero_entry = DistributionEntry {
         recipient: Address::new_from_array([0u8; 32]),
-        amount: 0,
+        bps: 0,
     };
     let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
         if i == 0 {
             DistributionEntry {
                 recipient: payee,
-                amount: deposit,
+                bps: 10_000,
             }
         } else {
             zero_entry.clone()

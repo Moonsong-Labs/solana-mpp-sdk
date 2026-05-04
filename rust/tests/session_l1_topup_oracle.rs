@@ -91,19 +91,18 @@ fn sdk_built_top_up_advances_channel_deposit() {
         .to_bytes(),
     );
 
-    // Open the channel. Distribution shape mirrors the open oracle: one
-    // recipient (the payee) absorbs the full deposit. The fixed-amount
-    // shape is what upstream pins at this rev; future revs flip to
-    // basis-points and this construction updates alongside.
+    // Single recipient: the payee at 10_000 bps. Topup test only exercises
+    // the topup ix; the open leg's distribution shape is irrelevant beyond
+    // satisfying upstream's open-time validation.
     let zero_entry = DistributionEntry {
         recipient: Address::new_from_array([0u8; 32]),
-        amount: 0,
+        bps: 0,
     };
     let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
         if i == 0 {
             DistributionEntry {
                 recipient: payee,
-                amount: initial_deposit,
+                bps: 10_000,
             }
         } else {
             zero_entry.clone()
