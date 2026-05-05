@@ -72,7 +72,10 @@ pub use protocol::solana::{
 };
 
 // Store types
-pub use store::{ChannelState, ChannelStore, MemoryChannelStore, MemoryStore, Store, StoreError};
+pub use store::{
+    AdvanceOutcome, ChannelRecord, ChannelStatus, ChannelStore, InMemoryChannelStore, MemoryStore,
+    Store, StoreError,
+};
 
 // Re-export crates callers need to use with the charge builder.
 pub use solana_keychain;

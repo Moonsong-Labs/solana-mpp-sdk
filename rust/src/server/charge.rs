@@ -1,5 +1,10 @@
 //! Server-side payment verification for the Solana charge intent.
 //!
+//! Charge is a one-shot pay-once HTTP-402 flow. Replay protection is keyed
+//! by transaction signature in a generic KV `Store`. That is independent of
+//! the session intent's typed `ChannelStore`; the two abstractions cover
+//! different problems and coexist intentionally.
+//!
 //! # Quick Start
 //!
 //! ```ignore

@@ -9,7 +9,7 @@ repository = "https://github.com/solana-foundation/mpp-sdk"
 
 [features]
 default = ["server", "client"]
-server = ["dep:tokio"]
+server = []
 client = ["dep:reqwest"]
 gcp_kms = ["solana-keychain/gcp_kms"]
 # Pull-mode session support via the multi-delegator program. Not supported in v1.
@@ -68,8 +68,10 @@ payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payme
 	"fetch",
 ] }
 
-# Async
-tokio = { version = "1", features = ["full"], optional = true }
+# Async runtime. Hard dep (not gated): solana-rpc-client already pulls tokio
+# transitively, the in-memory channel store uses `tokio::sync::RwLock`, and
+# both server and client paths are async.
+tokio = { version = "1", features = ["full"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"], optional = true }
@@ -100,8 +102,12 @@ tracing = "0.1"
 # Errors
 thiserror = "2"
 
+# Async trait sugar (used by ChannelStore so impls don't have to hand-roll
+# the Pin<Box<dyn Future + Send + '_>> dance for every method).
+async-trait = "0.1"
+
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+# Tokio is already a hard dep above (with `full`); no dev-deps entry needed.
 axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
