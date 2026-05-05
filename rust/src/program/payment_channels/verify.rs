@@ -13,7 +13,7 @@ use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use tracing::debug;
 
-use crate::program::payment_channels::state::ChannelView;
+use crate::program::payment_channels::state::{ChannelView, CLOSED_CHANNEL_DISCRIMINATOR};
 
 /// Build the `RpcAccountInfoConfig` used by every `verify_*` helper.
 ///
@@ -39,9 +39,9 @@ fn account_info_config(commitment: CommitmentConfig) -> RpcAccountInfoConfig {
 /// returned a shape we did not ask for, and is surfaced as the typed
 /// `VerifyError::UnexpectedEncoding` variant.
 fn decode_ui_account(channel_id: &Pubkey, ui: &UiAccount) -> Result<Vec<u8>, VerifyError> {
-    ui.data
-        .decode()
-        .ok_or(VerifyError::UnexpectedEncoding { channel_id: *channel_id })
+    ui.data.decode().ok_or(VerifyError::UnexpectedEncoding {
+        channel_id: *channel_id,
+    })
 }
 
 /// Per-field on-chain state mismatches. Each variant carries the typed
@@ -93,20 +93,21 @@ pub enum Mismatch {
     #[error("distribution_hash mismatch: expected {expected_b58}, got {got_b58}",
         expected_b58 = bs58::encode(expected).into_string(),
         got_b58 = bs58::encode(got).into_string())]
-    DistributionHash {
-        expected: [u8; 32],
-        got: [u8; 32],
-    },
+    DistributionHash { expected: [u8; 32], got: [u8; 32] },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     #[error("channel account not found")]
     NotFound,
-    #[error("channel account is tombstoned (data.len == 8)")]
+    #[error("channel account is tombstoned (data.len == 1, discriminator == 2)")]
     Tombstoned,
-    #[error("channel account is not tombstoned: expected data.len == 8, got {data_len}")]
-    NotTombstoned { data_len: usize },
+    #[error("channel account has wrong length for tombstone: expected 1, got {data_len}")]
+    WrongLength { data_len: usize },
+    #[error(
+        "channel account has tombstone length but wrong discriminator: expected 2, got {byte}"
+    )]
+    WrongDiscriminator { byte: u8 },
     #[error(transparent)]
     Mismatch(#[from] Mismatch),
     #[error("unexpected RPC encoding for channel {channel_id}: expected Base64")]
@@ -155,14 +156,15 @@ pub async fn verify_open(
 
     let data = decode_ui_account(channel_id, &ui_account)?;
 
-    if data.len() == 8 {
-        return Err(VerifyError::Tombstoned);
-    }
+    reject_tombstone_shape(&data)?;
 
     let view = ChannelView::from_account_data(&data)?;
 
     if view.version() != 1 {
-        return Err(Mismatch::Version { got: view.version() }.into());
+        return Err(Mismatch::Version {
+            got: view.version(),
+        }
+        .into());
     }
     if view.status() != ChannelStatus::Open as u8 {
         return Err(Mismatch::Status {
@@ -244,12 +246,13 @@ pub async fn verify_topup(
         .value
         .ok_or(VerifyError::NotFound)?;
     let data = decode_ui_account(channel_id, &ui_account)?;
-    if data.len() == 8 {
-        return Err(VerifyError::Tombstoned);
-    }
+    reject_tombstone_shape(&data)?;
     let view = ChannelView::from_account_data(&data)?;
     if view.version() != 1 {
-        return Err(Mismatch::Version { got: view.version() }.into());
+        return Err(Mismatch::Version {
+            got: view.version(),
+        }
+        .into());
     }
     if view.status() != ChannelStatus::Open as u8 {
         return Err(Mismatch::Status {
@@ -282,13 +285,14 @@ pub async fn verify_settled(
         .value
         .ok_or(VerifyError::NotFound)?;
     let data = decode_ui_account(channel_id, &ui_account)?;
-    if data.len() == 8 {
-        return Err(VerifyError::Tombstoned);
-    }
+    reject_tombstone_shape(&data)?;
     let view = ChannelView::from_account_data(&data)?;
 
     if view.version() != 1 {
-        return Err(Mismatch::Version { got: view.version() }.into());
+        return Err(Mismatch::Version {
+            got: view.version(),
+        }
+        .into());
     }
     if view.status() != ChannelStatus::Open as u8 {
         return Err(Mismatch::Status {
@@ -323,13 +327,14 @@ pub async fn verify_closing(
         .value
         .ok_or(VerifyError::NotFound)?;
     let data = decode_ui_account(channel_id, &ui_account)?;
-    if data.len() == 8 {
-        return Err(VerifyError::Tombstoned);
-    }
+    reject_tombstone_shape(&data)?;
     let view = ChannelView::from_account_data(&data)?;
 
     if view.version() != 1 {
-        return Err(Mismatch::Version { got: view.version() }.into());
+        return Err(Mismatch::Version {
+            got: view.version(),
+        }
+        .into());
     }
     if view.status() != ChannelStatus::Closing as u8 {
         return Err(Mismatch::Status {
@@ -358,17 +363,56 @@ pub async fn verify_closing(
     Ok(())
 }
 
+/// Pure-function classification of a fetched account payload against the
+/// on-chain tombstone shape. Mirrors the upstream program's
+/// defense-in-depth posture: both the realloc'd length AND the
+/// `CLOSED_CHANNEL_DISCRIMINATOR` byte are required.
+fn classify_tombstone(data: &[u8]) -> ClassifiedShape {
+    match data.len() {
+        1 if data[0] == CLOSED_CHANNEL_DISCRIMINATOR => ClassifiedShape::Tombstoned,
+        1 => ClassifiedShape::WrongDiscriminator { byte: data[0] },
+        n => ClassifiedShape::WrongLength { data_len: n },
+    }
+}
+
+enum ClassifiedShape {
+    Tombstoned,
+    WrongDiscriminator { byte: u8 },
+    WrongLength { data_len: usize },
+}
+
+/// Short-circuit guard for the live-channel verify helpers. Returns
+/// `Err` when the fetched payload is the program-emitted tombstone or a
+/// 1-byte payload with the wrong discriminator; returns `Ok(())` for any
+/// other length so the caller falls through to `ChannelView::from_account_data`,
+/// which surfaces wrong-length non-tombstone bytes as `Decode(io::Error)`,
+/// the documented behavior for malformed `Channel` bytes.
+fn reject_tombstone_shape(data: &[u8]) -> Result<(), VerifyError> {
+    match classify_tombstone(data) {
+        ClassifiedShape::Tombstoned => Err(VerifyError::Tombstoned),
+        ClassifiedShape::WrongDiscriminator { byte } => {
+            Err(VerifyError::WrongDiscriminator { byte })
+        }
+        ClassifiedShape::WrongLength { .. } => Ok(()),
+    }
+}
+
 /// Result of probing a channel PDA for tombstone state.
 ///
 /// Centralizes the fetch + decode + AccountNotFound classification used by
 /// both `verify_tombstoned` (strict) and `verify_finalized_or_absent`
-/// (broad). The two public helpers differ only in how they map `Absent`,
-/// so the shared boilerplate lives here.
+/// (broad). The two public helpers differ only in how they map `Absent`
+/// and how they treat the two non-tombstone-but-exists shapes, so the
+/// shared boilerplate lives here.
 enum TombstoneProbe {
-    /// Account exists and `data.len() == 8` (program-emitted tombstone).
+    /// Account exists, `data.len() == 1`, and `data[0] ==
+    /// CLOSED_CHANNEL_DISCRIMINATOR` (program-emitted tombstone).
     Tombstoned,
-    /// Account exists but `data.len() != 8`.
-    NotTombstoned { data_len: usize },
+    /// Account exists but `data.len() != 1`.
+    WrongLength { data_len: usize },
+    /// Account exists with `data.len() == 1` but the byte is not
+    /// `CLOSED_CHANNEL_DISCRIMINATOR`.
+    WrongDiscriminator { byte: u8 },
     /// Account does not exist on the cluster: either `Ok(value: None)` or
     /// the typed `AccountNotFound` (JSON-RPC code `-32004`).
     Absent,
@@ -393,11 +437,15 @@ async fn tombstone_probe(
         Ok(resp) => match resp.value {
             Some(ui_account) => {
                 let data = decode_ui_account(channel_id, &ui_account)?;
-                if data.len() == 8 {
-                    Ok(TombstoneProbe::Tombstoned)
-                } else {
-                    Ok(TombstoneProbe::NotTombstoned { data_len: data.len() })
-                }
+                Ok(match classify_tombstone(&data) {
+                    ClassifiedShape::Tombstoned => TombstoneProbe::Tombstoned,
+                    ClassifiedShape::WrongDiscriminator { byte } => {
+                        TombstoneProbe::WrongDiscriminator { byte }
+                    }
+                    ClassifiedShape::WrongLength { data_len } => {
+                        TombstoneProbe::WrongLength { data_len }
+                    }
+                })
             }
             None => Ok(TombstoneProbe::Absent),
         },
@@ -410,14 +458,18 @@ async fn tombstone_probe(
     }
 }
 
-/// Verify post-close state: the PDA exists and is the program-emitted
-/// tombstone (`data.len() == 8`).
+/// Verify post-close state: the PDA exists, `data.len() == 1`, and
+/// `data[0] == CLOSED_CHANNEL_DISCRIMINATOR` (the program-emitted
+/// tombstone shape).
 ///
 /// Strict variant. Any other outcome is rejected:
 /// - account absent (`Ok(value: None)` or RPC `AccountNotFound`) yields
 ///   `VerifyError::NotFound`,
-/// - account exists with `data.len() != 8` yields
-///   `VerifyError::NotTombstoned { data_len }`.
+/// - account exists with `data.len() != 1` yields
+///   `VerifyError::WrongLength { data_len }`,
+/// - account exists with `data.len() == 1` but `data[0] !=
+///   CLOSED_CHANNEL_DISCRIMINATOR` yields
+///   `VerifyError::WrongDiscriminator { byte }`.
 ///
 /// Use this whenever the caller needs evidence that the channel was in
 /// fact created and then closed by the program. Callers who can also
@@ -431,15 +483,16 @@ pub async fn verify_tombstoned(
 ) -> Result<(), VerifyError> {
     match tombstone_probe(rpc, commitment, channel_id).await? {
         TombstoneProbe::Tombstoned => Ok(()),
-        TombstoneProbe::NotTombstoned { data_len } => {
-            Err(VerifyError::NotTombstoned { data_len })
+        TombstoneProbe::WrongLength { data_len } => Err(VerifyError::WrongLength { data_len }),
+        TombstoneProbe::WrongDiscriminator { byte } => {
+            Err(VerifyError::WrongDiscriminator { byte })
         }
         TombstoneProbe::Absent => Err(VerifyError::NotFound),
     }
 }
 
-/// Verify the channel PDA is either tombstoned (`data.len() == 8`) or
-/// absent on the cluster.
+/// Verify the channel PDA is either tombstoned (`data.len() == 1` with
+/// `data[0] == CLOSED_CHANNEL_DISCRIMINATOR`) or absent on the cluster.
 ///
 /// Broad variant: intentionally weaker than `verify_tombstoned`. It
 /// accepts "account absent" (`Ok(value: None)` or RPC `AccountNotFound`,
@@ -471,8 +524,56 @@ pub async fn verify_finalized_or_absent(
             );
             Ok(())
         }
-        TombstoneProbe::NotTombstoned { data_len } => {
-            Err(VerifyError::NotTombstoned { data_len })
+        TombstoneProbe::WrongLength { data_len } => Err(VerifyError::WrongLength { data_len }),
+        TombstoneProbe::WrongDiscriminator { byte } => {
+            Err(VerifyError::WrongDiscriminator { byte })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_recognises_canonical_tombstone_at_literal_byte_two() {
+        // The literal `2` here is the byte taken straight from upstream's
+        // program/payment_channels/src/state/common.rs
+        // (AccountDiscriminator::ClosedChannel = 2). DO NOT replace with
+        // CLOSED_CHANNEL_DISCRIMINATOR; that would make the test
+        // self-referential and lose its drift-detection role.
+        assert!(matches!(
+            classify_tombstone(&[2u8]),
+            ClassifiedShape::Tombstoned
+        ));
+    }
+
+    #[test]
+    fn classify_flags_wrong_discriminator_at_length_one() {
+        // AccountDiscriminator::Channel == 1 on-chain; not a valid tombstone.
+        assert!(matches!(
+            classify_tombstone(&[1]),
+            ClassifiedShape::WrongDiscriminator { byte: 1 }
+        ));
+        // Zero-byte: the program rejects this on every load anyway, but the
+        // SDK-side classification still surfaces it as a typed mismatch.
+        assert!(matches!(
+            classify_tombstone(&[0]),
+            ClassifiedShape::WrongDiscriminator { byte: 0 }
+        ));
+    }
+
+    #[test]
+    fn classify_flags_wrong_lengths_including_the_old_speculative_eight() {
+        // 8 is the SDK's pre-bump speculative shape; pinning it as a
+        // regression sentinel against any future drift back to length-8.
+        assert!(matches!(
+            classify_tombstone(&[0u8; 8]),
+            ClassifiedShape::WrongLength { data_len: 8 }
+        ));
+        assert!(matches!(
+            classify_tombstone(&[]),
+            ClassifiedShape::WrongLength { data_len: 0 }
+        ));
     }
 }

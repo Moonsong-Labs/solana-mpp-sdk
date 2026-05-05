@@ -52,6 +52,19 @@ pub fn find_channel_pda(
     Pubkey::find_program_address(&seeds, program_id)
 }
 
+/// On-chain byte tag for a tombstoned channel PDA.
+///
+/// Mirrors the value of `AccountDiscriminator::ClosedChannel` declared in
+/// upstream's `program/payment_channels/src/state/common.rs` (where the
+/// enum carries `#[repr(u8)]` with explicit values `Channel = 1,
+/// ClosedChannel = 2`). The codama-generated client at
+/// `payment_channels_client::types::AccountDiscriminator` is
+/// Borsh-derived without an explicit repr, so `as u8` on it would return
+/// the declaration index, not the on-chain byte. Sourced as a literal
+/// here, with the upstream reference comment as the tripwire if upstream
+/// ever renumbers.
+pub const CLOSED_CHANNEL_DISCRIMINATOR: u8 = 2;
+
 /// Typed view over a Channel PDA account. Owns the decoded struct: the
 /// Codama-generated `Channel::from_bytes` returns an owned value, so storing
 /// a borrow (`&'a Channel`) would borrow from a temporary and fail to

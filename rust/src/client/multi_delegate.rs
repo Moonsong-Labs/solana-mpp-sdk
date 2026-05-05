@@ -2,7 +2,6 @@
 //!
 //! Produces base64-encoded, fully-signed Solana transactions that the server
 //! can submit on the client's behalf during a pull-mode session open.
-#![cfg(feature = "pull-mode")]
 
 use base64::Engine;
 use solana_hash::Hash;

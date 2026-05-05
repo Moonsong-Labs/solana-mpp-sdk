@@ -2,7 +2,7 @@
 name = "solana-mpp"
 version = "0.6.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Solana payment method for the Machine Payments Protocol"
 license = "MIT"
 repository = "https://github.com/solana-foundation/mpp-sdk"
@@ -58,13 +58,13 @@ spl-associated-token-account-client = { version = "2", default-features = false 
 # solana-client RPC helpers that `fetch_channel` / `fetch_maybe_channel` depend
 # on; leave it on by default.
 #
-# NOTE (rustc floor): `clients/rust/Cargo.toml` upstream declares
-# `edition = "2024"`, which requires rustc `>= 1.85`. Adding this dep raises
-# the SDK workspace's effective rustc floor to 1.85 transitively. If CI pins
-# an older toolchain, bump it alongside this dep; otherwise `cargo check`
-# fails with an "edition 2024 is unstable" style error before any SDK code
-# runs.
-payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "012cd8e4a77a2fd6a506d11c036a1a073c402213", features = [
+# NOTE (rustc floor): pinning to this upstream rev raises the SDK
+# workspace's effective rustc floor to 1.89 transitively. The new
+# dependency graph (notably `solana-address` 2.6.0 and `solana-pubkey`
+# 4.2.0 pulled by `payment_channels_client`) declares
+# `rust-version = "1.89"`, so older toolchains refuse to resolve the
+# graph. If CI pins an older toolchain, bump it alongside this dep.
+payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "f03ca9fcfdbeeb1089ecf07a4b757e9156784e44", features = [
 	"fetch",
 ] }
 
