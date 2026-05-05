@@ -1,26 +1,23 @@
-//! Challenge cache, intent binding, and the sweeper that evicts expired entries.
+//! Challenge cache, intent binding, and a sweeper for expired entries.
 //!
-//! Every server-issued challenge lives here from the moment a factory hands
-//! it to the operator until the matching action handler commits or a
-//! background sweep evicts it. The cache enforces three invariants:
+//! Every challenge the server hands out lives here until the action
+//! handler commits it or the sweeper evicts it. Three rules:
 //!
-//! 1. Single-use. A given challenge id walks `Available -> Pending ->
-//!    Consumed` exactly once. The reservation step is atomic: two
-//!    handler tasks racing on the same id observe one `Advanced` and
-//!    one `ChallengeInFlight`.
-//! 2. Intent binding. Each record is tagged with a typed
-//!    [`ChallengeIntent`]. Reservation rejects with
-//!    `ChallengeIntentMismatch` if the action handler's discriminant
-//!    does not match the cached intent's discriminant.
-//! 3. Bounded lifetime. A background sweeper drops every record older
-//!    than `2 * challenge_ttl_seconds` regardless of state, so a
-//!    leaked Pending record cannot wedge the cache.
+//! 1. Single-use. An id walks `Available -> Pending -> Consumed` once.
+//!    Two tasks racing on the same id: one wins, the other gets
+//!    `ChallengeInFlight`.
+//! 2. Intent binding. Each record carries a typed [`ChallengeIntent`];
+//!    reserving with the wrong discriminant gets
+//!    `ChallengeIntentMismatch`.
+//! 3. Bounded lifetime. Anything older than `2 * challenge_ttl_seconds`
+//!    gets swept out regardless of state, so a leaked Pending can't
+//!    wedge the cache.
 //!
-//! The internal storage is a [`dashmap::DashMap`]. The `Available ->
-//! Pending` transition uses `entry().and_modify()` so the check-and-set is
-//! performed inside the per-shard write lock that DashMap holds during the
-//! closure; concurrent reservations against the same key serialise on that
-//! shard lock rather than relying on a separate critical section.
+//! Storage is a [`dashmap::DashMap`]. The `Available -> Pending`
+//! transition runs inside `entry().and_modify`, so the check-and-set
+//! sits under DashMap's per-shard write lock; concurrent reservations
+//! on the same key serialise on that lock without a separate critical
+//! section.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,15 +29,15 @@ use solana_pubkey::Pubkey;
 use crate::error::SessionError;
 use crate::protocol::intents::session::Split;
 
-/// Why a challenge was issued. The handler asserts intent match on entry
-/// so cross-action reuse (e.g. presenting a `TopUp` challenge to the
-/// `open` handler) is rejected before any RPC or store work runs.
+/// Why a challenge was issued. Handlers check intent on entry so a
+/// cross-action submission (e.g. a `TopUp` challenge presented to
+/// `open`) is rejected before any RPC or store work.
 ///
-/// `Open` carries advertised splits and deposit bounds because the open
-/// handler re-validates them against the submitted payload. `TopUp` and
-/// `Close` are bound to a known `channel_id`; the channel record is the
-/// authoritative source for splits at handle-time, so the intent does
-/// not duplicate them.
+/// `Open` carries advertised splits and deposit bounds because the
+/// open handler re-validates them against the submitted payload.
+/// `TopUp` and `Close` only carry `channel_id`; the channel record is
+/// the splits source at handle time, so duplicating them here would
+/// drift.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ChallengeIntent {
@@ -59,9 +56,8 @@ pub enum ChallengeIntent {
     },
 }
 
-/// Discriminant-only view of [`ChallengeIntent`]. The reservation API takes
-/// the discriminant so handlers can assert "I expect a TopUp challenge"
-/// without having to construct a full intent value.
+/// Discriminant-only view of [`ChallengeIntent`]. Handlers pass this
+/// to `reserve` instead of building a full intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChallengeIntentDiscriminant {
     Open,
@@ -79,7 +75,7 @@ impl From<&ChallengeIntent> for ChallengeIntentDiscriminant {
     }
 }
 
-/// Three-state lifecycle for a challenge record.
+/// Lifecycle of a challenge record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChallengeState {
     Available,
@@ -87,18 +83,17 @@ pub enum ChallengeState {
     Consumed,
 }
 
-/// One row in [`ChallengeCache`]. Every challenge the server hands out
-/// has a matching record keyed on the challenge id.
+/// One row in [`ChallengeCache`], keyed by challenge id.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ChallengeRecord {
     pub intent: ChallengeIntent,
     pub external_id: Option<String>,
-    /// Unix seconds when the challenge was issued. Drives sweep TTL.
+    /// Unix seconds when issued; drives the sweep TTL.
     pub issued_at: i64,
-    /// The blockhash the server fetched at challenge time and committed
-    /// to the client. Action handlers compare the submitted tx's
-    /// `recent_blockhash` against this byte-for-byte before broadcast.
+    /// Blockhash the server fetched when issuing the challenge.
+    /// Handlers compare the submitted tx's `recent_blockhash` against
+    /// this before broadcast.
     pub recent_blockhash: Hash,
     pub state: ChallengeState,
 }
@@ -122,15 +117,14 @@ impl ChallengeRecord {
 
 /// In-process challenge cache.
 ///
-/// Cloning the cache hands out a new [`Arc`] handle; all clones share
-/// the same underlying state. The sweeper task holds one such handle.
+/// Cloning hands out a new [`Arc`] handle; clones share state. The
+/// sweeper task holds one of those handles.
 #[derive(Debug, Clone)]
 pub struct ChallengeCache {
     inner: Arc<DashMap<String, ChallengeRecord>>,
-    /// Per-record TTL in seconds. `reserve` rejects records whose age
-    /// (against wall-clock `now`) exceeds this bound. The sweeper
-    /// applies a `2 * ttl` window separately so a slow handler does not
-    /// race the sweep on its own Pending record.
+    /// Per-record TTL in seconds. `reserve` rejects records older
+    /// than this. The sweeper uses `2 * ttl` separately so a slow
+    /// handler doesn't race the sweep on its own Pending record.
     ttl_seconds: u32,
 }
 
@@ -142,15 +136,14 @@ impl ChallengeCache {
         }
     }
 
-    /// Per-record TTL the cache enforces inside `reserve`.
+    /// Per-record TTL `reserve` enforces.
     pub fn ttl_seconds(&self) -> u32 {
         self.ttl_seconds
     }
 
-    /// Register a freshly minted challenge. Rejects if `id` is already
-    /// in the cache; that would mean the HMAC challenge id collided
-    /// (vanishingly unlikely) or a caller tried to insert the same
-    /// challenge twice.
+    /// Register a fresh challenge. Rejects if `id` is already in the
+    /// cache; that's either an HMAC id collision (vanishingly
+    /// unlikely) or a double-insert.
     pub fn insert(&self, id: String, record: ChallengeRecord) -> Result<(), SessionError> {
         use dashmap::mapref::entry::Entry;
         match self.inner.entry(id) {
@@ -164,22 +157,22 @@ impl ChallengeCache {
         }
     }
 
-    /// Atomically transition `Available -> Pending` and return a snapshot
-    /// of the record as it stood at reservation time.
+    /// Atomically flip `Available -> Pending` and return a snapshot of
+    /// the record at reservation time.
     ///
     /// Failure modes:
-    /// - `ChallengeUnbound`: id not in the cache, or already `Consumed`.
-    /// - `ChallengeInFlight`: another caller already moved this id to
-    ///   `Pending` and has not yet committed or released.
-    /// - `ChallengeIntentMismatch`: cached intent's discriminant differs
-    ///   from `expected`.
-    /// - `ChallengeExpired`: record age exceeds the cache's
-    ///   `ttl_seconds`. The expired entry is evicted on the way out so
-    ///   a follow-up reservation on the same id reports `ChallengeUnbound`.
+    /// - `ChallengeUnbound`: id not in cache, or already `Consumed`.
+    /// - `ChallengeInFlight`: another caller already flipped to
+    ///   `Pending` and hasn't committed or released.
+    /// - `ChallengeIntentMismatch`: cached intent doesn't match
+    ///   `expected`.
+    /// - `ChallengeExpired`: record age exceeds `ttl_seconds`. The
+    ///   expired entry is evicted on the way out, so a retry on the
+    ///   same id reports `ChallengeUnbound`.
     ///
     /// The check-and-set runs inside `DashMap::entry().and_modify`, so
-    /// two concurrent callers on the same id serialise on DashMap's
-    /// shard write lock; exactly one observes `Available` and flips it.
+    /// concurrent callers on the same id serialise on DashMap's shard
+    /// write lock and exactly one sees `Available`.
     pub fn reserve(
         &self,
         id: &str,
@@ -192,10 +185,9 @@ impl ChallengeCache {
         self.reserve_at(id, expected, now)
     }
 
-    /// Test-friendly `reserve` that takes the wall-clock as an argument
-    /// instead of reading `SystemTime::now`. The public [`Self::reserve`]
-    /// delegates here. Splitting this out lets unit tests construct
-    /// expired records deterministically without sleeping.
+    /// `reserve` with the wall-clock injected. [`Self::reserve`]
+    /// delegates here. Lets unit tests construct expired records
+    /// without sleeping.
     pub fn reserve_at(
         &self,
         id: &str,
@@ -233,9 +225,9 @@ impl ChallengeCache {
         }
     }
 
-    /// Mark a Pending challenge as Consumed. Called from the action
-    /// handler's success path after the on-chain effect has been
-    /// observed. Rejects if the record is missing or not Pending.
+    /// Move a Pending challenge to Consumed. Called from the action
+    /// handler's success path after the on-chain effect lands.
+    /// Rejects if the record is missing or not Pending.
     pub fn commit(&self, id: &str) -> Result<(), SessionError> {
         use dashmap::mapref::entry::Entry;
         match self.inner.entry(id.to_string()) {
@@ -254,7 +246,7 @@ impl ChallengeCache {
         }
     }
 
-    /// Release a Pending reservation back to Available. Called from the
+    /// Move a Pending reservation back to Available. Called from the
     /// failure path so the client can retry without burning the
     /// challenge.
     pub fn release(&self, id: &str) -> Result<(), SessionError> {
@@ -275,28 +267,27 @@ impl ChallengeCache {
         }
     }
 
-    /// Drop every entry whose age (relative to `now`) exceeds
-    /// `ttl_seconds`. The sweeper task calls this with `2 *
-    /// challenge_ttl_seconds`; entries past their issue TTL get a grace
-    /// window before being reclaimed so a slow handler does not race
-    /// the sweep on its own Pending record.
+    /// Drop every entry older than `ttl_seconds` against `now`. The
+    /// sweeper passes `2 * challenge_ttl_seconds` so entries get a
+    /// grace window past their issue TTL and a slow handler doesn't
+    /// race the sweep on its own Pending record.
     pub fn evict_expired(&self, ttl_seconds: u32, now: i64) {
         let ttl = ttl_seconds as i64;
         self.inner
             .retain(|_, record| now.saturating_sub(record.issued_at) <= ttl);
     }
 
-    /// Test-only helper: clone the record at `id` if present.
+    /// Clone the record at `id` if present (test-only helper).
     pub fn get(&self, id: &str) -> Option<ChallengeRecord> {
         self.inner.get(id).map(|r| r.clone())
     }
 
-    /// Total entries currently held. Useful for sweep tests.
+    /// Entry count, handy for sweep tests.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
-    /// `true` if no entries are held.
+    /// True when the cache has no entries.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -326,11 +317,10 @@ mod tests {
         ChallengeRecord::new(intent, None, issued_at, Hash::new_from_array([0u8; 32]))
     }
 
-    /// Wall-clock now in unix seconds. Tests that exercise the live
-    /// `reserve` (not `reserve_at`) must construct records as if they
-    /// were issued seconds ago, otherwise the freshly added TTL check
-    /// trips against the mid-1970s placeholder timestamps every other
-    /// test was using.
+    /// Wall-clock now in unix seconds. Tests that hit the live
+    /// `reserve` (not `reserve_at`) need records issued moments ago,
+    /// otherwise the TTL check trips against the placeholder
+    /// timestamps the other tests use.
     fn now_secs() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -354,7 +344,7 @@ mod tests {
         let after = cache.get("c1").unwrap();
         assert_eq!(after.state, ChallengeState::Consumed);
 
-        // A second reservation on a Consumed record is unbound.
+        // Reserving a Consumed record returns Unbound.
         let err = cache
             .reserve("c1", ChallengeIntentDiscriminant::Open)
             .unwrap_err();
@@ -376,7 +366,7 @@ mod tests {
         let after = cache.get("c2").unwrap();
         assert_eq!(after.state, ChallengeState::Available);
 
-        // Released id must be reservable again.
+        // Released id is reservable again.
         cache
             .reserve("c2", ChallengeIntentDiscriminant::Open)
             .expect("released challenge must reserve cleanly");
@@ -410,10 +400,9 @@ mod tests {
             .unwrap();
         cache.commit("c4").unwrap();
 
-        // Spec wording calls a Consumed presentation `ChallengeUnbound`
-        // (the cache "no longer holds an Available record under that id"),
-        // which is the same outward-facing 402 the client sees for a
-        // missing id. Pin the variant so the wire-form code stays stable.
+        // A Consumed presentation comes back as `ChallengeUnbound`,
+        // matching the 402 a client sees for a missing id. Pin the
+        // variant so the wire-form code stays stable.
         let err = cache
             .reserve("c4", ChallengeIntentDiscriminant::Open)
             .unwrap_err();
@@ -435,19 +424,18 @@ mod tests {
             "{err:?}"
         );
 
-        // A failed mismatch reservation must NOT have flipped state.
+        // A mismatch reservation must not have flipped state.
         let snapshot = cache.get("c5").unwrap();
         assert_eq!(snapshot.state, ChallengeState::Available);
     }
 
     #[test]
     fn reserve_rejects_expired_challenge() {
-        // ttl 60s; record was issued at t=0 and the caller arrives at
-        // t=200, comfortably past the per-record TTL. `reserve` must
-        // refuse the reservation with `ChallengeExpired { age, max }`
-        // and evict the dead record so a follow-up reservation reports
-        // `ChallengeUnbound` rather than a second `ChallengeExpired`
-        // for the same id.
+        // ttl 60s; record issued at t=0, caller arrives at t=200,
+        // well past the TTL. `reserve` should refuse with
+        // `ChallengeExpired { age, max }` and evict the dead record
+        // so a retry on the same id reports `ChallengeUnbound`
+        // instead of a second `ChallengeExpired`.
         let cache = ChallengeCache::new(60);
         cache.insert("c6".into(), record(open_intent(), 0)).unwrap();
 
@@ -462,7 +450,7 @@ mod tests {
             other => panic!("expected ChallengeExpired, got: {other:?}"),
         }
 
-        // Entry is gone; the next call sees an empty slot.
+        // Entry was evicted; the next call sees an empty slot.
         assert!(cache.get("c6").is_none());
         let err = cache
             .reserve_at("c6", ChallengeIntentDiscriminant::Open, 201)
@@ -480,7 +468,7 @@ mod tests {
             .insert("fresh".into(), record(open_intent(), 100))
             .unwrap();
 
-        // ttl 50, now 100: "old" is 100s old (drop), "fresh" is 0s old (keep).
+        // ttl 50, now 100: `old` is 100s (drop), `fresh` is 0s (keep).
         cache.evict_expired(50, 100);
 
         assert!(cache.get("old").is_none());
@@ -490,12 +478,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_reserve_serializes() {
-        // Fan a high contention burst out across many tokio tasks against
-        // the same id. Exactly one task observes Available and flips to
-        // Pending; everyone else sees ChallengeInFlight or, if the test
-        // re-races against itself across iterations of the same record,
-        // ChallengeUnbound after the winner commits. The first reservation
-        // from a clean Available record can only be `Ok` for one task.
+        // Hammer the same id from many tokio tasks. One task sees
+        // Available and flips to Pending; the rest see
+        // `ChallengeInFlight`. The first reservation on a clean
+        // Available record can only succeed once.
         let cache = ChallengeCache::new(300);
         cache
             .insert("race".into(), record(open_intent(), now_secs()))

@@ -1,14 +1,13 @@
 //! SDK-wide error types.
 //!
-//! Two enums live here:
+//! Two enums:
 //!
-//! - `Error` is the legacy charge-intent surface: a flat enum scoped to the
-//!   one-shot pay-once flow. Held in tree as-is so the charge code path
-//!   stays untouched.
-//! - `SessionError` is the typed surface for the session intent. Every
-//!   variant maps to an HTTP status and a stable wire-form `MppErrorCode`
-//!   so 402 responses, receipts, and observability all key off the same
-//!   identifier.
+//! - `Error` is the older charge-intent surface, a flat enum for the
+//!   one-shot pay-once flow. Kept as-is so the charge code path doesn't
+//!   churn.
+//! - `SessionError` is the typed surface for the session intent. Each
+//!   variant maps to an HTTP status and a stable `MppErrorCode` so 402
+//!   responses, receipts, and observability all key off the same id.
 
 use http::StatusCode;
 use solana_pubkey::Pubkey;
@@ -86,27 +85,24 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Opaque wrapper around RPC errors, decoupled from any specific
 /// `solana-client` major version.
 ///
-/// Carries a stringified message; callers that need structured handling
-/// should branch on the [`MppErrorCode`] returned from
-/// [`SessionError::code`] rather than downcasting the inner error. This
-/// keeps the SDK's public error surface stable across upstream RPC-client
-/// version bumps.
+/// Carries a stringified message. Callers that want structured handling
+/// should branch on [`SessionError::code`] rather than peering inside;
+/// that keeps the public error surface stable when upstream bumps the
+/// RPC client.
 ///
-/// The inner field is private and the type is `#[non_exhaustive]` so
-/// future refactors (e.g. adding endpoint / status / body fields) do not
-/// constitute a breaking change. Use [`RpcError::message`] to read the
-/// stringified payload, or rely on `Display` / `MppErrorCode` for routing.
+/// Inner field is private and the type is `#[non_exhaustive]` so we can
+/// add endpoint / status / body fields later without breaking callers.
+/// Use [`RpcError::message`] to read the payload.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("rpc error: {0}")]
 #[non_exhaustive]
 pub struct RpcError(String);
 
 impl RpcError {
-    /// Read the stringified RPC failure message.
+    /// Stringified RPC failure message.
     ///
-    /// Operators rendering structured logs can branch on
-    /// [`MppErrorCode`] for routing and use this accessor to surface
-    /// the underlying RPC context.
+    /// Branch on [`MppErrorCode`] for routing; use this for the
+    /// underlying context when rendering logs.
     pub fn message(&self) -> &str {
         &self.0
     }
@@ -114,18 +110,17 @@ impl RpcError {
 
 impl From<solana_client::client_error::ClientError> for RpcError {
     fn from(e: solana_client::client_error::ClientError) -> Self {
-        // `{e:#}` walks the thiserror source chain so the operator
-        // sees endpoint, status, and body context rather than just the
-        // top-level summary.
+        // `{e:#}` walks the source chain so we see endpoint/status/body
+        // instead of just the top-level summary.
         Self(format!("{e:#}"))
     }
 }
 
-/// Snapshot of an on-chain channel's lifecycle as observed by recovery.
+/// Channel lifecycle as recovery sees it.
 ///
 /// `Absent` is the recovery-only state for a PDA the cluster has never
-/// seen (or that has been garbage-collected). The other variants mirror
-/// the on-chain `Status` byte plus the `Tombstoned` close-marker byte.
+/// seen or has GC'd. The rest mirrors the on-chain `Status` byte plus
+/// the `Tombstoned` close marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OnChainChannelStatus {
@@ -136,13 +131,12 @@ pub enum OnChainChannelStatus {
     Absent,
 }
 
-/// Typed reason for a per-record recovery failure.
+/// Typed reason a single channel failed recovery.
 ///
-/// Variants cover the four classes of failure the inspect phase can
-/// surface: the operator left unsettled revenue on the table, an RPC
-/// fetch failed, the stored status disagrees with the on-chain status in
-/// a way the runtime cannot resolve, or a `verify_open` field check
-/// failed during inspection.
+/// Covers the four shapes the inspect phase produces: unsettled
+/// revenue lying around at startup, an RPC fetch that failed, stored
+/// status disagreeing with on-chain in a way we can't reconcile, or a
+/// `verify_open` field check failing during inspection.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryFailureKind {
@@ -151,11 +145,10 @@ pub enum RecoveryFailureKind {
 
     #[error("rpc failure: {message}")]
     RpcFailure {
-        // Stringified RPC failure message. Kept as `String` so the
-        // recovery surface stays version-agnostic. The plan doc names
-        // this field `source`; we rename to `message` here because
-        // `thiserror` would otherwise pick the field up as a source
-        // chain link and require it implement `std::error::Error`.
+        // Stringified so the recovery surface stays version-agnostic.
+        // Field is `message` rather than `source` because thiserror would
+        // otherwise treat a `source` field as a source-chain link and
+        // require `std::error::Error`.
         message: String,
     },
 
@@ -169,13 +162,12 @@ pub enum RecoveryFailureKind {
     VerifyOpenMismatch { field: &'static str },
 }
 
-/// Per-record recovery failure surfaced inside `RecoveryBatchFailed`.
+/// One channel's failure inside `RecoveryBatchFailed`.
 ///
-/// The startup recovery flow inspects every persisted channel before
-/// touching the store, then either applies every outcome or returns the
-/// batch of failures. Each failure carries the channel it pertains to and
-/// a typed reason so operators can route on the cause without parsing
-/// strings.
+/// Startup recovery inspects every persisted channel before touching
+/// the store. Either every outcome applies, or this batch comes back.
+/// Each failure pairs the channel id with a typed reason so operators
+/// can route on it without parsing strings.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("channel {channel_id}: {kind}")]
 #[non_exhaustive]
@@ -185,13 +177,12 @@ pub struct RecoveryFailure {
     pub kind: RecoveryFailureKind,
 }
 
-/// Errors produced by the session intent server lifecycle.
+/// Errors from the session intent server lifecycle.
 ///
-/// Every variant maps to an HTTP status via [`SessionError::http_status`]
-/// and a stable wire-form code via [`SessionError::code`]. The two
-/// accessors decouple "what went wrong" from "how to render it on the
-/// wire": handlers thread the typed enum internally and only convert at
-/// the response boundary.
+/// Each variant maps to an HTTP status via [`SessionError::http_status`]
+/// and a wire-form code via [`SessionError::code`]. Handlers carry the
+/// typed enum internally and only render at the response boundary, so
+/// "what happened" stays separate from "how to ship it on the wire".
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SessionError {
@@ -321,9 +312,9 @@ pub enum SessionError {
     #[error("rpc unavailable: {0}")]
     RpcUnavailable(#[from] RpcError),
 
-    /// Catch-all for unexpected server-side failures the client should
-    /// treat as 5xx. Use sparingly: prefer a typed variant whenever the
-    /// failure is one we want operators to route on.
+    /// Catch-all for unexpected server-side failures (5xx to the
+    /// client). Prefer a typed variant for anything operators will
+    /// want to route on.
     #[error("internal server error: {0}")]
     InternalError(String),
 }
@@ -335,7 +326,7 @@ impl From<solana_client::client_error::ClientError> for SessionError {
 }
 
 impl SessionError {
-    /// Stable wire-form code emitted on 402 responses and receipts.
+    /// Wire-form code emitted on 402 responses and receipts.
     pub fn code(&self) -> MppErrorCode {
         use MppErrorCode as C;
         match self {
@@ -378,48 +369,37 @@ impl SessionError {
 
     /// HTTP status to render on the response.
     ///
-    /// `402 Payment Required` covers the normal client-facing protocol
-    /// errors (challenge / voucher / deposit / splits violations).
+    /// `402` is the normal client-facing protocol bucket (challenge,
+    /// voucher, deposit, splits).
     ///
-    /// `409 Conflict` covers cases where the client request is well-formed
-    /// but inconsistent with current state: `MaliciousTx` (the submitted
-    /// tx disagrees with the advertised challenge), `BlockhashMismatch`
-    /// (the client used a blockhash other than the one the server
-    /// committed in the 402 challenge, the same protocol-violation class
-    /// as `MaliciousTx`), `InvalidStatusForTopup` (topup against a
-    /// non-Open channel), and `OnChainStateMismatch` (the request
-    /// advertised a deposit / payer / payee / splits-hash that
-    /// disagrees with on-chain reality; nothing the client can re-sign
-    /// will reconcile this).
+    /// `409` is for well-formed requests that conflict with current
+    /// state: `MaliciousTx`, `BlockhashMismatch`,
+    /// `InvalidStatusForTopup`, `OnChainStateMismatch`. Re-signing
+    /// won't help.
     ///
-    /// `503 Service Unavailable` covers server-side broadcast failures
-    /// and transient preflight glitches: the client cannot remediate by
-    /// re-signing because the failure happened after a valid signed
-    /// payload reached the server (RPC dropped, validator congestion,
-    /// blockhash expired before the server's submission landed,
-    /// `CreateIdempotent` ATA preflight failed). The server is expected
-    /// to retry; 503 is the standard "transient, retry later" status.
+    /// `503` is for transient broadcast or preflight failures that
+    /// happened after a valid signed payload reached us (RPC dropped,
+    /// validator congestion, blockhash expired, `CreateIdempotent`
+    /// preflight failed). Standard "retry later".
     ///
-    /// `500 Internal Server Error` is reserved for recovery and infra
-    /// failures the operator must fix.
+    /// `500` is recovery and infra failures the operator has to fix.
     pub fn http_status(&self) -> StatusCode {
         match self {
-            // 409 Conflict: well-formed request, conflicting state.
+            // 409: well-formed request, conflicting state.
             SessionError::MaliciousTx { .. }
             | SessionError::BlockhashMismatch { .. }
             | SessionError::InvalidStatusForTopup { .. }
             | SessionError::OnChainStateMismatch { .. } => StatusCode::CONFLICT,
 
-            // 503 Service Unavailable: transient server-side broadcast
-            // and preflight failures. The client cannot remediate by
-            // re-signing.
+            // 503: transient server-side broadcast and preflight
+            // failures; re-signing on the client won't help.
             SessionError::OpenTxUnconfirmed(_)
             | SessionError::TopUpFailed(_, _)
             | SessionError::SettleFailed(_, _)
             | SessionError::DistributeFailed(_, _)
             | SessionError::AtaPreflightFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
 
-            // 500 Internal: recovery anomalies and infra-layer failures.
+            // 500: recovery and infra failures.
             SessionError::UnsettledRevenueOnStartup { .. }
             | SessionError::RecoveryRpcFailure { .. }
             | SessionError::RecoveryBatchFailed { .. }
@@ -427,7 +407,7 @@ impl SessionError {
             | SessionError::RpcUnavailable(_)
             | SessionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
-            // Everything else is a 402 the client can address.
+            // Everything else: 402, client can fix it.
             _ => StatusCode::PAYMENT_REQUIRED,
         }
     }

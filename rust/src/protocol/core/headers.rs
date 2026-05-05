@@ -396,6 +396,8 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             reference: "5UfDuX...".to_string(),
             challenge_id: "ch-test".to_string(),
+            accepted_cumulative: None,
+            spent: None,
         };
         let header = format_receipt(&receipt).unwrap();
         let parsed = parse_receipt(&header).unwrap();

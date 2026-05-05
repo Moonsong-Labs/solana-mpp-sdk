@@ -1,16 +1,16 @@
 //! Session intent server-side lifecycle.
 //!
-//! Public surface (assembled across this directory):
+//! Public surface:
 //!
 //! - [`SessionConfig`]: operator-supplied configuration.
-//! - [`SessionMethod`]: not directly constructible, only
-//!   `SessionBuilder::recover().await?` produces one.
-//! - [`SessionBuilder`]: builder with `with_store` / `with_rpc` /
+//! - [`SessionMethod`]: only constructible via
+//!   `SessionBuilder::recover().await?`.
+//! - [`SessionBuilder`]: `with_store` / `with_rpc` /
 //!   `with_recovery_options` / `recover`.
 //!
-//! Submodule layout:
+//! Submodules:
 //!
-//! - [`challenge`]: challenge cache, intent binding, sweeper.
+//! - [`challenge`]: cache, intent binding, sweeper.
 //! - [`open`] / [`voucher`] / [`topup`] / [`close`]: per-action handlers.
 //! - [`ix`]: settle-bundle assembly.
 //! - [`recover`]: two-phase startup recovery.
@@ -46,26 +46,25 @@ use crate::store::{ChannelRecord, ChannelStatus, ChannelStore};
 use challenge::{ChallengeCache, ChallengeIntent, ChallengeIntentDiscriminant, ChallengeRecord};
 use open::{validate_open_tx_shape, DecodedOpenTx};
 
-const METHOD_NAME: &str = "solana";
+pub(crate) const METHOD_NAME: &str = "solana";
 const SESSION_INTENT: &str = "session";
 
-/// Default realm advertised in the WWW-Authenticate header. Mirrors
-/// `charge`'s `"MPP Payment"`. They are independent intents but share
-/// the 402 framing, so a session-only operator would not need to
-/// configure the realm explicitly. Charge keeps its own copy of the
-/// constant because the two surfaces are otherwise unrelated.
+/// Default realm in the WWW-Authenticate header. Matches charge's
+/// `"MPP Payment"` so a session-only operator doesn't need to set
+/// the realm explicitly; charge keeps its own copy of the constant
+/// because the two surfaces are otherwise unrelated.
 const DEFAULT_REALM: &str = "MPP Payment";
 
-/// Env var holding the HMAC secret. Same name as charge so an operator
-/// running both intents on one process only sets one variable.
+/// Env var holding the HMAC secret. Same name as charge so running
+/// both intents in one process only takes one variable.
 const SECRET_KEY_ENV_VAR: &str = "MPP_SECRET_KEY";
 
 const DEFAULT_CHALLENGE_TTL_SECONDS: u32 = 300;
-const DEFAULT_CLOCK_SKEW_SECONDS: u32 = 5;
-const DEFAULT_VOUCHER_CHECK_GRACE_SECONDS: u32 = 15;
+pub(crate) const DEFAULT_CLOCK_SKEW_SECONDS: u32 = 5;
+pub(crate) const DEFAULT_VOUCHER_CHECK_GRACE_SECONDS: u32 = 15;
 
-/// Solana cluster the session lives on. The string form doubles as the
-/// chain id slug embedded in DIDs and in `methodDetails.network`.
+/// Cluster this session lives on. The string form is the chain-id slug
+/// in DIDs and `methodDetails.network`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
     MainnetBeta,
@@ -83,16 +82,16 @@ impl Network {
     }
 }
 
-/// Per-unit pricing the operator advertises in the 402 challenge body.
+/// Per-unit pricing advertised in the 402 challenge body.
 #[derive(Debug, Clone)]
 pub struct Pricing {
     pub amount_per_unit: u64,
     pub unit_type: String,
 }
 
-/// Server-side fee-payer signer. The SDK does not persist key material;
-/// the operator wraps their custody (env, KMS, HSM, wallet file) inside
-/// a [`solana_keychain::SolanaSigner`] impl and hands it through here.
+/// Server-side fee-payer signer. The SDK never persists key material;
+/// wrap your custody (env, KMS, HSM, wallet file) in a
+/// [`solana_keychain::SolanaSigner`] and pass it through.
 #[derive(Clone)]
 pub struct FeePayer {
     pub signer: Arc<dyn solana_keychain::SolanaSigner>,
@@ -106,9 +105,9 @@ impl std::fmt::Debug for FeePayer {
     }
 }
 
-/// Operator-supplied configuration. Wired into [`SessionBuilder`] before
-/// `recover()` produces a [`SessionMethod`]; the store and RPC client
-/// flow in through the builder, not through here.
+/// Operator-supplied config. Hand it to [`SessionBuilder`] before
+/// `recover()`. Store and RPC client come in through the builder, not
+/// here.
 #[derive(Clone)]
 pub struct SessionConfig {
     pub operator: Pubkey,
@@ -118,49 +117,45 @@ pub struct SessionConfig {
     pub network: Network,
     pub program_id: Pubkey,
     pub pricing: Pricing,
-    /// `Σ share_bps <= 10_000`; the payee receives the implicit
-    /// remainder.
+    /// `Σ share_bps <= 10_000`; payee gets the remainder.
     pub splits: Vec<Split>,
     pub max_deposit: u64,
     pub min_deposit: u64,
     pub min_voucher_delta: u64,
     pub voucher_ttl_seconds: u32,
     pub grace_period_seconds: u32,
-    /// Bound on challenge cache lifetime. Defaults to 300s.
+    /// Challenge cache lifetime cap. Defaults to 300s.
     pub challenge_ttl_seconds: u32,
-    /// Commitment level used for RPC reads inside the lifecycle. The
-    /// upstream `verify_*` helpers thread this through. Defaults to
+    /// Commitment level for RPC reads inside the lifecycle. Threaded
+    /// through to the upstream `verify_*` helpers. Defaults to
     /// `Confirmed`.
     pub commitment: CommitmentConfig,
-    /// How long the open-tx broadcast loop waits for the cluster to
-    /// surface the submitted signature at `Confirmed` before giving up
-    /// and returning `OpenTxUnconfirmed`. Defaults to 30s, which covers
-    /// devnet round-trips with headroom.
+    /// How long to wait for the open tx to land at `Confirmed` before
+    /// giving up with `OpenTxUnconfirmed`. Defaults to 30s, comfortable
+    /// for devnet round-trips.
     pub broadcast_confirm_timeout: Duration,
-    /// Slack the voucher TTL check tolerates relative to wall-clock
-    /// drift. Defaults to 5s.
+    /// Wall-clock slack the voucher TTL check tolerates. Defaults to
+    /// 5s.
     pub clock_skew_seconds: u32,
-    /// How long after a voucher's `expires_at` the server will still
-    /// accept it (covers transient RPC delay between the client's
-    /// signing and the server's processing). Defaults to 15s.
+    /// Grace window after a voucher's `expires_at` for transient RPC
+    /// delay between sign and submit. Defaults to 15s.
     pub voucher_check_grace_seconds: u32,
     pub fee_payer: Option<FeePayer>,
-    /// Realm advertised in the WWW-Authenticate header. `None` falls
-    /// back to [`DEFAULT_REALM`] (`"MPP Payment"`).
+    /// Realm advertised in the WWW-Authenticate header. Falls back to
+    /// [`DEFAULT_REALM`] (`"MPP Payment"`) when `None`.
     pub realm: Option<String>,
-    /// HMAC key used to derive deterministic challenge ids. Operators
-    /// MUST set this to a secret unique to their deployment.
-    /// `None` falls back to the `MPP_SECRET_KEY` env var; if both are
-    /// absent, [`SessionBuilder::recover`] returns an error.
+    /// HMAC key for deterministic challenge ids. Set this to something
+    /// unique to your deployment. `None` falls back to the
+    /// `MPP_SECRET_KEY` env var; if both are missing,
+    /// [`SessionBuilder::recover`] errors out.
     pub secret_key: Option<String>,
 }
 
 impl SessionConfig {
-    /// Produce a config with sane defaults for everything that has one.
-    /// Required identifiers (`operator`, `payee`, `mint`, `program_id`)
-    /// still need to be set by the caller. `secret_key` is left `None`
-    /// so the resolver in [`SessionBuilder::recover`] can fall back to
-    /// the `MPP_SECRET_KEY` env var.
+    /// Config with reasonable defaults. The required identifiers
+    /// (`operator`, `payee`, `mint`, `program_id`) still need to be
+    /// provided. `secret_key` stays `None` so the resolver can pick
+    /// up `MPP_SECRET_KEY` from the env.
     pub fn new_with_defaults(
         operator: Pubkey,
         payee: Pubkey,
@@ -196,10 +191,9 @@ impl SessionConfig {
     }
 }
 
-/// Resolve the operator's `secret_key` Option into a concrete string,
-/// falling back to the `MPP_SECRET_KEY` env var. Returns
-/// [`SessionError::InternalError`] if neither is set so the operator
-/// gets the same shape they get for other recover-time misconfiguration.
+/// Pick the secret key from config, falling back to the env var.
+/// Returns `InternalError` when neither is set, matching the shape of
+/// other recover-time misconfiguration errors.
 fn resolve_secret_key(opt: &Option<String>) -> Result<String, SessionError> {
     if let Some(s) = opt {
         return Ok(s.clone());
@@ -211,30 +205,28 @@ fn resolve_secret_key(opt: &Option<String>) -> Result<String, SessionError> {
     })
 }
 
-/// Resolve the operator's `realm` Option, defaulting to
-/// [`DEFAULT_REALM`].
+/// Pick the realm, defaulting to [`DEFAULT_REALM`].
 fn resolve_realm(opt: &Option<String>) -> String {
     opt.clone().unwrap_or_else(|| DEFAULT_REALM.to_string())
 }
 
-/// Optional advisory fields a caller can attach to an `Open` challenge.
-/// Description and external id flow into the challenge itself; both are
-/// pure passthrough.
+/// Advisory fields a caller can attach to an `Open` challenge.
+/// Both description and external id are pure passthrough.
 #[derive(Debug, Clone, Default)]
 pub struct OpenChallengeOptions {
     pub description: Option<String>,
     pub external_id: Option<String>,
 }
 
-/// Tuning knobs for the recovery walk that gates `SessionMethod`
-/// construction.
+/// Tuning knobs for the recovery walk that runs before
+/// `SessionMethod` is built.
 #[derive(Debug, Clone)]
 pub struct RecoveryOptions {
-    /// If true, the recovery walk treats unsettled mid-session revenue
-    /// as a warning rather than a fatal error. Off by default; flip
-    /// only if you understand the audit implications.
+    /// When true, unsettled mid-session revenue is a warning instead
+    /// of a fatal startup error. Off by default; only flip if you've
+    /// thought through the audit story.
     pub allow_unsettled_on_startup: bool,
-    /// Concurrency cap for the per-channel inspect phase.
+    /// Concurrency cap on the per-channel inspect phase.
     pub parallelism: usize,
 }
 
@@ -247,10 +239,9 @@ impl Default for RecoveryOptions {
     }
 }
 
-/// Output of `prepare_open`: the co-signed transaction plus the typed
-/// values needed by `finalize_open` to verify on-chain state and persist
-/// the channel record. Held only between broadcast preparation and the
-/// confirm-poll handoff; never crosses the public API.
+/// Handoff between `prepare_open` and `finalize_open`: the co-signed
+/// transaction plus the typed values needed for the on-chain verify
+/// and the persisted channel record. Internal only.
 struct PreparedOpen {
     tx: Transaction,
     channel_id: Pubkey,
@@ -266,23 +257,22 @@ struct PreparedOpen {
 
 /// Server-side handler for the session intent.
 ///
-/// Constructed exclusively through [`SessionBuilder::recover`]; recovery
-/// is a hard prerequisite for serving requests.
+/// Only built via [`SessionBuilder::recover`]; recovery has to run
+/// before we'll serve anything.
 pub struct SessionMethod {
     config: SessionConfig,
-    /// Resolved HMAC secret. Materialised once during construction from
-    /// `config.secret_key` or the `MPP_SECRET_KEY` env var so the hot
-    /// path never re-reads the env.
+    /// HMAC secret resolved at construction (from config or env) so
+    /// the hot path doesn't re-read the env.
     secret_key: String,
-    /// Resolved realm string with the default applied.
+    /// Realm with the default applied.
     realm: String,
     store: Arc<dyn ChannelStore>,
     rpc: Arc<RpcClient>,
     cache: ChallengeCache,
-    /// Plain `JoinHandle` because `SessionMethod` is not `Clone`; `Drop`
-    /// always owns the only handle. If `SessionMethod` ever becomes
-    /// `Clone`, switch to `Arc<JoinHandle>` with a `strong_count == 1`
-    /// guard so the sweeper survives until the last clone is dropped.
+    /// Plain `JoinHandle` because `SessionMethod` is not `Clone`, so
+    /// the `Drop` impl owns the only handle. If we ever make this
+    /// `Clone`, switch to `Arc<JoinHandle>` and guard on
+    /// `strong_count == 1` so the sweeper outlives every clone.
     sweeper: JoinHandle<()>,
 }
 
@@ -298,18 +288,16 @@ impl std::fmt::Debug for SessionMethod {
 }
 
 impl SessionMethod {
-    /// Construct a fresh handler. Spawns the background sweeper that
+    /// Build a fresh handler and spawn the background sweeper that
     /// evicts cache entries older than `2 * challenge_ttl_seconds`.
     ///
-    /// `pub(crate)` because [`SessionBuilder::recover`] is the sole
-    /// supported entry point. Action handlers and recovery code inside
-    /// this crate may use this directly.
+    /// `pub(crate)` because [`SessionBuilder::recover`] is the only
+    /// supported public entry; action handlers and recovery code in
+    /// this crate use it directly.
     ///
-    /// If `recover()` returns `Err` mid-flight (e.g. the on-chain walk
-    /// fails), the `SessionMethod` returned here is dropped at the end
-    /// of the failed call. The `Drop` impl below aborts the sweeper, so
-    /// no background task survives a failed recovery. Future changes
-    /// to the recovery flow must preserve this cleanup invariant.
+    /// If `recover()` errors out mid-flight, this `SessionMethod` is
+    /// dropped on the way out and the `Drop` impl aborts the sweeper.
+    /// Keep that cleanup intact when changing the recovery flow.
     pub(crate) fn new_for_recover(
         config: SessionConfig,
         store: Arc<dyn ChannelStore>,
@@ -346,8 +334,8 @@ impl SessionMethod {
         &self.cache
     }
 
-    /// Issue an `Open` challenge bound to the operator's advertised
-    /// payee, mint, splits, and deposit bounds.
+    /// Issue an `Open` challenge bound to the configured payee,
+    /// mint, splits, and deposit bounds.
     pub async fn build_challenge_for_open(
         &self,
         opts: OpenChallengeOptions,
@@ -376,12 +364,11 @@ impl SessionMethod {
         Ok(challenge)
     }
 
-    /// Build the typed `SessionRequest` that goes on the wire for an
-    /// `Open` challenge. Pure: no RPC, no cache mutation, lets unit
-    /// tests pin the body shape without spinning up a live cluster.
-    /// Action handlers re-validate intent fields against the cached
-    /// `ChallengeIntent` on entry, so the wire body is the client-facing
-    /// advertisement, not the source of truth.
+    /// Wire-shape `SessionRequest` for an `Open` challenge. Pure: no
+    /// RPC, no cache mutation, so unit tests can pin the body without
+    /// a live cluster. Handlers re-validate against the cached
+    /// `ChallengeIntent`, so this is the advertised wire body, not
+    /// the source of truth.
     fn session_request_for_open(
         &self,
         opts: &OpenChallengeOptions,
@@ -425,8 +412,8 @@ impl SessionMethod {
         }
     }
 
-    /// Issue a `TopUp` challenge bound to a known channel id and the
-    /// channel's persisted splits.
+    /// Issue a `TopUp` challenge for a known channel id, using the
+    /// channel's persisted splits as the wire shape.
     pub async fn build_challenge_for_topup(
         &self,
         channel_id: &Pubkey,
@@ -455,15 +442,14 @@ impl SessionMethod {
         Ok(challenge)
     }
 
-    /// Issue a `Close` challenge bound to a known channel id.
+    /// Issue a `Close` challenge for a known channel id.
     pub async fn build_challenge_for_close(
         &self,
         channel_id: &Pubkey,
     ) -> Result<PaymentChallenge, SessionError> {
-        // Surface a typed error early if the channel is not known to
-        // this server; the close handler will redo this check, but
-        // failing here avoids handing out a challenge we already know
-        // we cannot honour.
+        // Bail early if the channel is unknown. The close handler
+        // checks again, but no point handing out a challenge we
+        // already know we can't honour.
         let record = self
             .store
             .get(channel_id)
@@ -488,9 +474,8 @@ impl SessionMethod {
         Ok(challenge)
     }
 
-    /// Shared `SessionRequest` factory for topup and close challenges,
-    /// both of which target a known channel and reuse the channel's
-    /// persisted splits as the advertised wire shape.
+    /// Shared `SessionRequest` builder for topup and close. Both
+    /// target a known channel and reuse its persisted splits.
     fn session_request_for_known_channel(
         &self,
         channel_id: &Pubkey,
@@ -537,47 +522,43 @@ impl SessionMethod {
 
     /// Server entry point for the `open` action.
     ///
-    /// Validates the cached challenge, the wire payload, and the client's
-    /// partial-signed transaction, then co-signs as fee payer, broadcasts,
-    /// and persists the resulting channel record.
+    /// Checks the cached challenge, the wire payload, and the client's
+    /// partial-signed tx, then co-signs as fee payer, broadcasts, and
+    /// persists the channel record.
     ///
-    /// Challenge lifecycle around broadcast: the reservation is taken
-    /// before any RPC work. Errors raised BEFORE `send_transaction` lands
-    /// release the reservation so the client can retry without burning a
-    /// challenge. The moment the cluster accepts the transaction
-    /// (`send_transaction` returns Ok), the challenge is committed
-    /// (Pending to Consumed). This closes a retry-window race: a
-    /// confirm-poll timeout returning `OpenTxUnconfirmed(sig)` while the
-    /// transaction lands a moment later would otherwise let the client
-    /// retry under the same challenge id and broadcast a second open for
-    /// the same intent. After commit, any subsequent error (timeout or
-    /// `verify_open` failure) propagates to the caller with the challenge
-    /// already consumed; reconciliation of an unconfirmed signature is
-    /// the recovery layer's job.
+    /// The challenge gets reserved before any RPC. Anything that fails
+    /// before `send_transaction` succeeds releases the reservation so
+    /// the client can retry. Once `send_transaction` returns Ok the
+    /// cluster has accepted the tx and the challenge flips to Consumed
+    /// immediately, before the confirm poll: otherwise a confirm-poll
+    /// timeout could let the client re-broadcast the same intent
+    /// against a tx that's still landing. After Consumed, any later
+    /// error (timeout, verify failure) bubbles up with the challenge
+    /// already burned and recovery handles signature reconciliation.
     pub async fn process_open(
         &self,
         payload: &OpenPayload,
     ) -> Result<Receipt, SessionError> {
-        // 1. Reserve the challenge for `Open` intent.
+        // Reserve under `Open` intent.
         let cached = self
             .cache
             .reserve(&payload.challenge_id, ChallengeIntentDiscriminant::Open)?;
 
-        // 2 to 5. Pre-broadcast validation. Any error here releases the
-        //         reservation so the client can retry.
+        // Pre-broadcast validation. Anything failing here releases the
+        // reservation so the client can retry.
         let prepared = match self.prepare_open(payload, &cached).await {
             Ok(p) => p,
             Err(e) => {
-                // Release best-effort; ignore the secondary error so the
-                // primary failure surfaces to the caller.
+                // Best-effort release; swallow the secondary error so the
+                // primary failure reaches the caller.
                 let _ = self.cache.release(&payload.challenge_id);
                 return Err(e);
             }
         };
 
-        // 6. Broadcast. Once `send_transaction` returns Ok, the cluster
-        //    has accepted the tx and the challenge MUST be marked
-        //    Consumed. From here on out, no error path may release.
+        // Broadcast. Once `send_transaction` returns Ok the cluster has
+        // accepted the tx, so from here on we never release the
+        // challenge.
         let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
             preflight_commitment: Some(self.config.commitment.commitment),
             ..Default::default()
@@ -590,28 +571,26 @@ impl SessionMethod {
             }
         };
 
-        // Commit the challenge BEFORE the confirm poll. A confirm-poll
-        // timeout at 30s does not mean the tx failed; it just means the
-        // server has not seen Confirmed yet. Releasing here would let the
-        // client re-broadcast against a tx that may still land, producing
-        // a duplicate. The recovery layer reconciles unconfirmed signatures.
+        // Commit before the confirm poll. A 30s timeout doesn't mean the
+        // tx failed, just that we haven't seen Confirmed yet; releasing
+        // would let the client re-broadcast a duplicate while the
+        // original lands. Recovery reconciles unconfirmed signatures.
         self.cache.commit(&payload.challenge_id)?;
 
-        // 6b to 8. Confirm + verify + persist. Errors propagate with the
-        //          challenge already consumed.
+        // Confirm + verify + persist. Errors propagate with the
+        // challenge already consumed.
         self.finalize_open(payload, prepared, tx_sig).await
     }
 
-    /// Pre-broadcast preparation. Validates everything from the cached
-    /// challenge through tx-shape co-signing. Errors here are safe to
-    /// release the reservation against.
+    /// Pre-broadcast prep. Runs every check from the cached challenge
+    /// through tx-shape co-signing. Failures here are safe to release.
     async fn prepare_open(
         &self,
         payload: &OpenPayload,
         cached: &ChallengeRecord,
     ) -> Result<PreparedOpen, SessionError> {
-        // 2. Decode wire splits to typed `Split`s, then assert the cached
-        //    intent's advertised fields match the payload.
+        // Decode wire splits and check the cached intent's advertised
+        // fields against the payload.
         let payload_splits = wire_to_typed(&payload.distribution_splits, |m| {
             SessionError::ChallengeFieldMismatch {
                 field: "distributionSplits",
@@ -629,7 +608,8 @@ impl SessionMethod {
                     min_deposit,
                     max_deposit,
                 } => (*payee, *mint, advertised_splits.clone(), *min_deposit, *max_deposit),
-                // Discriminant was checked at reserve; this arm is unreachable.
+                // Discriminant was checked at reserve, so this arm is
+                // unreachable.
                 _ => {
                     return Err(SessionError::ChallengeIntentMismatch);
                 }
@@ -671,8 +651,8 @@ impl SessionMethod {
             });
         }
 
-        // 3. Re-derive (channel_pda, canonical_bump). Reject on PDA or bump
-        //    drift before any tx-shape work runs.
+        // Re-derive `(channel_pda, canonical_bump)` and reject on
+        // drift before doing any tx-shape work.
         let payer = parse_pubkey_field("payer", &payload.payer)?;
         let authorized_signer =
             parse_pubkey_field("authorizedSigner", &payload.authorized_signer)?;
@@ -703,7 +683,7 @@ impl SessionMethod {
             });
         }
 
-        // 4. Validate the client's tx shape against the canonical bytes.
+        // Compare the submitted tx against the canonical bytes.
         let DecodedOpenTx {
             mut tx,
             channel_id,
@@ -712,18 +692,16 @@ impl SessionMethod {
             grace_period: tx_grace,
             canonical_bump: tx_bump,
         } = validate_open_tx_shape(payload, &payload_splits, &self.config, &cached.recent_blockhash)?;
-        // Cross-check the decoded values match what the payload claimed.
-        // These are post-hoc sanity asserts; the canonical-bytes comparison
-        // already covers byte equivalence, but the typed-value cross-check
-        // surfaces a clearer error if the payload-vs-tx parsing layers ever
-        // drift.
+        // Sanity asserts. The canonical-bytes comparison above already
+        // covers equivalence, but a typed cross-check gives a clearer
+        // error if the payload-vs-tx parsing layers drift.
         debug_assert_eq!(tx_salt, salt);
         debug_assert_eq!(tx_deposit, deposit);
         debug_assert_eq!(tx_grace, self.config.grace_period_seconds);
         debug_assert_eq!(tx_bump, canonical_bump);
         debug_assert_eq!(channel_id, expected_pda);
 
-        // 5. Co-sign as fee payer. Slot 0 is the fee-payer signature.
+        // Co-sign as fee payer. Signature slot 0 is the fee-payer.
         let fee_payer = self.config.fee_payer.as_ref().ok_or_else(|| {
             SessionError::InternalError("fee_payer not configured; v1 is server-submit".into())
         })?;
@@ -754,11 +732,11 @@ impl SessionMethod {
         })
     }
 
-    /// Post-broadcast finalisation. The challenge is already committed
-    /// before this runs; failures here propagate to the caller without
-    /// releasing. A confirm-poll timeout surfaces `OpenTxUnconfirmed(sig)`
-    /// so the operator log carries the real signature; the recovery layer
-    /// reconciles signatures that landed but did not confirm in time.
+    /// Post-broadcast finalisation. By the time this runs the challenge
+    /// is already Consumed, so failures bubble up without releasing.
+    /// A confirm-poll timeout returns `OpenTxUnconfirmed(sig)` so the
+    /// real signature ends up in operator logs; recovery handles
+    /// signatures that landed late.
     async fn finalize_open(
         &self,
         payload: &OpenPayload,
@@ -778,8 +756,7 @@ impl SessionMethod {
             payload_splits,
         } = prepared;
 
-        // Poll for Confirmed commitment, bounded by the operator-configured
-        // `broadcast_confirm_timeout`.
+        // Poll for Confirmed, bounded by `broadcast_confirm_timeout`.
         let confirm_commitment = CommitmentConfig::confirmed();
         let mut confirmed = false;
         let confirm_deadline = std::time::Instant::now() + self.config.broadcast_confirm_timeout;
@@ -804,8 +781,8 @@ impl SessionMethod {
             return Err(SessionError::OpenTxUnconfirmed(tx_sig));
         }
 
-        // Mandatory on-chain verify. Map the typed VerifyError onto the
-        // surface error with the offending field name.
+        // On-chain verify. Map `VerifyError` onto the public surface
+        // error, carrying the offending field name.
         verify_open(
             &self.rpc,
             self.config.commitment,
@@ -823,8 +800,8 @@ impl SessionMethod {
         .await
         .map_err(|e| verify_error_to_session_error(e, &channel_id))?;
 
-        // Persist the record. Hold the insert until verify succeeds so a
-        // cluster-disagreement does not write through to the store.
+        // Insert only after verify succeeds, so a cluster-disagreement
+        // never writes through to the store.
         let record = ChannelRecord {
             channel_id,
             payer,
@@ -849,7 +826,23 @@ impl SessionMethod {
             timestamp: rfc3339_now(),
             reference: tx_sig.to_string(),
             challenge_id: payload.challenge_id.clone(),
+            accepted_cumulative: None,
+            spent: None,
         })
+    }
+
+    /// Server entry point for voucher submission.
+    ///
+    /// Off-chain validation plus an atomic store CAS: signature and
+    /// payload checks first, then `advance_watermark` linearises the
+    /// per-channel race. CAS losers get the winner's cached receipt
+    /// bytes back, so two callers at the same cumulative see the same
+    /// receipt the network committed to.
+    pub async fn verify_voucher(
+        &self,
+        signed: &crate::protocol::intents::session::SignedVoucher,
+    ) -> Result<Receipt, SessionError> {
+        voucher::run_verify_voucher(self.store.as_ref(), &self.config, signed).await
     }
 
     fn build_challenge(
@@ -857,11 +850,10 @@ impl SessionMethod {
         encoded: Base64UrlJson,
         description: Option<&str>,
     ) -> Result<PaymentChallenge, SessionError> {
-        // Trailing `None`s are `expires`, `digest`, `opaque` per the
-        // signature in `protocol::core::challenge::compute_challenge_id`.
-        // Sessions do not pin an explicit expiry on the HMAC input
-        // (the cache TTL handles that out-of-band) and have no body
-        // digest or opaque echo to commit, so all three are None.
+        // Trailing `None`s match `compute_challenge_id`'s
+        // `expires`/`digest`/`opaque` slots. Sessions don't pin an
+        // expiry into the HMAC input (cache TTL covers that) and
+        // there's no body digest or opaque echo to commit.
         let id = compute_challenge_id(
             &self.secret_key,
             &self.realm,
@@ -885,9 +877,9 @@ impl SessionMethod {
         })
     }
 
-    /// Realm string with the default applied. Use this in
-    /// WWW-Authenticate header construction so reads see the resolved
-    /// value, not the operator's `Option<String>`.
+    /// Realm with the default applied. Use this when building
+    /// WWW-Authenticate headers so reads see the resolved value, not
+    /// the raw `Option<String>` from config.
     pub fn realm(&self) -> &str {
         &self.realm
     }
@@ -895,14 +887,14 @@ impl SessionMethod {
 
 impl Drop for SessionMethod {
     fn drop(&mut self) {
-        // `SessionMethod` is not `Clone`, so this drop owns the only
-        // handle to the sweeper task. Aborting unconditionally is safe.
+        // We're not `Clone`, so this drop owns the only sweeper handle
+        // and aborting unconditionally is safe.
         self.sweeper.abort();
     }
 }
 
-/// Entry point: hand a config in, get a builder back. Wire the store
-/// and RPC client through the builder before calling `recover()`.
+/// Hand a config in, get a builder back. Set the store and RPC
+/// client on the builder before calling `recover()`.
 pub fn session(config: SessionConfig) -> SessionBuilder {
     SessionBuilder {
         config,
@@ -938,12 +930,10 @@ impl SessionBuilder {
     /// Run startup recovery and produce a [`SessionMethod`] only after
     /// every persisted channel has been reconciled with the cluster.
     ///
-    /// The recovery walk itself is filled in by a follow-up. This
-    /// skeleton validates that the store and RPC client are wired up
-    /// (so misconfiguration surfaces an obvious error) and then
-    /// returns a typed "not yet implemented" failure. Downstream
-    /// callers can still take a compile-time dependency on the
-    /// builder shape today.
+    /// The recovery walk itself isn't here yet. For now this checks
+    /// that store and RPC are wired (so misconfig surfaces obviously)
+    /// and returns a typed "not yet implemented" so callers can still
+    /// depend on the builder shape.
     pub async fn recover(self) -> Result<SessionMethod, SessionError> {
         let store = self.store.ok_or_else(|| {
             SessionError::InternalError("session builder missing store; call with_store".into())
@@ -952,12 +942,11 @@ impl SessionBuilder {
             SessionError::InternalError("session builder missing rpc; call with_rpc".into())
         })?;
 
-        // Construct the eventual handler shape so the type stays
-        // exercised by `cargo check` even before the recovery walk
-        // lands. Drop it immediately so the sweeper is not left
-        // running. `new_for_recover` resolves `secret_key` / `realm`
-        // up front, so a bad secret config fails here rather than at
-        // first challenge issuance.
+        // Build the eventual handler shape so `cargo check` keeps
+        // exercising it before the recovery walk exists. Drop it
+        // straight away so the sweeper doesn't keep running.
+        // `new_for_recover` resolves `secret_key` and `realm` up front
+        // so a bad secret config fails here, not on first challenge.
         let _ = self.recovery;
         drop(SessionMethod::new_for_recover(self.config, store, rpc)?);
 
@@ -968,7 +957,7 @@ impl SessionBuilder {
 }
 
 fn spawn_sweeper(cache: ChallengeCache, ttl_seconds: u32) -> JoinHandle<()> {
-    // Wake every `ttl_seconds`. Each tick reclaims entries older than
+    // Tick every `ttl_seconds` and reclaim entries older than
     // `2 * ttl` so a Pending record gets a grace window before being
     // evicted out from under a slow handler.
     let period = ttl_seconds.max(1) as u64;
@@ -976,7 +965,7 @@ fn spawn_sweeper(cache: ChallengeCache, ttl_seconds: u32) -> JoinHandle<()> {
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(period));
-        // Skip the immediate first tick; the cache is empty at startup.
+        // Skip the immediate first tick: cache is empty at startup.
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -992,13 +981,13 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-fn rfc3339_now() -> String {
+pub(crate) fn rfc3339_now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-/// Decode a base58-encoded pubkey field from a wire payload.
+/// Decode a base58 pubkey field from a wire payload.
 fn parse_pubkey_field(field: &'static str, raw: &str) -> Result<Pubkey, SessionError> {
     let bytes = bs58::decode(raw)
         .into_vec()
@@ -1017,22 +1006,19 @@ fn parse_pubkey_field(field: &'static str, raw: &str) -> Result<Pubkey, SessionE
     Ok(Pubkey::new_from_array(arr))
 }
 
-/// Map a `solana_client::ClientError` into the right `SessionError`.
+/// Map a `solana_client::ClientError` to the right `SessionError`.
 ///
-/// The blanket `From<ClientError>` impl lands every RPC failure in
-/// `RpcUnavailable` (5xx), which is wrong for blockhash expiry: that is a
-/// client-recoverable condition, the client should re-acquire a challenge
-/// with a fresh blockhash. This helper sniffs `BlockhashNotFound`
-/// surfaced via the simulated-tx path (returned as `TransactionError`)
-/// and routes it to `BlockhashMismatch` (4xx, 409) so the client backs
-/// off correctly. Anything else falls through to `RpcUnavailable`.
+/// The blanket `From<ClientError>` lands every RPC failure in
+/// `RpcUnavailable` (5xx), which is wrong for blockhash expiry: the
+/// client can fix it by grabbing a fresh challenge. This helper sniffs
+/// `BlockhashNotFound` out of the simulated-tx path and routes it to
+/// `BlockhashMismatch` (409). Everything else falls through to
+/// `RpcUnavailable`.
 ///
-/// Note: many blockhash-expiry signals only show up at simulation time
-/// because the Solana RPC API exposes the `TransactionError` only when
-/// the cluster has actually attempted the tx. Pre-send "blockhash too old"
-/// detection is not reliably exposed by the upstream client; this helper
-/// catches the common case (post-send signal) and otherwise treats the
-/// failure as transient infra.
+/// Most blockhash-expiry signals only surface at simulation time
+/// because the upstream client exposes `TransactionError` only after
+/// the cluster has tried the tx. Pre-send detection isn't reliable, so
+/// this catches the post-send case and treats the rest as transient.
 fn client_error_to_session_error(e: ClientError) -> SessionError {
     if matches!(e.get_transaction_error(), Some(TransactionError::BlockhashNotFound)) {
         return SessionError::BlockhashMismatch {
@@ -1043,8 +1029,8 @@ fn client_error_to_session_error(e: ClientError) -> SessionError {
     SessionError::from(e)
 }
 
-/// Map `verify_open`'s `VerifyError` into a typed `SessionError`,
-/// surfacing the offending on-chain field name in the conflict variants.
+/// Map `verify_open`'s `VerifyError` to a `SessionError`, carrying
+/// the offending on-chain field name on the conflict variants.
 fn verify_error_to_session_error(e: VerifyError, channel_id: &Pubkey) -> SessionError {
     match e {
         VerifyError::NotFound => SessionError::OnChainStateMismatch {
@@ -1150,8 +1136,8 @@ mod tests {
     use solana_hash::Hash;
 
     fn dummy_method() -> SessionMethod {
-        // Local URL only; no RPC call is made by these tests because we
-        // exercise the pure body builder directly.
+        // Local URL only; these tests exercise the pure body builder
+        // and never hit the RPC.
         let rpc = Arc::new(RpcClient::new("http://127.0.0.1:8899".to_string()));
         let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
         let config = SessionConfig {
@@ -1185,10 +1171,10 @@ mod tests {
 
     #[tokio::test]
     async fn external_id_appears_in_open_challenge_body() {
-        // External id flows from `OpenChallengeOptions` into the wire
-        // body's `externalId` field. The challenge factory stores the
-        // same value on the cache `ChallengeRecord`; this test pins the
-        // wire path because that is the surface the client sees.
+        // `external_id` flows from `OpenChallengeOptions` into the wire
+        // body's `externalId`. The cache record carries the same value;
+        // this test pins the wire path since that's what the client
+        // sees.
         let method = dummy_method();
         let opts = OpenChallengeOptions {
             description: Some("rent-a-frame".into()),
@@ -1198,8 +1184,8 @@ mod tests {
         let value = serde_json::to_value(&request).expect("request serializes");
         assert_eq!(value.get("externalId"), Some(&serde_json::json!("ext-123")));
 
-        // Round-trip through Base64UrlJson to confirm the encoded body
-        // also carries the field.
+        // Round-trip through `Base64UrlJson` to confirm the encoded
+        // body also carries the field.
         let encoded = Base64UrlJson::from_typed(&request).expect("encode body");
         let decoded: serde_json::Value = encoded.decode_value().expect("decode body");
         assert_eq!(
@@ -1210,19 +1196,17 @@ mod tests {
 
     #[tokio::test]
     async fn open_commits_challenge_before_confirm_poll() {
-        // Pins the post-broadcast ordering inside `process_open`:
-        // once `send_transaction` returns Ok, the cache is moved to
-        // Consumed BEFORE the confirm poll. A confirm-poll timeout
-        // later returning `OpenTxUnconfirmed` must therefore leave the
-        // record in Consumed state, not Available; otherwise the
-        // client could re-broadcast a duplicate tx for the same
-        // intent if the original lands a moment after the timeout.
+        // Pin the post-broadcast ordering inside `process_open`. Once
+        // `send_transaction` returns Ok, the cache moves to Consumed
+        // before the confirm poll runs; a later `OpenTxUnconfirmed`
+        // therefore leaves the record Consumed, not Available, so the
+        // client can't re-broadcast a duplicate if the original lands
+        // a moment after the timeout.
         //
-        // We exercise the cache state machine directly here because
-        // driving the surrounding broadcast + verify + persist surface
-        // needs a live cluster. The live path is covered by the L1
-        // oracle; this test locks the invariant `process_open`
-        // depends on.
+        // The cache state machine runs directly here; driving the
+        // surrounding broadcast/verify/persist needs a live cluster
+        // and the L1 oracle covers that. This test just locks the
+        // ordering `process_open` relies on.
         let method = dummy_method();
         let challenge_id = "test-challenge-id-open-commit-ordering".to_string();
         let intent = ChallengeIntent::Open {
@@ -1241,8 +1225,8 @@ mod tests {
             )
             .expect("seed challenge record");
 
-        // Reserve, then commit, mirroring the order `process_open`
-        // performs once `send_transaction` returns Ok.
+        // Reserve then commit, mirroring `process_open` after
+        // `send_transaction` returns Ok.
         method
             .cache
             .reserve(&challenge_id, ChallengeIntentDiscriminant::Open)
@@ -1262,8 +1246,8 @@ mod tests {
             "challenge must be Consumed after commit, not Available"
         );
 
-        // A second reservation under the same id must not succeed,
-        // regardless of whether the original tx ultimately confirmed.
+        // A second reservation on the same id must fail no matter
+        // what happens to the original tx.
         let err = method
             .cache
             .reserve(&challenge_id, ChallengeIntentDiscriminant::Open)
@@ -1276,9 +1260,9 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_external_id_is_absent_from_open_challenge_body() {
-        // `serde(skip_serializing_if = "Option::is_none")` on
-        // `SessionRequest::external_id` means an absent option must
-        // omit the JSON key entirely, not render it as `null`.
+        // `skip_serializing_if = "Option::is_none"` means an absent
+        // `external_id` should omit the JSON key entirely, not emit
+        // `null`.
         let method = dummy_method();
         let opts = OpenChallengeOptions {
             description: None,

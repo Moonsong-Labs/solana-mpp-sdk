@@ -1,22 +1,17 @@
-//! Channel state store for the session intent.
+//! Per-channel server-side state.
 //!
-//! `ChannelStore` is the persistence boundary for the server-side session
-//! lifecycle: it owns the canonical view of every channel the server has
-//! opened, the watermark it has accepted vouchers up to, and the on-chain
-//! settled value once a close confirms.
+//! `ChannelStore` holds what the server knows about each open channel:
+//! who's paying, the deposit, the watermark of vouchers we've accepted,
+//! and the on-chain settled value once a close confirms.
 //!
-//! The trait is async because production backends (Redis, Postgres, etc.)
-//! are network-bound. The CAS primitive on the trait, `advance_watermark`,
-//! is the single point where two concurrent voucher submissions for the
-//! same channel are linearized: exactly one caller observes `Advanced`,
-//! every other caller observes `Conflict` carrying the winner's signature
-//! and receipt bytes byte-for-byte (so the loser returns the network's
-//! committed receipt, not a re-derived one). Implementations MUST make
-//! that step atomic.
+//! `advance_watermark` is the only piece that has to be atomic. Two
+//! concurrent vouchers at the same cumulative will both call it; one
+//! wins (`Advanced`), the others get `Conflict` with the winner's
+//! cached receipt so we hand back the exact bytes the network saw,
+//! not a fresh re-derivation.
 //!
-//! Only an `InMemoryChannelStore` ships with the SDK; it is suitable for
-//! single-process demos and test harnesses, NOT production. See its doc
-//! comment for the operational caveats.
+//! `InMemoryChannelStore` is for tests and single-process demos.
+//! Anything production wants TTLs, persistence, and a real CAS.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,13 +100,11 @@ pub trait ChannelStore: Send + Sync {
 
     async fn insert(&self, record: ChannelRecord) -> Result<(), StoreError>;
 
-    /// Atomically advance the accepted watermark from `expected` to `new`,
-    /// commit `signature` + `receipt_bytes` as the winner's receipt, and
-    /// either return `Advanced { prior }` to the caller that won the race
-    /// or `Conflict { current, winner_signature, winner_receipt }` to every
-    /// loser. The conflict payload is the winner's cached entry, so loser
-    /// callers can return the network-committed receipt verbatim instead
-    /// of re-deriving one.
+    /// Advance the accepted watermark from `expected` to `new` atomically,
+    /// caching `signature` + `receipt_bytes` as the winner's receipt.
+    /// The winner sees `Advanced { prior }`; everyone else gets
+    /// `Conflict { current, winner_signature, winner_receipt }` so
+    /// they can hand back the network-committed receipt verbatim.
     async fn advance_watermark(
         &self,
         channel_id: &Pubkey,
@@ -145,16 +138,12 @@ pub trait ChannelStore: Send + Sync {
         sig: Signature,
     ) -> Result<(), StoreError>;
 
-    // Status mutators. Call-once per logical transition: each one drives the
-    // matrix in `check_transition` exactly one forward edge and rejects the
-    // self-edge with `StoreError::IllegalTransition` (the only intentional
-    // self-edge is `ClosedFinalized -> ClosedFinalized`, which lets a follow-up
-    // commitment poll be a no-op). Any flow that genuinely needs to re-enter a
-    // close-state mutator (e.g. fork rollback that re-runs the close path on a
-    // record already in `ClosedPending`) is the recovery layer's responsibility
-    // to bookkeep at the call-site, not this trait's. The trait surface stays
-    // narrow on purpose so backends do not have to reason about ambiguous
-    // self-edges.
+    // Status mutators. One forward edge per call; self-edges other than
+    // `ClosedFinalized -> ClosedFinalized` come back as
+    // `IllegalTransition`. The finalized self-edge is there so a repeated
+    // commitment poll is a no-op. If a flow needs to re-enter a close
+    // mutator (fork rollback, etc.), bookkeep that at the call-site
+    // rather than widening this trait.
     async fn mark_close_attempting(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
 
     async fn mark_close_rollback(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
@@ -193,22 +182,21 @@ pub trait ChannelStore: Send + Sync {
 
 // ── In-memory implementation ───────────────────────────────────────────────
 
-/// In-memory `ChannelStore` for single-process demos and tests.
+/// In-memory `ChannelStore` for tests and single-process demos.
 ///
-/// **Not production-grade.** The voucher cache and the records map both
-/// grow without bound; closed records are retained until explicitly
-/// `delete`d; and there is no persistence. Production backends MUST add
-/// TTL + LRU on the voucher cache and a retention policy on closed
-/// records.
+/// Not production-grade. The voucher cache and records map grow
+/// unboundedly, closed records stick around until you `delete` them,
+/// and nothing gets persisted. A production backend needs TTL + LRU
+/// on the voucher cache and a retention policy on closed records.
 pub struct InMemoryChannelStore {
     inner: Arc<RwLock<InMemoryInner>>,
 }
 
 struct InMemoryInner {
     records: HashMap<Pubkey, ChannelRecord>,
-    /// Voucher replay cache keyed by `(channel_id, cumulative)`. The value
-    /// is `(receipt_bytes, signature)`; on CAS conflict the loser returns
-    /// the cached receipt to its client byte-for-byte.
+    /// Replay cache keyed by `(channel_id, cumulative)`. Value is
+    /// `(receipt_bytes, signature)`; CAS losers hand the cached
+    /// receipt back to their client unchanged.
     voucher_cache: HashMap<(Pubkey, u64), (Vec<u8>, [u8; 64])>,
 }
 
@@ -281,11 +269,6 @@ impl ChannelStore for InMemoryChannelStore {
         signature: [u8; 64],
         receipt_bytes: Vec<u8>,
     ) -> Result<AdvanceOutcome, StoreError> {
-        if new <= expected {
-            return Err(StoreError::Other(format!(
-                "advance_watermark requires new ({new}) > expected ({expected})"
-            )));
-        }
         let mut g = self.inner.write().await;
         let record = g
             .records
@@ -471,14 +454,13 @@ impl ChannelStore for InMemoryChannelStore {
     }
 }
 
-// ── Generic KV store (used by the charge intent for replay protection) ──
+// ── Generic KV store (charge intent replay protection) ──
 //
-// Charge is a one-shot pay-once HTTP-402 flow. It stores `(signature, status)`
-// pairs to reject double-spends of the same on-chain signature, and an opaque
-// `serde_json::Value` blob keyed by string is the right abstraction for that.
-// This is intentionally separate from the session intent's typed `ChannelStore`:
-// the two cover different problems (one-shot replay protection vs. typed
-// per-channel lifecycle state) and there is no migration to plan for.
+// Charge stores `(signature, status)` pairs to reject double-spends of
+// the same on-chain signature. An opaque JSON blob keyed by string is
+// the right shape for that, and it's deliberately separate from the
+// session intent's typed `ChannelStore`: different problems, no
+// migration planned.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -500,8 +482,8 @@ pub trait Store: Send + Sync {
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
 
-    /// Atomically insert a value only if the key is absent. Returns `true`
-    /// on insert, `false` if the key was already present.
+    /// Insert only if the key isn't already there. Returns `true` on
+    /// insert, `false` on collision.
     fn put_if_absent(
         &self,
         key: &str,
@@ -712,7 +694,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Loser presents stale expected=0 with new=50; CAS should reject.
+        // Loser presents stale expected=0 with new=50; CAS rejects.
         let outcome = store
             .advance_watermark(&cid, 0, 50, make_sig(2), b"lose".to_vec())
             .await
@@ -742,8 +724,8 @@ mod tests {
             .await
             .unwrap();
 
-        // expected matches current watermark (0) but new (100) is also the
-        // current watermark, so the strict-greater check must reject.
+        // expected (0) matches the current watermark, but new (100) is
+        // also the current watermark, so the strict-greater check rejects.
         let outcome = store
             .advance_watermark(&cid, 0, 100, make_sig(2), b"lose".to_vec())
             .await
@@ -752,40 +734,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_watermark_rejects_new_le_expected() {
+    async fn advance_watermark_returns_conflict_on_equality_after_winner() {
         let store = InMemoryChannelStore::new();
         let cid = pk(1);
         store.insert(record(cid, 1_000)).await.unwrap();
 
-        // new < expected: pure caller bug. Cache empty; the precondition must
-        // fire before any CAS or cache lookup, so the error reflects the bad
-        // request, not "cas conflict but winner not cached".
+        // Winner advances 0 -> 100 and caches its receipt at (cid, 100).
+        let outcome = store
+            .advance_watermark(&cid, 0, 100, make_sig(0xAA), b"alpha".to_vec())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AdvanceOutcome::Advanced { prior: 0 }));
+
+        // Replay: the loser read the record after the winner committed,
+        // so its `expected == new == 100`. The CAS sees
+        // `accepted_cumulative == expected` but `new > expected` is false,
+        // falls into the cache-lookup branch, and hands back the winner's
+        // entry unchanged.
+        let outcome = store
+            .advance_watermark(&cid, 100, 100, make_sig(0xBB), b"beta".to_vec())
+            .await
+            .unwrap();
+        match outcome {
+            AdvanceOutcome::Conflict {
+                current,
+                winner_signature,
+                winner_receipt,
+            } => {
+                assert_eq!(current, 100);
+                assert_eq!(winner_signature, make_sig(0xAA));
+                assert_eq!(winner_receipt, b"alpha".to_vec());
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // Watermark still reflects the winner.
+        assert_eq!(store.get(&cid).await.unwrap().unwrap().accepted_cumulative, 100);
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_returns_other_on_strict_regression_with_no_cached_winner() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        // Caller-bug shape: `expected = 50`, `new = 25` against a fresh
+        // record (watermark 0). The CAS branch fails the equality check,
+        // the cache lookup at `(cid, 0)` misses since no winner ever
+        // committed, and the fallback fires.
         let err = store
-            .advance_watermark(&cid, 50, 10, make_sig(0), b"x".to_vec())
+            .advance_watermark(&cid, 50, 25, make_sig(0), b"x".to_vec())
             .await
             .unwrap_err();
         match err {
             StoreError::Other(msg) => assert!(
-                msg.contains("new (10)") && msg.contains("expected (50)"),
+                msg.contains("cas conflict at cumulative 0"),
                 "unexpected message: {msg}"
             ),
             other => panic!("expected StoreError::Other, got {other:?}"),
         }
 
-        // new == expected: also a caller bug. Same surface.
-        let err = store
-            .advance_watermark(&cid, 50, 50, make_sig(0), b"x".to_vec())
-            .await
-            .unwrap_err();
-        match err {
-            StoreError::Other(msg) => assert!(
-                msg.contains("new (50)") && msg.contains("expected (50)"),
-                "unexpected message: {msg}"
-            ),
-            other => panic!("expected StoreError::Other, got {other:?}"),
-        }
-
-        // The store must be untouched.
+        // Store should be untouched.
         assert_eq!(store.get(&cid).await.unwrap().unwrap().accepted_cumulative, 0);
     }
 
@@ -795,9 +804,9 @@ mod tests {
         let cid = pk(1);
         store.insert(record(cid, 10_000)).await.unwrap();
 
-        // Both tasks present the same target watermark. Linearization through
-        // the inner write lock ensures one wins, the other observes the
-        // winner's cached receipt.
+        // Both tasks aim for the same watermark; the inner write lock
+        // serialises them so one wins and the other reads the cached
+        // receipt back.
         let s1 = store.clone();
         let s2 = store.clone();
         let h1 = tokio::spawn(async move {
@@ -830,9 +839,8 @@ mod tests {
                 winner_receipt,
             } => {
                 assert_eq!(current, 500);
-                // The winner's signature was either AA or BB, but it is the
-                // signature recorded by whichever call landed first. The loser
-                // sees that exact pair.
+                // Whichever call landed first owns the cached pair; the
+                // loser sees those exact bytes.
                 assert!(winner_signature == make_sig(0xAA) || winner_signature == make_sig(0xBB));
                 assert!(winner_receipt == b"alpha".to_vec() || winner_receipt == b"beta".to_vec());
                 let expected_receipt = if winner_signature == make_sig(0xAA) {
@@ -886,7 +894,7 @@ mod tests {
             ChannelStatus::Open
         );
 
-        // After rollback, normal voucher acceptance must still work.
+        // Voucher acceptance still works after a rollback.
         let outcome = store
             .advance_watermark(&cid, 0, 50, make_sig(9), b"r".to_vec())
             .await
@@ -1065,8 +1073,8 @@ mod tests {
 
     #[tokio::test]
     async fn topup_during_concurrent_voucher_preserves_watermark() {
-        // Regression: targeted mutators (record_deposit) must not race-erase
-        // the watermark advanced by concurrent advance_watermark calls.
+        // Regression: a targeted mutator like `record_deposit` running
+        // alongside `advance_watermark` shouldn't clobber the watermark.
         let store = Arc::new(InMemoryChannelStore::new());
         let cid = pk(1);
         store.insert(record(cid, 1_000)).await.unwrap();
@@ -1098,7 +1106,7 @@ mod tests {
             .await
             .unwrap();
         store.mark_closed_finalized(&cid).await.unwrap();
-        // A second mark_closed_finalized must succeed (legal self-transition).
+        // The self-edge on Finalized is legal and should be a no-op.
         store.mark_closed_finalized(&cid).await.unwrap();
     }
 }

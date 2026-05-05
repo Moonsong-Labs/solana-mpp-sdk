@@ -1,18 +1,19 @@
-//! Wire-form error codes for MPP 402 problem-json bodies and
+//! Wire-form error codes for 402 problem-json bodies and
 //! `Payment-Receipt` headers.
 //!
-//! `MppErrorCode` is the camelCase token that operators and clients agree
-//! on. Servers tag every 402 response with one of these so the client can
-//! switch on a stable identifier rather than parsing free-form prose, and
-//! the token also rides along on `Payment-Receipt` when a receipt carries
-//! a non-success status.
+//! `MppErrorCode` is the camelCase token both sides agree on. Servers
+//! tag 402 responses with one of these so the client can switch on a
+//! stable identifier rather than parsing free-form prose. The same
+//! token rides along on `Payment-Receipt` when a receipt carries a
+//! non-success status.
 
 use serde::{Deserialize, Serialize};
 
-/// Stable wire-form error code emitted on 402 responses and receipts.
+/// Wire-form error code emitted on 402 responses and receipts.
 ///
-/// Serialization is camelCase: `ChallengeUnbound` becomes `"challengeUnbound"`,
-/// `VoucherOverDeposit` becomes `"voucherOverDeposit"`, and so on.
+/// Serialised as camelCase: `ChallengeUnbound` becomes
+/// `"challengeUnbound"`, `VoucherOverDeposit` becomes
+/// `"voucherOverDeposit"`, etc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
@@ -62,11 +63,11 @@ pub enum MppErrorCode {
     RecoveryRpcFailure,
     RecoveryBatchFailed,
 
-    // Infra (server-side dependency unavailable).
+    // Infra: server-side dependency unavailable.
     StoreUnavailable,
     RpcUnavailable,
 
-    // Catch-all for unexpected failures the client should treat as 5xx.
+    // Catch-all for unexpected 5xx-class failures.
     InternalError,
 }
 

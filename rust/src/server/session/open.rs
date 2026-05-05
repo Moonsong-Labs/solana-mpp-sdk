@@ -1,14 +1,13 @@
-//! `process_open` handler. Validates the open transaction shape against the
-//! advertised challenge, co-signs as fee payer, broadcasts, and persists the
-//! resulting channel record.
+//! `process_open` handler. Validates the open tx against the advertised
+//! challenge, co-signs as fee payer, broadcasts, and persists the
+//! channel record.
 //!
-//! The validation step rebuilds the canonical `open` instruction from the
-//! server's view of the parameters (salt, deposit, splits, grace period) and
-//! asserts the client's submitted transaction carries that exact instruction
-//! against an allow-listed program set. Anything off the allow list, any drift
-//! in the instruction args, or a fee-payer in the wrong slot trips a typed
-//! `MaliciousTx` / `BadFeePayerSlot` / `BlockhashMismatch` rejection BEFORE any
-//! RPC broadcast.
+//! Validation rebuilds the canonical `open` ix from the server's view
+//! of the args (salt, deposit, splits, grace period) and checks that
+//! the submitted tx carries those exact bytes plus only allow-listed
+//! programs. Off-list programs, ix-arg drift, or a fee-payer in the
+//! wrong slot all trip a typed `MaliciousTx` / `BadFeePayerSlot` /
+//! `BlockhashMismatch` rejection before we hit the RPC.
 
 use solana_address::Address;
 use solana_hash::Hash;
@@ -25,29 +24,29 @@ use crate::program::payment_channels::state::find_channel_pda;
 use crate::protocol::intents::session::{OpenPayload, Split};
 use crate::server::session::SessionConfig;
 
-/// Decoded view of a client-submitted open transaction after shape validation
-/// has succeeded. Carries the raw `Transaction` (so the caller can co-sign
-/// and broadcast) plus the typed values extracted from the open ix args.
+/// Validated view of a client-submitted open tx. Carries the raw
+/// `Transaction` (so the caller can co-sign and broadcast) plus the
+/// typed values pulled out of the open ix args.
 #[derive(Debug)]
 pub(crate) struct DecodedOpenTx {
-    /// The submitted transaction. The fee-payer signature slot is still empty
-    /// at this point; the caller writes it after co-signing.
+    /// The submitted transaction with the fee-payer signature slot
+    /// still empty; the caller fills it after co-signing.
     pub tx: Transaction,
     pub salt: u64,
     pub deposit: u64,
     pub grace_period: u32,
     pub canonical_bump: u8,
-    /// Channel PDA derived from `(payer, payee, mint, authorized_signer, salt,
-    /// program_id)`. Matches the address occupying the `channel` slot in the
-    /// canonical open ix.
+    /// Channel PDA derived from `(payer, payee, mint, authorized_signer,
+    /// salt, program_id)`. Matches the address in the `channel` slot of
+    /// the canonical open ix.
     pub channel_id: Pubkey,
 }
 
-/// Inputs required to re-derive the canonical open ix from the server's view.
+/// Inputs for rebuilding the canonical open ix.
 ///
-/// `salt`, `deposit`, and `grace_period` are sourced from the wire
-/// `OpenPayload`, parsed and bounds-checked by the caller; `splits` are the
-/// typed splits the caller already validated against the cached challenge.
+/// `salt`, `deposit`, and `grace_period` come from the wire
+/// `OpenPayload` (already parsed and bounds-checked); `splits` is the
+/// typed form the caller validated against the cached challenge.
 pub(crate) struct CanonicalOpenInputs<'a> {
     pub payer: Pubkey,
     pub payee: Pubkey,
@@ -60,9 +59,9 @@ pub(crate) struct CanonicalOpenInputs<'a> {
     pub splits: &'a [Split],
 }
 
-/// Convert a typed `Split` slice to the upstream `DistributionRecipients`
-/// shape consumed by `OpenBuilder`. The on-chain wire shape always carries 32
-/// entries; unused trailing slots are zero-filled.
+/// Convert typed `Split`s to the upstream `DistributionRecipients`
+/// `OpenBuilder` wants. Wire shape is always 32 entries; trailing
+/// slots are zero-filled.
 pub(crate) fn splits_to_recipients(splits: &[Split]) -> DistributionRecipients {
     let zero_entry = DistributionEntry {
         recipient: Address::new_from_array([0u8; 32]),
@@ -86,33 +85,32 @@ fn addr_to_pk(addr: &Address) -> Pubkey {
     Pubkey::new_from_array(addr.to_bytes())
 }
 
-/// Bridge a 32-byte program-id constant from a 2.x `solana_pubkey::Pubkey`
-/// (the version `spl_token`, `spl_associated_token_account_client`, and
+/// Bridge a 32-byte program-id constant from 2.x `Pubkey` (what
+/// `spl_token`, `spl_associated_token_account_client`, and
 /// `solana_compute_budget_interface` re-export) into the SDK's 3.x
-/// `solana_pubkey::Pubkey`. Both are 32-byte newtypes, so the hop is a
-/// no-op at the byte level.
+/// `Pubkey`. Both are 32-byte newtypes, so this is a no-op byte-wise.
 fn id_v2_to_v3(bytes: [u8; 32]) -> Pubkey {
     Pubkey::new_from_array(bytes)
 }
 
-/// Classic SPL Token program id as a v3 `Pubkey`.
+/// SPL Token program id as v3 `Pubkey`.
 fn spl_token_id() -> Pubkey {
     id_v2_to_v3(spl_token::id().to_bytes())
 }
 
-/// SPL Associated Token Account program id as a v3 `Pubkey`.
+/// SPL ATA program id as v3 `Pubkey`.
 fn ata_program_id() -> Pubkey {
     id_v2_to_v3(spl_associated_token_account_client::program::ID.to_bytes())
 }
 
-/// ComputeBudget program id as a v3 `Pubkey`.
+/// ComputeBudget program id as v3 `Pubkey`.
 fn compute_budget_program_id() -> Pubkey {
     id_v2_to_v3(solana_compute_budget_interface::ID.to_bytes())
 }
 
-/// Derive the associated token account for `(wallet, mint, token_program)`.
-/// Mirrors `spl_associated_token_account_client::address::get_associated_token_address_with_program_id`
-/// but stays in v3 `Pubkey` to avoid a dual-version crate hop.
+/// Derive the ATA for `(wallet, mint, token_program)`. Mirrors
+/// `spl_associated_token_account_client::address::get_associated_token_address_with_program_id`
+/// but stays in v3 `Pubkey` to skip the dual-version crate hop.
 fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubkey {
     let (pda, _) = Pubkey::find_program_address(
         &[
@@ -125,13 +123,14 @@ fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pub
     pda
 }
 
-/// Build the canonical `open` instruction the server expects to see in the
-/// client's submitted transaction. Mirrors what an honest client builds via
+/// Build the canonical `open` ix we expect to find in the client's
+/// submitted tx. Same shape an honest client builds via
 /// `OpenBuilder`.
 pub(crate) fn build_canonical_open_ix(inputs: &CanonicalOpenInputs<'_>) -> Instruction {
-    // Event authority PDA: single literal seed `b"event_authority"`. Upstream
-    // declares this in `program/payment_channels/src/event_engine.rs` but does
-    // not re-export it through the Codama client, so we re-derive locally.
+    // Event authority PDA, single seed `b"event_authority"`. Upstream
+    // declares it in `program/payment_channels/src/event_engine.rs`
+    // but doesn't re-export it through the Codama client, so derive
+    // here.
     let (event_authority_pk, _) =
         Pubkey::find_program_address(&[b"event_authority"], &inputs.program_id);
 
@@ -154,9 +153,9 @@ pub(crate) fn build_canonical_open_ix(inputs: &CanonicalOpenInputs<'_>) -> Instr
     );
     let channel_addr = pk_to_addr(&channel_pda);
 
-    // ATAs: classic SPL Token program only. Token-2022 mints are rejected
-    // at the program allow-list check; the address derivation here would
-    // diverge if the wrong token program id were used.
+    // ATAs use the classic SPL Token program only. Token-2022 mints
+    // are blocked by the program allow-list; using the wrong token
+    // program id here would yield a different ATA.
     let payer_token_account_pk = ata_address(&inputs.payer, &inputs.mint, &token_program_pk);
     let channel_token_account_pk = ata_address(&channel_pda, &inputs.mint, &token_program_pk);
     let payer_token_account_addr = pk_to_addr(&payer_token_account_pk);
@@ -187,9 +186,9 @@ pub(crate) fn build_canonical_open_ix(inputs: &CanonicalOpenInputs<'_>) -> Instr
         .instruction()
 }
 
-/// Programs allowed to appear in `account_keys` of an open tx. Anything else
-/// signals a malicious or malformed submission. Token-2022 is intentionally
-/// off the list so v1 rejects Token-2022 mints at the shape boundary.
+/// Programs that may appear in an open tx's `account_keys`. Anything
+/// else is a malformed or malicious submission. Token-2022 is left
+/// off so v1 rejects Token-2022 mints at the shape boundary.
 fn open_program_allow_list() -> [Pubkey; 5] {
     [
         addr_to_pk(&PAYMENT_CHANNELS_ID),
@@ -200,7 +199,7 @@ fn open_program_allow_list() -> [Pubkey; 5] {
     ]
 }
 
-/// Parsed payload arguments needed to re-derive the canonical open ix.
+/// Parsed payload args needed to rebuild the canonical open ix.
 struct ParsedOpenPayload {
     payer: Pubkey,
     payee: Pubkey,
@@ -241,7 +240,7 @@ fn parse_open_payload(payload: &OpenPayload) -> Result<ParsedOpenPayload, Sessio
         .deposit_amount
         .parse()
         .map_err(|e| SessionError::InvalidAmount(format!("depositAmount parse: {e}")))?;
-    let _advertised_bump = payload.bump; // re-derived canonically below; field carried for assertion in `process_open`
+    let _advertised_bump = payload.bump; // re-derived below; carried only for the assertion in `process_open`
     Ok(ParsedOpenPayload {
         payer,
         payee,
@@ -252,16 +251,16 @@ fn parse_open_payload(payload: &OpenPayload) -> Result<ParsedOpenPayload, Sessio
     })
 }
 
-/// Validate the shape of a client-submitted open transaction.
+/// Validate a client-submitted open tx.
 ///
-/// Decodes the base64 partial-signed transaction, asserts the program
-/// allow-list, the fee-payer slot, the required-signatures count, and that
-/// the submitted open ix matches the canonical bytes the server would emit
-/// for the same parameters. Rejects with typed errors before any RPC call.
+/// Decodes the base64 partial-signed tx and checks: programs are
+/// allow-listed, fee-payer is in slot 0, the required-signatures
+/// count matches, and the open ix bytes match what the server would
+/// emit for the same args. Rejects with typed errors before any RPC.
 ///
-/// The caller supplies the typed `splits` rather than re-parsing the wire
-/// `BpsSplit`s here, so the wire/typed conversion lives at the handler
-/// boundary and this helper stays focused on the byte contract.
+/// Takes already-typed `splits` so the wire/typed conversion lives
+/// at the handler boundary and this helper stays on the byte
+/// contract.
 pub(crate) fn validate_open_tx_shape(
     payload: &OpenPayload,
     splits: &[Split],
@@ -287,7 +286,8 @@ pub(crate) fn validate_open_tx_shape(
         reason: format!("transaction bincode decode failed: {e}"),
     })?;
 
-    // Allow-list every program key referenced by the message.
+    // Every program referenced by the message must be on the
+    // allow-list.
     let allow = open_program_allow_list();
     let pc_program_pk = addr_to_pk(&PAYMENT_CHANNELS_ID);
     for ix in &tx.message.instructions {
@@ -305,7 +305,7 @@ pub(crate) fn validate_open_tx_shape(
         }
     }
 
-    // Header: exactly two required signatures. payer + server fee-payer.
+    // Exactly two required signatures: payer + server fee-payer.
     if tx.message.header.num_required_signatures != 2 {
         return Err(SessionError::MaliciousTx {
             reason: format!(
@@ -315,7 +315,7 @@ pub(crate) fn validate_open_tx_shape(
         });
     }
 
-    // Fee-payer slot is account_keys[0]. Must equal the operator-configured
+    // Fee-payer is `account_keys[0]` and must match the configured
     // fee-payer pubkey.
     let slot0 = tx
         .message
@@ -332,7 +332,7 @@ pub(crate) fn validate_open_tx_shape(
         });
     }
 
-    // Recent blockhash must match the cached challenge's blockhash.
+    // Recent blockhash has to match the cached challenge's.
     if tx.message.recent_blockhash != *expected_blockhash {
         return Err(SessionError::BlockhashMismatch {
             expected: expected_blockhash.to_string(),
@@ -340,7 +340,7 @@ pub(crate) fn validate_open_tx_shape(
         });
     }
 
-    // Re-derive the canonical (channel_pda, bump) from the parsed payload.
+    // Re-derive `(channel_pda, bump)` from the parsed payload.
     let (canonical_pda, canonical_bump) = find_channel_pda(
         &parsed.payer,
         &parsed.payee,
@@ -350,7 +350,7 @@ pub(crate) fn validate_open_tx_shape(
         &config.program_id,
     );
 
-    // Build the canonical open ix.
+    // Rebuild the canonical open ix.
     let canonical_ix = build_canonical_open_ix(&CanonicalOpenInputs {
         payer: parsed.payer,
         payee: parsed.payee,
@@ -363,7 +363,7 @@ pub(crate) fn validate_open_tx_shape(
         splits,
     });
 
-    // Locate the open ix in the submitted message and compare bytes.
+    // Find the open ix in the submitted message and compare bytes.
     let open_ix_compiled = tx
         .message
         .instructions
@@ -430,10 +430,9 @@ pub(crate) fn validate_open_tx_shape(
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `validate_open_tx_shape`. Each case hand-crafts a
-    //! transaction that fails one specific check; together they pin every
-    //! rejection variant the validator emits. End-to-end coverage of the
-    //! full `process_open` happy path lives in the L1 oracle.
+    //! Unit tests for `validate_open_tx_shape`. Each case fails one
+    //! specific check; together they cover every rejection variant.
+    //! End-to-end happy-path coverage lives in the L1 oracle.
 
     use super::*;
     use crate::protocol::intents::session::{typed_to_wire, Split};
@@ -444,15 +443,15 @@ mod tests {
     use solana_sdk::signer::Signer;
     use std::sync::Arc;
 
-    /// Build a fresh `MemorySigner` over a freshly generated keypair.
+    /// `MemorySigner` over a freshly generated keypair.
     fn fresh_memory_signer() -> Arc<dyn solana_keychain::SolanaSigner> {
         let kp = Keypair::new();
         let bytes = kp.to_bytes();
         Arc::new(MemorySigner::from_bytes(&bytes).expect("memory signer accepts keypair bytes"))
     }
 
-    /// Construct a default-shaped `SessionConfig` wired with a
-    /// `MemorySigner` whose pubkey is captured back to the caller.
+    /// Default `SessionConfig` wired with a `MemorySigner`; returns
+    /// the signer's pubkey too.
     fn config_with_fresh_fee_payer() -> (SessionConfig, Pubkey) {
         let signer = fresh_memory_signer();
         let fee_payer_pk = signer.pubkey();
@@ -477,9 +476,9 @@ mod tests {
         Vec::new()
     }
 
-    /// Build a payload + canonical tx pair from the given inputs. The
-    /// returned transaction is signed by the payer only; the fee-payer slot
-    /// is left empty as the wire format requires.
+    /// Build a payload + canonical tx pair. The returned tx is signed
+    /// by the payer only; the fee-payer slot stays empty per the wire
+    /// format.
     fn build_payload_and_tx(
         config: &SessionConfig,
         payer: &Keypair,
@@ -504,9 +503,10 @@ mod tests {
         let fee_payer_pk = config.fee_payer.as_ref().unwrap().signer.pubkey();
         let fee_payer_addr = pk_to_addr(&fee_payer_pk);
 
-        // Two-signer message: account_keys[0] is the fee-payer, [1] is the
-        // payer. We construct the message manually so the fee-payer signature
-        // slot can stay empty (the server fills it post-validation).
+        // Two-signer message: `account_keys[0]` is the fee-payer,
+        // `[1]` is the payer. We build the message manually so the
+        // fee-payer signature slot stays empty for the server to fill
+        // after validation.
         let message = Message::new_with_blockhash(
             &[canonical_ix],
             Some(&fee_payer_addr),
@@ -514,15 +514,15 @@ mod tests {
         );
 
         let mut tx = Transaction::new_unsigned(message);
-        // Pad signatures to header.num_required_signatures so the layout
-        // matches the wire format. The server overwrites slot 0 after
-        // co-signing.
+        // Pad signatures up to `header.num_required_signatures` so
+        // the layout matches the wire format. Server overwrites slot 0
+        // after co-signing.
         tx.signatures = vec![
             solana_signature::Signature::default();
             tx.message.header.num_required_signatures as usize
         ];
-        // Sign payer slot. Payer is account_keys[1]; partial_sign handles
-        // locating the signing slot correctly.
+        // Sign the payer slot. Payer is `account_keys[1]`;
+        // `partial_sign` locates the slot.
         tx.partial_sign(&[payer], blockhash);
 
         let (channel_pda, bump) = find_channel_pda(
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn happy_path_validates_canonical_tx() {
-        // Sanity check: a faithfully-rebuilt tx passes every shape check.
+        // A faithfully-rebuilt tx passes every shape check.
         let (cfg, _fee_payer_pk) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let auth_signer = Keypair::new().pubkey();
@@ -581,9 +581,9 @@ mod tests {
         let (mut payload, mut tx) =
             build_payload_and_tx(&cfg, &payer, auth_signer, 42, 1_000_000, blockhash);
 
-        // Splice an unrelated program into account_keys (a fresh random key
-        // not on the allow-list) and append a no-op compiled ix that targets
-        // it, so the allow-list scan reaches the bogus key.
+        // Splice an off-list program into `account_keys` and append a
+        // no-op ix targeting it, so the allow-list scan reaches the
+        // bogus key.
         let bogus = Address::new_from_array([0xAB; 32]);
         tx.message.account_keys.push(bogus);
         let bogus_idx = (tx.message.account_keys.len() - 1) as u8;
@@ -606,10 +606,10 @@ mod tests {
 
     #[test]
     fn wrong_fee_payer_slot_rejects() {
-        // Configure the server with one fee_payer key, but build the tx
-        // with a *different* key in slot 0. The validator must surface
-        // `BadFeePayerSlot { expected, got }` with the configured key as
-        // `expected` and the slot-0 key as `got`.
+        // Server's fee-payer is one key; the tx puts a different key
+        // in slot 0. Validator should raise
+        // `BadFeePayerSlot { expected, got }` with the configured key
+        // as `expected` and the slot-0 key as `got`.
         let (cfg, server_fee_payer_pk) = config_with_fresh_fee_payer();
         let attacker_fee_payer = Keypair::new();
 
@@ -617,8 +617,8 @@ mod tests {
         let auth_signer = Keypair::new().pubkey();
         let blockhash = Hash::new_from_array([7u8; 32]);
 
-        // Build a tx that lists the attacker_fee_payer in slot 0 by passing
-        // it as the message fee-payer.
+        // Put `attacker_fee_payer` in slot 0 by passing it as the
+        // message fee-payer.
         let canonical_ix = build_canonical_open_ix(&CanonicalOpenInputs {
             payer: payer.pubkey(),
             payee: cfg.payee,
@@ -674,10 +674,9 @@ mod tests {
 
     #[test]
     fn num_required_signatures_other_than_two_rejects() {
-        // A real client tx must require exactly two signers (payer + server
-        // fee-payer). Forcing the count to 1 lands inside the `MaliciousTx`
-        // branch the spec calls out, even though the rest of the shape is
-        // canonical.
+        // A real client tx requires two signers (payer + server
+        // fee-payer). Forcing the count to 1 trips the `MaliciousTx`
+        // branch even with the rest of the shape canonical.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let auth_signer = Keypair::new().pubkey();
@@ -686,8 +685,8 @@ mod tests {
             build_payload_and_tx(&cfg, &payer, auth_signer, 42, 1_000_000, blockhash);
 
         tx.message.header.num_required_signatures = 1;
-        // Trim signatures vec to keep bincode happy; the validator reads
-        // header.num_required_signatures, not signatures.len().
+        // Trim sigs to keep bincode happy; the validator reads
+        // `header.num_required_signatures`, not `signatures.len()`.
         tx.signatures.truncate(1);
         payload.transaction = encode_tx_b64(&tx);
 
@@ -701,10 +700,10 @@ mod tests {
 
     #[test]
     fn tampered_open_ix_data_rejects() {
-        // Flip one byte inside the open ix data. The rest of the tx is
-        // canonical (allow-listed programs, correct fee-payer slot, two
-        // required sigs, matching blockhash) so the only check that fires
-        // is the canonical-bytes comparison.
+        // Flip one byte inside the open ix data. Everything else is
+        // canonical (allow-listed programs, correct fee-payer slot,
+        // two required sigs, matching blockhash) so only the
+        // canonical-bytes comparison fires.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let auth_signer = Keypair::new().pubkey();
@@ -712,14 +711,14 @@ mod tests {
         let (mut payload, mut tx) =
             build_payload_and_tx(&cfg, &payer, auth_signer, 42, 1_000_000, blockhash);
 
-        // Locate the open ix and flip a byte inside its borsh-serialized
-        // OpenArgs payload. Index 1 sits inside the `salt` u64, so the
-        // canonical re-derivation produces different bytes.
+        // Find the open ix and flip a byte inside its borsh
+        // `OpenArgs` payload. Index 1 sits inside the `salt` u64, so
+        // the canonical rebuild yields different bytes.
         let pc_program_pk = addr_to_pk(&PAYMENT_CHANNELS_ID);
         for ix in tx.message.instructions.iter_mut() {
             let key = tx.message.account_keys[ix.program_id_index as usize];
             if addr_to_pk(&key) == pc_program_pk {
-                let i = 1; // inside discriminator+salt window
+                let i = 1; // inside the discriminator + salt window
                 ix.data[i] ^= 0xFF;
                 break;
             }
@@ -736,9 +735,8 @@ mod tests {
 
     #[test]
     fn blockhash_mismatch_rejects() {
-        // Cached challenge committed to one blockhash; the client's tx uses
-        // another. The server must reject with `BlockhashMismatch` carrying
-        // both string forms.
+        // Challenge committed to one blockhash, tx uses another.
+        // Reject with `BlockhashMismatch` carrying both string forms.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let auth_signer = Keypair::new().pubkey();
