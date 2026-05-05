@@ -320,6 +320,12 @@ pub enum SessionError {
 
     #[error("rpc unavailable: {0}")]
     RpcUnavailable(#[from] RpcError),
+
+    /// Catch-all for unexpected server-side failures the client should
+    /// treat as 5xx. Use sparingly: prefer a typed variant whenever the
+    /// failure is one we want operators to route on.
+    #[error("internal server error: {0}")]
+    InternalError(String),
 }
 
 impl From<solana_client::client_error::ClientError> for SessionError {
@@ -366,6 +372,7 @@ impl SessionError {
             SessionError::RecoveryBatchFailed { .. } => C::RecoveryBatchFailed,
             SessionError::StoreUnavailable(_) => C::StoreUnavailable,
             SessionError::RpcUnavailable(_) => C::RpcUnavailable,
+            SessionError::InternalError(_) => C::InternalError,
         }
     }
 
@@ -417,7 +424,8 @@ impl SessionError {
             | SessionError::RecoveryRpcFailure { .. }
             | SessionError::RecoveryBatchFailed { .. }
             | SessionError::StoreUnavailable(_)
-            | SessionError::RpcUnavailable(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | SessionError::RpcUnavailable(_)
+            | SessionError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
 
             // Everything else is a 402 the client can address.
             _ => StatusCode::PAYMENT_REQUIRED,

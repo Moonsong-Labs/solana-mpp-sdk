@@ -113,6 +113,16 @@ http = "1"
 # the Pin<Box<dyn Future + Send + '_>> dance for every method).
 async-trait = "0.1"
 
+# Lock-free concurrent map for the challenge cache. The cache is hot on
+# every challenge factory call and on every action handler entry; pulling
+# DashMap avoids serialising those across a global RwLock.
+dashmap = "6"
+
+# Combinators used by the recovery loop to fan out per-channel inspection
+# work. Pulled in here so the dep landscape is settled before recovery
+# wiring lands in a follow-up.
+futures = "0.3"
+
 [dev-dependencies]
 # Tokio is already a hard dep above (with `full`); no dev-deps entry needed.
 axum = "0.8"
