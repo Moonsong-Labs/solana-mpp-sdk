@@ -102,6 +102,13 @@ tracing = "0.1"
 # Errors
 thiserror = "2"
 
+# HTTP types: `http::StatusCode` is what production servers expect to thread
+# through their handler stack, and the crate is already in every meaningful
+# server dep graph (axum / hyper / reqwest all pull it). Keeping it as a
+# direct dep means SessionError::http_status() returns a type the operator
+# can hand straight to their HTTP layer without re-mapping.
+http = "1"
+
 # Async trait sugar (used by ChannelStore so impls don't have to hand-roll
 # the Pin<Box<dyn Future + Send + '_>> dance for every method).
 async-trait = "0.1"

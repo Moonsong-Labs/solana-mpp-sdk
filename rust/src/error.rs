@@ -1,4 +1,23 @@
-/// Errors produced by the Solana MPP SDK.
+//! SDK-wide error types.
+//!
+//! Two enums live here:
+//!
+//! - `Error` is the legacy charge-intent surface: a flat enum scoped to the
+//!   one-shot pay-once flow. Held in tree as-is so the charge code path
+//!   stays untouched.
+//! - `SessionError` is the typed surface for the session intent. Every
+//!   variant maps to an HTTP status and a stable wire-form `MppErrorCode`
+//!   so 402 responses, receipts, and observability all key off the same
+//!   identifier.
+
+use http::StatusCode;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+
+use crate::protocol::core::MppErrorCode;
+use crate::store::{ChannelStatus, StoreError};
+
+/// Errors produced by the Solana MPP charge intent.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("RPC error: {0}")]
@@ -59,5 +78,480 @@ pub enum Error {
     Other(String),
 }
 
-/// Result type alias.
+/// Result type alias for the charge intent.
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ── Session intent error surface ──────────────────────────────────────────
+
+/// Opaque wrapper around RPC errors, decoupled from any specific
+/// `solana-client` major version.
+///
+/// Carries a stringified message; callers that need structured handling
+/// should branch on the [`MppErrorCode`] returned from
+/// [`SessionError::code`] rather than downcasting the inner error. This
+/// keeps the SDK's public error surface stable across upstream RPC-client
+/// version bumps.
+///
+/// The inner field is private and the type is `#[non_exhaustive]` so
+/// future refactors (e.g. adding endpoint / status / body fields) do not
+/// constitute a breaking change. Use [`RpcError::message`] to read the
+/// stringified payload, or rely on `Display` / `MppErrorCode` for routing.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("rpc error: {0}")]
+#[non_exhaustive]
+pub struct RpcError(String);
+
+impl RpcError {
+    /// Read the stringified RPC failure message.
+    ///
+    /// Operators rendering structured logs can branch on
+    /// [`MppErrorCode`] for routing and use this accessor to surface
+    /// the underlying RPC context.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<solana_client::client_error::ClientError> for RpcError {
+    fn from(e: solana_client::client_error::ClientError) -> Self {
+        // `{e:#}` walks the thiserror source chain so the operator
+        // sees endpoint, status, and body context rather than just the
+        // top-level summary.
+        Self(format!("{e:#}"))
+    }
+}
+
+/// Snapshot of an on-chain channel's lifecycle as observed by recovery.
+///
+/// `Absent` is the recovery-only state for a PDA the cluster has never
+/// seen (or that has been garbage-collected). The other variants mirror
+/// the on-chain `Status` byte plus the `Tombstoned` close-marker byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OnChainChannelStatus {
+    Open,
+    Closing,
+    Finalized,
+    Tombstoned,
+    Absent,
+}
+
+/// Typed reason for a per-record recovery failure.
+///
+/// Variants cover the four classes of failure the inspect phase can
+/// surface: the operator left unsettled revenue on the table, an RPC
+/// fetch failed, the stored status disagrees with the on-chain status in
+/// a way the runtime cannot resolve, or a `verify_open` field check
+/// failed during inspection.
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecoveryFailureKind {
+    #[error("unsettled revenue on startup ({unsettled} units)")]
+    UnsettledRevenue { unsettled: u64 },
+
+    #[error("rpc failure: {message}")]
+    RpcFailure {
+        // Stringified RPC failure message. Kept as `String` so the
+        // recovery surface stays version-agnostic. The plan doc names
+        // this field `source`; we rename to `message` here because
+        // `thiserror` would otherwise pick the field up as a source
+        // chain link and require it implement `std::error::Error`.
+        message: String,
+    },
+
+    #[error("state inversion: stored {stored:?}, on-chain {on_chain:?}")]
+    StateInversion {
+        stored: ChannelStatus,
+        on_chain: OnChainChannelStatus,
+    },
+
+    #[error("verify_open mismatch on field {field}")]
+    VerifyOpenMismatch { field: &'static str },
+}
+
+/// Per-record recovery failure surfaced inside `RecoveryBatchFailed`.
+///
+/// The startup recovery flow inspects every persisted channel before
+/// touching the store, then either applies every outcome or returns the
+/// batch of failures. Each failure carries the channel it pertains to and
+/// a typed reason so operators can route on the cause without parsing
+/// strings.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("channel {channel_id}: {kind}")]
+#[non_exhaustive]
+pub struct RecoveryFailure {
+    pub channel_id: Pubkey,
+    #[source]
+    pub kind: RecoveryFailureKind,
+}
+
+/// Errors produced by the session intent server lifecycle.
+///
+/// Every variant maps to an HTTP status via [`SessionError::http_status`]
+/// and a stable wire-form code via [`SessionError::code`]. The two
+/// accessors decouple "what went wrong" from "how to render it on the
+/// wire": handlers thread the typed enum internally and only convert at
+/// the response boundary.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionError {
+    // ── Challenge lifecycle ───────────────────────────────────────────────
+    #[error("challenge id absent, expired, or already consumed")]
+    ChallengeUnbound,
+
+    #[error("a request bound to this challenge is already in flight")]
+    ChallengeInFlight,
+
+    #[error("challenge id has already been used")]
+    ChallengeAlreadyUsed,
+
+    #[error("challenge intent does not match the request")]
+    ChallengeIntentMismatch,
+
+    #[error("challenge field {field} mismatch: advertised {advertised}, got {got}")]
+    ChallengeFieldMismatch {
+        field: &'static str,
+        advertised: String,
+        got: String,
+    },
+
+    #[error("challenge expired: age {age}s exceeds max {max}s")]
+    ChallengeExpired { age: u64, max: u64 },
+
+    // ── Open / topup preflight ────────────────────────────────────────────
+    #[error("splits hash mismatch: expected {expected_hash:x?}, got {got_hash:x?}")]
+    SplitsMismatch {
+        expected_hash: [u8; 32],
+        got_hash: [u8; 32],
+    },
+
+    #[error("deposit {got} out of range [{min}, {max}]")]
+    DepositOutOfRange { min: u64, max: u64, got: u64 },
+
+    #[error("bump mismatch: canonical {canonical}, got {got}")]
+    BumpMismatch { canonical: u8, got: u8 },
+
+    #[error("ata preflight failed for recipient {recipient}: {cause}")]
+    AtaPreflightFailed { recipient: Pubkey, cause: String },
+
+    #[error("on-chain state mismatch on field {field}: expected {expected}, got {got}")]
+    OnChainStateMismatch {
+        field: &'static str,
+        expected: String,
+        got: String,
+    },
+
+    #[error("channel version mismatch: supported {supported}, got {got}")]
+    ChannelVersionMismatch { supported: u8, got: u8 },
+
+    // ── Tx-shape validation ───────────────────────────────────────────────
+    #[error("malicious or malformed transaction: {reason}")]
+    MaliciousTx { reason: String },
+
+    #[error("fee-payer in wrong transaction slot: expected {expected}, got {got}")]
+    BadFeePayerSlot { expected: Pubkey, got: Pubkey },
+
+    #[error("recent blockhash mismatch: expected {expected}, got {got}")]
+    BlockhashMismatch { expected: String, got: String },
+
+    // ── Voucher ───────────────────────────────────────────────────────────
+    #[error("voucher signature failed verification")]
+    VoucherSignatureInvalid,
+
+    #[error("voucher signed by wrong key: expected {expected}, got {got}")]
+    VoucherWrongSigner { expected: Pubkey, got: Pubkey },
+
+    #[error("voucher cumulative regressed: stored {stored}, got {got}")]
+    VoucherCumulativeRegression { stored: u64, got: u64 },
+
+    #[error("voucher cumulative {got} exceeds deposit cap {deposit}")]
+    VoucherOverDeposit { deposit: u64, got: u64 },
+
+    #[error("voucher expired: now {now} >= expires_at {expires_at}")]
+    VoucherExpired { now: i64, expires_at: i64 },
+
+    #[error("voucher delta below minimum: min {min}, got {got}")]
+    VoucherDeltaTooSmall { min: u64, got: u64 },
+
+    // ── Topup-specific ────────────────────────────────────────────────────
+    #[error("invalid status for topup: channel is {status:?}")]
+    InvalidStatusForTopup { status: ChannelStatus },
+
+    #[error("topup would exceed max deposit: current {current} + additional {additional} > max {max}")]
+    MaxDepositExceeded {
+        current: u64,
+        additional: u64,
+        max: u64,
+    },
+
+    #[error("invalid amount: {0}")]
+    InvalidAmount(String),
+
+    // ── Settlement / on-chain submission ──────────────────────────────────
+    #[error("open transaction {0} did not confirm")]
+    OpenTxUnconfirmed(Signature),
+
+    #[error("topup tx {0} failed: {1}")]
+    TopUpFailed(Signature, String),
+
+    #[error("settle tx {0} failed: {1}")]
+    SettleFailed(Signature, String),
+
+    #[error("distribute tx {0} failed: {1}")]
+    DistributeFailed(Signature, String),
+
+    // ── Recovery ──────────────────────────────────────────────────────────
+    #[error("channel {channel_id}: unsettled revenue on startup ({unsettled} units)")]
+    UnsettledRevenueOnStartup { channel_id: Pubkey, unsettled: u64 },
+
+    #[error("recovery rpc failure for channel {channel_id}: {source}")]
+    RecoveryRpcFailure {
+        channel_id: Pubkey,
+        #[source]
+        source: RpcError,
+    },
+
+    #[error("recovery batch failed: {} failure(s)", .failures.len())]
+    RecoveryBatchFailed { failures: Vec<RecoveryFailure> },
+
+    // ── Infra ─────────────────────────────────────────────────────────────
+    #[error("store unavailable: {0}")]
+    StoreUnavailable(#[from] StoreError),
+
+    #[error("rpc unavailable: {0}")]
+    RpcUnavailable(#[from] RpcError),
+}
+
+impl From<solana_client::client_error::ClientError> for SessionError {
+    fn from(e: solana_client::client_error::ClientError) -> Self {
+        SessionError::RpcUnavailable(RpcError::from(e))
+    }
+}
+
+impl SessionError {
+    /// Stable wire-form code emitted on 402 responses and receipts.
+    pub fn code(&self) -> MppErrorCode {
+        use MppErrorCode as C;
+        match self {
+            SessionError::ChallengeUnbound => C::ChallengeUnbound,
+            SessionError::ChallengeInFlight => C::ChallengeInFlight,
+            SessionError::ChallengeAlreadyUsed => C::ChallengeAlreadyUsed,
+            SessionError::ChallengeIntentMismatch => C::ChallengeIntentMismatch,
+            SessionError::ChallengeFieldMismatch { .. } => C::ChallengeFieldMismatch,
+            SessionError::ChallengeExpired { .. } => C::ChallengeExpired,
+            SessionError::SplitsMismatch { .. } => C::SplitsMismatch,
+            SessionError::DepositOutOfRange { .. } => C::DepositOutOfRange,
+            SessionError::BumpMismatch { .. } => C::BumpMismatch,
+            SessionError::AtaPreflightFailed { .. } => C::AtaPreflightFailed,
+            SessionError::OnChainStateMismatch { .. } => C::OnChainStateMismatch,
+            SessionError::ChannelVersionMismatch { .. } => C::ChannelVersionMismatch,
+            SessionError::MaliciousTx { .. } => C::MaliciousTx,
+            SessionError::BadFeePayerSlot { .. } => C::BadFeePayerSlot,
+            SessionError::BlockhashMismatch { .. } => C::BlockhashMismatch,
+            SessionError::VoucherSignatureInvalid => C::VoucherSignatureInvalid,
+            SessionError::VoucherWrongSigner { .. } => C::VoucherWrongSigner,
+            SessionError::VoucherCumulativeRegression { .. } => C::VoucherCumulativeRegression,
+            SessionError::VoucherOverDeposit { .. } => C::VoucherOverDeposit,
+            SessionError::VoucherExpired { .. } => C::VoucherExpired,
+            SessionError::VoucherDeltaTooSmall { .. } => C::VoucherDeltaTooSmall,
+            SessionError::InvalidStatusForTopup { .. } => C::InvalidStatusForTopup,
+            SessionError::MaxDepositExceeded { .. } => C::MaxDepositExceeded,
+            SessionError::InvalidAmount(_) => C::InvalidAmount,
+            SessionError::OpenTxUnconfirmed(_) => C::OpenTxUnconfirmed,
+            SessionError::TopUpFailed(_, _) => C::TopUpFailed,
+            SessionError::SettleFailed(_, _) => C::SettleFailed,
+            SessionError::DistributeFailed(_, _) => C::DistributeFailed,
+            SessionError::UnsettledRevenueOnStartup { .. } => C::UnsettledRevenueOnStartup,
+            SessionError::RecoveryRpcFailure { .. } => C::RecoveryRpcFailure,
+            SessionError::RecoveryBatchFailed { .. } => C::RecoveryBatchFailed,
+            SessionError::StoreUnavailable(_) => C::StoreUnavailable,
+            SessionError::RpcUnavailable(_) => C::RpcUnavailable,
+        }
+    }
+
+    /// HTTP status to render on the response.
+    ///
+    /// `402 Payment Required` covers the normal client-facing protocol
+    /// errors (challenge / voucher / deposit / splits violations).
+    ///
+    /// `409 Conflict` covers cases where the client request is well-formed
+    /// but inconsistent with current state: `MaliciousTx` (the submitted
+    /// tx disagrees with the advertised challenge), `BlockhashMismatch`
+    /// (the client used a blockhash other than the one the server
+    /// committed in the 402 challenge, the same protocol-violation class
+    /// as `MaliciousTx`), `InvalidStatusForTopup` (topup against a
+    /// non-Open channel), and `OnChainStateMismatch` (the request
+    /// advertised a deposit / payer / payee / splits-hash that
+    /// disagrees with on-chain reality; nothing the client can re-sign
+    /// will reconcile this).
+    ///
+    /// `503 Service Unavailable` covers server-side broadcast failures
+    /// and transient preflight glitches: the client cannot remediate by
+    /// re-signing because the failure happened after a valid signed
+    /// payload reached the server (RPC dropped, validator congestion,
+    /// blockhash expired before the server's submission landed,
+    /// `CreateIdempotent` ATA preflight failed). The server is expected
+    /// to retry; 503 is the standard "transient, retry later" status.
+    ///
+    /// `500 Internal Server Error` is reserved for recovery and infra
+    /// failures the operator must fix.
+    pub fn http_status(&self) -> StatusCode {
+        match self {
+            // 409 Conflict: well-formed request, conflicting state.
+            SessionError::MaliciousTx { .. }
+            | SessionError::BlockhashMismatch { .. }
+            | SessionError::InvalidStatusForTopup { .. }
+            | SessionError::OnChainStateMismatch { .. } => StatusCode::CONFLICT,
+
+            // 503 Service Unavailable: transient server-side broadcast
+            // and preflight failures. The client cannot remediate by
+            // re-signing.
+            SessionError::OpenTxUnconfirmed(_)
+            | SessionError::TopUpFailed(_, _)
+            | SessionError::SettleFailed(_, _)
+            | SessionError::DistributeFailed(_, _)
+            | SessionError::AtaPreflightFailed { .. } => StatusCode::SERVICE_UNAVAILABLE,
+
+            // 500 Internal: recovery anomalies and infra-layer failures.
+            SessionError::UnsettledRevenueOnStartup { .. }
+            | SessionError::RecoveryRpcFailure { .. }
+            | SessionError::RecoveryBatchFailed { .. }
+            | SessionError::StoreUnavailable(_)
+            | SessionError::RpcUnavailable(_) => StatusCode::INTERNAL_SERVER_ERROR,
+
+            // Everything else is a 402 the client can address.
+            _ => StatusCode::PAYMENT_REQUIRED,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn challenge_errors_are_402_with_typed_codes() {
+        assert_eq!(
+            SessionError::ChallengeUnbound.http_status(),
+            StatusCode::PAYMENT_REQUIRED
+        );
+        assert_eq!(
+            SessionError::ChallengeUnbound.code(),
+            MppErrorCode::ChallengeUnbound
+        );
+    }
+
+    #[test]
+    fn voucher_errors_are_402() {
+        let cases = [
+            SessionError::VoucherSignatureInvalid,
+            SessionError::VoucherCumulativeRegression {
+                stored: 100,
+                got: 50,
+            },
+            SessionError::VoucherOverDeposit {
+                deposit: 1_000,
+                got: 1_500,
+            },
+            SessionError::VoucherDeltaTooSmall { min: 100, got: 50 },
+            SessionError::VoucherExpired {
+                now: 200,
+                expires_at: 100,
+            },
+        ];
+        for err in cases {
+            assert_eq!(err.http_status(), StatusCode::PAYMENT_REQUIRED, "{err}");
+        }
+    }
+
+    #[test]
+    fn on_chain_state_mismatch_is_409() {
+        let err = SessionError::OnChainStateMismatch {
+            field: "deposit",
+            expected: "1000".into(),
+            got: "999".into(),
+        };
+        assert_eq!(err.http_status(), StatusCode::CONFLICT);
+        assert_eq!(err.code(), MppErrorCode::OnChainStateMismatch);
+    }
+
+    #[test]
+    fn ata_preflight_failed_is_503() {
+        let err = SessionError::AtaPreflightFailed {
+            recipient: Pubkey::new_from_array([3u8; 32]),
+            cause: "create_idempotent rejected".into(),
+        };
+        assert_eq!(err.http_status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code(), MppErrorCode::AtaPreflightFailed);
+    }
+
+    #[test]
+    fn malicious_tx_blockhash_mismatch_and_invalid_topup_status_are_409() {
+        assert_eq!(
+            SessionError::MaliciousTx {
+                reason: "x".into()
+            }
+            .http_status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            SessionError::BlockhashMismatch {
+                expected: "abc".into(),
+                got: "def".into(),
+            }
+            .http_status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            SessionError::InvalidStatusForTopup {
+                status: ChannelStatus::Closing
+            }
+            .http_status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn broadcast_failures_are_503() {
+        let sig = Signature::default();
+        let cases: [SessionError; 4] = [
+            SessionError::OpenTxUnconfirmed(sig),
+            SessionError::TopUpFailed(sig, "rpc dropped".into()),
+            SessionError::SettleFailed(sig, "blockhash expired".into()),
+            SessionError::DistributeFailed(sig, "validator congested".into()),
+        ];
+        for err in cases {
+            assert_eq!(err.http_status(), StatusCode::SERVICE_UNAVAILABLE, "{err}");
+        }
+    }
+
+    #[test]
+    fn recovery_and_infra_errors_are_500() {
+        assert_eq!(
+            SessionError::UnsettledRevenueOnStartup {
+                channel_id: Pubkey::new_from_array([1u8; 32]),
+                unsettled: 999,
+            }
+            .http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let store_err: SessionError = StoreError::Timeout.into();
+        assert_eq!(store_err.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(store_err.code(), MppErrorCode::StoreUnavailable);
+
+        let rpc_err: SessionError = RpcError("connection reset".into()).into();
+        assert_eq!(rpc_err.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(rpc_err.code(), MppErrorCode::RpcUnavailable);
+    }
+
+    #[test]
+    fn recovery_failure_carries_typed_kind() {
+        let f = RecoveryFailure {
+            channel_id: Pubkey::new_from_array([7u8; 32]),
+            kind: RecoveryFailureKind::UnsettledRevenue { unsettled: 42 },
+        };
+        let err: SessionError = SessionError::RecoveryBatchFailed { failures: vec![f] };
+        assert_eq!(err.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.code(), MppErrorCode::RecoveryBatchFailed);
+    }
+}

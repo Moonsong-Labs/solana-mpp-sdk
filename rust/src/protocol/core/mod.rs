@@ -3,12 +3,14 @@
 //! Zero heavy dependencies — only serde, serde_json, hmac, sha2, base64, time.
 
 pub mod challenge;
+pub mod error_code;
 pub mod headers;
 pub mod types;
 
 pub use challenge::{
     compute_challenge_id, ChallengeEcho, PaymentChallenge, PaymentCredential, Receipt,
 };
+pub use error_code::MppErrorCode;
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
     format_www_authenticate_many, parse_authorization, parse_receipt, parse_www_authenticate,

@@ -44,12 +44,16 @@ pub mod server;
 
 // ── Re-exports ──
 
-pub use error::{Error, Result};
+pub use error::{
+    Error, OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, Result, RpcError,
+    SessionError,
+};
 
 // Core protocol types
 pub use protocol::core::{
     base64url_decode, base64url_encode, compute_challenge_id, Base64UrlJson, ChallengeEcho,
-    IntentName, MethodName, PaymentChallenge, PaymentCredential, Receipt, ReceiptStatus,
+    IntentName, MethodName, MppErrorCode, PaymentChallenge, PaymentCredential, Receipt,
+    ReceiptStatus,
 };
 
 // Header parsing/formatting

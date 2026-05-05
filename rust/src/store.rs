@@ -93,11 +93,6 @@ pub enum StoreError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
-    /// Used by the legacy generic KV `Store` trait below for backend errors
-    /// without a more specific category.
-    #[error("store error: {0}")]
-    Internal(String),
-
     #[error("{0}")]
     Other(String),
 }
