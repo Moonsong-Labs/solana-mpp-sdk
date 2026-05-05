@@ -198,3 +198,12 @@ l1-oracle-distribute:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_distribute_oracle -- --nocapture
+
+# Run the request_close oracle. Requires the pinned program .so. Opens a
+# channel via OpenBuilder, submits a `request_close` ix via
+# RequestCloseBuilder, and asserts the SDK-decoded `ChannelView` shows
+# status=Closing with closure_started_at set and other fields untouched.
+l1-oracle-request-close:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_request_close_oracle -- --nocapture
