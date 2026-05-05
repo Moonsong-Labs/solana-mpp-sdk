@@ -207,3 +207,12 @@ l1-oracle-request-close:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_request_close_oracle -- --nocapture
+
+# Run the settle_and_finalize oracle. Requires the pinned program .so.
+# Two test cases exercise both `has_voucher` shapes of the cooperative-
+# close branch: with-voucher applies a fresh voucher then transitions to
+# Finalized, without-voucher locks the prior settled value.
+l1-oracle-settle-finalize:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_settle_finalize_oracle -- --nocapture
