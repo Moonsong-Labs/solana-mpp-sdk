@@ -26,17 +26,25 @@ pub mod voucher;
 use std::sync::Arc;
 use std::time::Duration;
 
+use solana_client::client_error::ClientError;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use solana_transaction::{Transaction, TransactionError};
 use tokio::task::JoinHandle;
 
 use crate::error::SessionError;
-use crate::protocol::core::{compute_challenge_id, Base64UrlJson, PaymentChallenge};
-use crate::protocol::intents::session::{typed_to_wire, MethodDetails, SessionRequest, Split};
-use crate::store::ChannelStore;
+use crate::program::payment_channels::state::find_channel_pda;
+use crate::program::payment_channels::verify::{verify_open, ExpectedOpenState, Mismatch, VerifyError};
+use crate::protocol::core::{compute_challenge_id, Base64UrlJson, MethodName, PaymentChallenge, Receipt};
+use crate::protocol::intents::session::{
+    typed_to_wire, wire_to_typed, MethodDetails, OpenPayload, SessionRequest, Split,
+};
+use crate::store::{ChannelRecord, ChannelStatus, ChannelStore};
 
-use challenge::{ChallengeCache, ChallengeIntent, ChallengeRecord};
+use challenge::{ChallengeCache, ChallengeIntent, ChallengeIntentDiscriminant, ChallengeRecord};
+use open::{validate_open_tx_shape, DecodedOpenTx};
 
 const METHOD_NAME: &str = "solana";
 const SESSION_INTENT: &str = "session";
@@ -124,6 +132,11 @@ pub struct SessionConfig {
     /// upstream `verify_*` helpers thread this through. Defaults to
     /// `Confirmed`.
     pub commitment: CommitmentConfig,
+    /// How long the open-tx broadcast loop waits for the cluster to
+    /// surface the submitted signature at `Confirmed` before giving up
+    /// and returning `OpenTxUnconfirmed`. Defaults to 30s, which covers
+    /// devnet round-trips with headroom.
+    pub broadcast_confirm_timeout: Duration,
     /// Slack the voucher TTL check tolerates relative to wall-clock
     /// drift. Defaults to 5s.
     pub clock_skew_seconds: u32,
@@ -173,6 +186,7 @@ impl SessionConfig {
             grace_period_seconds: 24 * 60 * 60,
             challenge_ttl_seconds: DEFAULT_CHALLENGE_TTL_SECONDS,
             commitment: CommitmentConfig::confirmed(),
+            broadcast_confirm_timeout: Duration::from_secs(30),
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
             voucher_check_grace_seconds: DEFAULT_VOUCHER_CHECK_GRACE_SECONDS,
             fee_payer: None,
@@ -231,6 +245,23 @@ impl Default for RecoveryOptions {
             parallelism: 8,
         }
     }
+}
+
+/// Output of `prepare_open`: the co-signed transaction plus the typed
+/// values needed by `finalize_open` to verify on-chain state and persist
+/// the channel record. Held only between broadcast preparation and the
+/// confirm-poll handoff; never crosses the public API.
+struct PreparedOpen {
+    tx: Transaction,
+    channel_id: Pubkey,
+    payer: Pubkey,
+    payee: Pubkey,
+    mint: Pubkey,
+    authorized_signer: Pubkey,
+    salt: u64,
+    deposit: u64,
+    canonical_bump: u8,
+    payload_splits: Vec<Split>,
 }
 
 /// Server-side handler for the session intent.
@@ -504,6 +535,323 @@ impl SessionMethod {
         }
     }
 
+    /// Server entry point for the `open` action.
+    ///
+    /// Validates the cached challenge, the wire payload, and the client's
+    /// partial-signed transaction, then co-signs as fee payer, broadcasts,
+    /// and persists the resulting channel record.
+    ///
+    /// Challenge lifecycle around broadcast: the reservation is taken
+    /// before any RPC work. Errors raised BEFORE `send_transaction` lands
+    /// release the reservation so the client can retry without burning a
+    /// challenge. The moment the cluster accepts the transaction
+    /// (`send_transaction` returns Ok), the challenge is committed
+    /// (Pending to Consumed). This closes a retry-window race: a
+    /// confirm-poll timeout returning `OpenTxUnconfirmed(sig)` while the
+    /// transaction lands a moment later would otherwise let the client
+    /// retry under the same challenge id and broadcast a second open for
+    /// the same intent. After commit, any subsequent error (timeout or
+    /// `verify_open` failure) propagates to the caller with the challenge
+    /// already consumed; reconciliation of an unconfirmed signature is
+    /// the recovery layer's job.
+    pub async fn process_open(
+        &self,
+        payload: &OpenPayload,
+    ) -> Result<Receipt, SessionError> {
+        // 1. Reserve the challenge for `Open` intent.
+        let cached = self
+            .cache
+            .reserve(&payload.challenge_id, ChallengeIntentDiscriminant::Open)?;
+
+        // 2 to 5. Pre-broadcast validation. Any error here releases the
+        //         reservation so the client can retry.
+        let prepared = match self.prepare_open(payload, &cached).await {
+            Ok(p) => p,
+            Err(e) => {
+                // Release best-effort; ignore the secondary error so the
+                // primary failure surfaces to the caller.
+                let _ = self.cache.release(&payload.challenge_id);
+                return Err(e);
+            }
+        };
+
+        // 6. Broadcast. Once `send_transaction` returns Ok, the cluster
+        //    has accepted the tx and the challenge MUST be marked
+        //    Consumed. From here on out, no error path may release.
+        let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
+            preflight_commitment: Some(self.config.commitment.commitment),
+            ..Default::default()
+        };
+        let tx_sig = match self.rpc.send_transaction_with_config(&prepared.tx, send_config).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                let _ = self.cache.release(&payload.challenge_id);
+                return Err(client_error_to_session_error(e));
+            }
+        };
+
+        // Commit the challenge BEFORE the confirm poll. A confirm-poll
+        // timeout at 30s does not mean the tx failed; it just means the
+        // server has not seen Confirmed yet. Releasing here would let the
+        // client re-broadcast against a tx that may still land, producing
+        // a duplicate. The recovery layer reconciles unconfirmed signatures.
+        self.cache.commit(&payload.challenge_id)?;
+
+        // 6b to 8. Confirm + verify + persist. Errors propagate with the
+        //          challenge already consumed.
+        self.finalize_open(payload, prepared, tx_sig).await
+    }
+
+    /// Pre-broadcast preparation. Validates everything from the cached
+    /// challenge through tx-shape co-signing. Errors here are safe to
+    /// release the reservation against.
+    async fn prepare_open(
+        &self,
+        payload: &OpenPayload,
+        cached: &ChallengeRecord,
+    ) -> Result<PreparedOpen, SessionError> {
+        // 2. Decode wire splits to typed `Split`s, then assert the cached
+        //    intent's advertised fields match the payload.
+        let payload_splits = wire_to_typed(&payload.distribution_splits, |m| {
+            SessionError::ChallengeFieldMismatch {
+                field: "distributionSplits",
+                advertised: "<cached>".into(),
+                got: m,
+            }
+        })?;
+
+        let (advertised_payee, advertised_mint, advertised_splits, min_deposit, max_deposit) =
+            match &cached.intent {
+                ChallengeIntent::Open {
+                    payee,
+                    mint,
+                    advertised_splits,
+                    min_deposit,
+                    max_deposit,
+                } => (*payee, *mint, advertised_splits.clone(), *min_deposit, *max_deposit),
+                // Discriminant was checked at reserve; this arm is unreachable.
+                _ => {
+                    return Err(SessionError::ChallengeIntentMismatch);
+                }
+            };
+
+        let payload_payee = parse_pubkey_field("payee", &payload.payee)?;
+        if payload_payee != advertised_payee {
+            return Err(SessionError::ChallengeFieldMismatch {
+                field: "payee",
+                advertised: advertised_payee.to_string(),
+                got: payload_payee.to_string(),
+            });
+        }
+        let payload_mint = parse_pubkey_field("mint", &payload.mint)?;
+        if payload_mint != advertised_mint {
+            return Err(SessionError::ChallengeFieldMismatch {
+                field: "mint",
+                advertised: advertised_mint.to_string(),
+                got: payload_mint.to_string(),
+            });
+        }
+        if payload_splits != advertised_splits {
+            return Err(SessionError::ChallengeFieldMismatch {
+                field: "distributionSplits",
+                advertised: format!("{advertised_splits:?}"),
+                got: format!("{payload_splits:?}"),
+            });
+        }
+
+        let deposit: u64 = payload
+            .deposit_amount
+            .parse()
+            .map_err(|e| SessionError::InvalidAmount(format!("depositAmount: {e}")))?;
+        if deposit < min_deposit || deposit > max_deposit {
+            return Err(SessionError::DepositOutOfRange {
+                min: min_deposit,
+                max: max_deposit,
+                got: deposit,
+            });
+        }
+
+        // 3. Re-derive (channel_pda, canonical_bump). Reject on PDA or bump
+        //    drift before any tx-shape work runs.
+        let payer = parse_pubkey_field("payer", &payload.payer)?;
+        let authorized_signer =
+            parse_pubkey_field("authorizedSigner", &payload.authorized_signer)?;
+        let salt: u64 = payload
+            .salt
+            .parse()
+            .map_err(|e| SessionError::InvalidAmount(format!("salt: {e}")))?;
+        let (expected_pda, canonical_bump) = find_channel_pda(
+            &payer,
+            &payload_payee,
+            &payload_mint,
+            &authorized_signer,
+            salt,
+            &self.config.program_id,
+        );
+        let claimed_pda = parse_pubkey_field("channelId", &payload.channel_id)?;
+        if claimed_pda != expected_pda {
+            return Err(SessionError::OnChainStateMismatch {
+                field: "channelId",
+                expected: expected_pda.to_string(),
+                got: claimed_pda.to_string(),
+            });
+        }
+        if payload.bump != canonical_bump {
+            return Err(SessionError::BumpMismatch {
+                canonical: canonical_bump,
+                got: payload.bump,
+            });
+        }
+
+        // 4. Validate the client's tx shape against the canonical bytes.
+        let DecodedOpenTx {
+            mut tx,
+            channel_id,
+            salt: tx_salt,
+            deposit: tx_deposit,
+            grace_period: tx_grace,
+            canonical_bump: tx_bump,
+        } = validate_open_tx_shape(payload, &payload_splits, &self.config, &cached.recent_blockhash)?;
+        // Cross-check the decoded values match what the payload claimed.
+        // These are post-hoc sanity asserts; the canonical-bytes comparison
+        // already covers byte equivalence, but the typed-value cross-check
+        // surfaces a clearer error if the payload-vs-tx parsing layers ever
+        // drift.
+        debug_assert_eq!(tx_salt, salt);
+        debug_assert_eq!(tx_deposit, deposit);
+        debug_assert_eq!(tx_grace, self.config.grace_period_seconds);
+        debug_assert_eq!(tx_bump, canonical_bump);
+        debug_assert_eq!(channel_id, expected_pda);
+
+        // 5. Co-sign as fee payer. Slot 0 is the fee-payer signature.
+        let fee_payer = self.config.fee_payer.as_ref().ok_or_else(|| {
+            SessionError::InternalError("fee_payer not configured; v1 is server-submit".into())
+        })?;
+        let msg_data = tx.message_data();
+        let sig = fee_payer
+            .signer
+            .sign_message(&msg_data)
+            .await
+            .map_err(|e| SessionError::InternalError(format!("fee-payer sign failed: {e}")))?;
+        if tx.signatures.is_empty() {
+            return Err(SessionError::MaliciousTx {
+                reason: "transaction missing signature slot for fee payer".into(),
+            });
+        }
+        tx.signatures[0] = Signature::from(<[u8; 64]>::from(sig));
+
+        Ok(PreparedOpen {
+            tx,
+            channel_id,
+            payer,
+            payee: payload_payee,
+            mint: payload_mint,
+            authorized_signer,
+            salt,
+            deposit,
+            canonical_bump,
+            payload_splits,
+        })
+    }
+
+    /// Post-broadcast finalisation. The challenge is already committed
+    /// before this runs; failures here propagate to the caller without
+    /// releasing. A confirm-poll timeout surfaces `OpenTxUnconfirmed(sig)`
+    /// so the operator log carries the real signature; the recovery layer
+    /// reconciles signatures that landed but did not confirm in time.
+    async fn finalize_open(
+        &self,
+        payload: &OpenPayload,
+        prepared: PreparedOpen,
+        tx_sig: Signature,
+    ) -> Result<Receipt, SessionError> {
+        let PreparedOpen {
+            tx: _,
+            channel_id,
+            payer,
+            payee: payload_payee,
+            mint: payload_mint,
+            authorized_signer,
+            salt,
+            deposit,
+            canonical_bump,
+            payload_splits,
+        } = prepared;
+
+        // Poll for Confirmed commitment, bounded by the operator-configured
+        // `broadcast_confirm_timeout`.
+        let confirm_commitment = CommitmentConfig::confirmed();
+        let mut confirmed = false;
+        let confirm_deadline = std::time::Instant::now() + self.config.broadcast_confirm_timeout;
+        while std::time::Instant::now() < confirm_deadline {
+            let resp = self
+                .rpc
+                .confirm_transaction_with_commitment(&tx_sig, confirm_commitment)
+                .await
+                .map_err(client_error_to_session_error)?;
+            if resp.value {
+                confirmed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !confirmed {
+            tracing::warn!(
+                signature = %tx_sig,
+                timeout_secs = self.config.broadcast_confirm_timeout.as_secs(),
+                "open tx broadcast but failed to confirm within timeout; channel may or may not exist; recovery layer will reconcile",
+            );
+            return Err(SessionError::OpenTxUnconfirmed(tx_sig));
+        }
+
+        // Mandatory on-chain verify. Map the typed VerifyError onto the
+        // surface error with the offending field name.
+        verify_open(
+            &self.rpc,
+            self.config.commitment,
+            &channel_id,
+            &ExpectedOpenState {
+                deposit,
+                payer,
+                payee: payload_payee,
+                mint: payload_mint,
+                authorized_signer,
+                bump: canonical_bump,
+            },
+            &payload_splits,
+        )
+        .await
+        .map_err(|e| verify_error_to_session_error(e, &channel_id))?;
+
+        // Persist the record. Hold the insert until verify succeeds so a
+        // cluster-disagreement does not write through to the store.
+        let record = ChannelRecord {
+            channel_id,
+            payer,
+            payee: payload_payee,
+            mint: payload_mint,
+            salt,
+            program_id: self.config.program_id,
+            authorized_signer,
+            deposit,
+            accepted_cumulative: 0,
+            on_chain_settled: 0,
+            last_voucher: None,
+            close_tx: None,
+            status: ChannelStatus::Open,
+            splits: payload_splits,
+        };
+        self.store.insert(record).await?;
+
+        Ok(Receipt {
+            status: crate::protocol::core::ReceiptStatus::Success,
+            method: MethodName::from(METHOD_NAME),
+            timestamp: rfc3339_now(),
+            reference: tx_sig.to_string(),
+            challenge_id: payload.challenge_id.clone(),
+        })
+    }
+
     fn build_challenge(
         &self,
         encoded: Base64UrlJson,
@@ -644,6 +992,157 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+fn rfc3339_now() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Decode a base58-encoded pubkey field from a wire payload.
+fn parse_pubkey_field(field: &'static str, raw: &str) -> Result<Pubkey, SessionError> {
+    let bytes = bs58::decode(raw)
+        .into_vec()
+        .map_err(|e| SessionError::OnChainStateMismatch {
+            field,
+            expected: "base58 pubkey".into(),
+            got: format!("{raw}: {e}"),
+        })?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SessionError::OnChainStateMismatch {
+            field,
+            expected: "32-byte pubkey".into(),
+            got: raw.to_string(),
+        })?;
+    Ok(Pubkey::new_from_array(arr))
+}
+
+/// Map a `solana_client::ClientError` into the right `SessionError`.
+///
+/// The blanket `From<ClientError>` impl lands every RPC failure in
+/// `RpcUnavailable` (5xx), which is wrong for blockhash expiry: that is a
+/// client-recoverable condition, the client should re-acquire a challenge
+/// with a fresh blockhash. This helper sniffs `BlockhashNotFound`
+/// surfaced via the simulated-tx path (returned as `TransactionError`)
+/// and routes it to `BlockhashMismatch` (4xx, 409) so the client backs
+/// off correctly. Anything else falls through to `RpcUnavailable`.
+///
+/// Note: many blockhash-expiry signals only show up at simulation time
+/// because the Solana RPC API exposes the `TransactionError` only when
+/// the cluster has actually attempted the tx. Pre-send "blockhash too old"
+/// detection is not reliably exposed by the upstream client; this helper
+/// catches the common case (post-send signal) and otherwise treats the
+/// failure as transient infra.
+fn client_error_to_session_error(e: ClientError) -> SessionError {
+    if matches!(e.get_transaction_error(), Some(TransactionError::BlockhashNotFound)) {
+        return SessionError::BlockhashMismatch {
+            expected: "challenge-bound recent blockhash".to_string(),
+            got: "BlockhashNotFound (expired or unknown to the cluster)".to_string(),
+        };
+    }
+    SessionError::from(e)
+}
+
+/// Map `verify_open`'s `VerifyError` into a typed `SessionError`,
+/// surfacing the offending on-chain field name in the conflict variants.
+fn verify_error_to_session_error(e: VerifyError, channel_id: &Pubkey) -> SessionError {
+    match e {
+        VerifyError::NotFound => SessionError::OnChainStateMismatch {
+            field: "channel",
+            expected: format!("Channel PDA at {channel_id}"),
+            got: "account not found".into(),
+        },
+        VerifyError::Tombstoned => SessionError::OnChainStateMismatch {
+            field: "channel",
+            expected: "Open status".into(),
+            got: "tombstoned (closed)".into(),
+        },
+        VerifyError::WrongLength { data_len } => SessionError::OnChainStateMismatch {
+            field: "channel",
+            expected: "Channel PDA bytes".into(),
+            got: format!("unexpected data.len() == {data_len}"),
+        },
+        VerifyError::WrongDiscriminator { byte } => SessionError::OnChainStateMismatch {
+            field: "channel",
+            expected: "Channel discriminator".into(),
+            got: format!("discriminator byte == {byte}"),
+        },
+        VerifyError::Mismatch(m) => mismatch_to_session_error(m),
+        VerifyError::UnexpectedEncoding { channel_id } => SessionError::OnChainStateMismatch {
+            field: "channel",
+            expected: "Base64 RPC encoding".into(),
+            got: format!("unsupported encoding for {channel_id}"),
+        },
+        VerifyError::Rpc(err) => err.into(),
+        VerifyError::Decode(err) => SessionError::InternalError(format!("channel decode: {err}")),
+    }
+}
+
+fn mismatch_to_session_error(m: Mismatch) -> SessionError {
+    use Mismatch as M;
+    match m {
+        M::Deposit { expected, got } => SessionError::OnChainStateMismatch {
+            field: "deposit",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::Settled { expected, got } => SessionError::OnChainStateMismatch {
+            field: "settled",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::Bump { expected, got } => SessionError::BumpMismatch {
+            canonical: expected,
+            got,
+        },
+        M::Version { got } => SessionError::ChannelVersionMismatch { supported: 1, got },
+        M::Status { expected, got } => SessionError::OnChainStateMismatch {
+            field: "status",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::GracePeriod { expected, got } => SessionError::OnChainStateMismatch {
+            field: "gracePeriod",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::ClosureStartedAt { expected, got } => SessionError::OnChainStateMismatch {
+            field: "closureStartedAt",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::Payer { expected, got } => SessionError::OnChainStateMismatch {
+            field: "payer",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::Payee { expected, got } => SessionError::OnChainStateMismatch {
+            field: "payee",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::AuthorizedSigner { expected, got } => SessionError::OnChainStateMismatch {
+            field: "authorizedSigner",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::Mint { expected, got } => SessionError::OnChainStateMismatch {
+            field: "mint",
+            expected: expected.to_string(),
+            got: got.to_string(),
+        },
+        M::ClosureNotStarted => SessionError::OnChainStateMismatch {
+            field: "closureStartedAt",
+            expected: ">0".into(),
+            got: "0".into(),
+        },
+        M::DistributionHash { expected, got } => SessionError::SplitsMismatch {
+            expected_hash: expected,
+            got_hash: got,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,6 +1173,7 @@ mod tests {
             grace_period_seconds: 86_400,
             challenge_ttl_seconds: 300,
             commitment: CommitmentConfig::confirmed(),
+            broadcast_confirm_timeout: Duration::from_secs(30),
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
             voucher_check_grace_seconds: DEFAULT_VOUCHER_CHECK_GRACE_SECONDS,
             fee_payer: None,
@@ -705,6 +1205,72 @@ mod tests {
         assert_eq!(
             decoded.get("externalId"),
             Some(&serde_json::json!("ext-123"))
+        );
+    }
+
+    #[tokio::test]
+    async fn open_commits_challenge_before_confirm_poll() {
+        // Pins the post-broadcast ordering inside `process_open`:
+        // once `send_transaction` returns Ok, the cache is moved to
+        // Consumed BEFORE the confirm poll. A confirm-poll timeout
+        // later returning `OpenTxUnconfirmed` must therefore leave the
+        // record in Consumed state, not Available; otherwise the
+        // client could re-broadcast a duplicate tx for the same
+        // intent if the original lands a moment after the timeout.
+        //
+        // We exercise the cache state machine directly here because
+        // driving the surrounding broadcast + verify + persist surface
+        // needs a live cluster. The live path is covered by the L1
+        // oracle; this test locks the invariant `process_open`
+        // depends on.
+        let method = dummy_method();
+        let challenge_id = "test-challenge-id-open-commit-ordering".to_string();
+        let intent = ChallengeIntent::Open {
+            payee: method.config.payee,
+            mint: method.config.mint,
+            advertised_splits: Vec::new(),
+            min_deposit: method.config.min_deposit,
+            max_deposit: method.config.max_deposit,
+        };
+        let issued_at = now_unix_seconds();
+        method
+            .cache
+            .insert(
+                challenge_id.clone(),
+                ChallengeRecord::new(intent, None, issued_at, Hash::new_from_array([0u8; 32])),
+            )
+            .expect("seed challenge record");
+
+        // Reserve, then commit, mirroring the order `process_open`
+        // performs once `send_transaction` returns Ok.
+        method
+            .cache
+            .reserve(&challenge_id, ChallengeIntentDiscriminant::Open)
+            .expect("reserve fresh challenge");
+        method
+            .cache
+            .commit(&challenge_id)
+            .expect("commit pending challenge");
+
+        let snapshot = method
+            .cache
+            .get(&challenge_id)
+            .expect("record stays in cache after commit");
+        assert_eq!(
+            snapshot.state,
+            challenge::ChallengeState::Consumed,
+            "challenge must be Consumed after commit, not Available"
+        );
+
+        // A second reservation under the same id must not succeed,
+        // regardless of whether the original tx ultimately confirmed.
+        let err = method
+            .cache
+            .reserve(&challenge_id, ChallengeIntentDiscriminant::Open)
+            .expect_err("second reserve on Consumed challenge must reject");
+        assert!(
+            matches!(err, SessionError::ChallengeUnbound),
+            "expected ChallengeUnbound on retry, got {err:?}"
         );
     }
 
