@@ -232,14 +232,21 @@ pub async fn verify_open(
     Ok(())
 }
 
-/// Verify a `top_up` produced the expected new deposit, at the
-/// caller-supplied commitment (matches `verify_open`'s semantics).
-pub async fn verify_topup(
+/// Verify a `top_up` confirmed and return the on-chain `deposit`.
+///
+/// Asserts the account exists, isn't tombstoned, has the supported
+/// version, and is still in `Open`. Rejects with [`Mismatch::Deposit`]
+/// if `view.deposit() < expected_new_deposit` (the tx confirmed but
+/// the chain didn't move the deposit as far as we expected). Returns
+/// `Ok(actual)` whenever the chain sits at or above the expected
+/// value, so the caller can fold a concurrent-topup race into its
+/// own deposit policy without losing the actual chain figure.
+pub async fn verify_topup_reconciling(
     rpc: &RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
     expected_new_deposit: u64,
-) -> Result<(), VerifyError> {
+) -> Result<u64, VerifyError> {
     let ui_account = rpc
         .get_ui_account_with_config(channel_id, account_info_config(commitment))
         .await?
@@ -261,14 +268,15 @@ pub async fn verify_topup(
         }
         .into());
     }
-    if view.deposit() != expected_new_deposit {
+    let actual = view.deposit();
+    if actual < expected_new_deposit {
         return Err(Mismatch::Deposit {
             expected: expected_new_deposit,
-            got: view.deposit(),
+            got: actual,
         }
         .into());
     }
-    Ok(())
+    Ok(actual)
 }
 
 /// Verify a `settle` left the channel still `Open` with the expected

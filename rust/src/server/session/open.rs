@@ -77,11 +77,11 @@ pub(crate) fn splits_to_recipients(splits: &[Split]) -> DistributionRecipients {
     }
 }
 
-fn pk_to_addr(pk: &Pubkey) -> Address {
+pub(crate) fn pk_to_addr(pk: &Pubkey) -> Address {
     Address::new_from_array(pk.to_bytes())
 }
 
-fn addr_to_pk(addr: &Address) -> Pubkey {
+pub(crate) fn addr_to_pk(addr: &Address) -> Pubkey {
     Pubkey::new_from_array(addr.to_bytes())
 }
 
@@ -94,24 +94,24 @@ fn id_v2_to_v3(bytes: [u8; 32]) -> Pubkey {
 }
 
 /// SPL Token program id as v3 `Pubkey`.
-fn spl_token_id() -> Pubkey {
+pub(crate) fn spl_token_id() -> Pubkey {
     id_v2_to_v3(spl_token::id().to_bytes())
 }
 
 /// SPL ATA program id as v3 `Pubkey`.
-fn ata_program_id() -> Pubkey {
+pub(crate) fn ata_program_id() -> Pubkey {
     id_v2_to_v3(spl_associated_token_account_client::program::ID.to_bytes())
 }
 
 /// ComputeBudget program id as v3 `Pubkey`.
-fn compute_budget_program_id() -> Pubkey {
+pub(crate) fn compute_budget_program_id() -> Pubkey {
     id_v2_to_v3(solana_compute_budget_interface::ID.to_bytes())
 }
 
 /// Derive the ATA for `(wallet, mint, token_program)`. Mirrors
 /// `spl_associated_token_account_client::address::get_associated_token_address_with_program_id`
 /// but stays in v3 `Pubkey` to skip the dual-version crate hop.
-fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubkey {
+pub(crate) fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubkey {
     let (pda, _) = Pubkey::find_program_address(
         &[
             wallet.as_ref(),

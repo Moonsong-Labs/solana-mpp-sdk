@@ -36,15 +36,18 @@ use tokio::task::JoinHandle;
 
 use crate::error::SessionError;
 use crate::program::payment_channels::state::find_channel_pda;
-use crate::program::payment_channels::verify::{verify_open, ExpectedOpenState, Mismatch, VerifyError};
+use crate::program::payment_channels::verify::{
+    verify_open, verify_topup_reconciling, ExpectedOpenState, Mismatch, VerifyError,
+};
 use crate::protocol::core::{compute_challenge_id, Base64UrlJson, MethodName, PaymentChallenge, Receipt};
 use crate::protocol::intents::session::{
-    typed_to_wire, wire_to_typed, MethodDetails, OpenPayload, SessionRequest, Split,
+    typed_to_wire, wire_to_typed, MethodDetails, OpenPayload, SessionRequest, Split, TopUpPayload,
 };
 use crate::store::{ChannelRecord, ChannelStatus, ChannelStore};
 
 use challenge::{ChallengeCache, ChallengeIntent, ChallengeIntentDiscriminant, ChallengeRecord};
 use open::{validate_open_tx_shape, DecodedOpenTx};
+use topup::{parse_topup_payload, validate_topup_tx_shape, DecodedTopupTx, ParsedTopupPayload};
 
 pub(crate) const METHOD_NAME: &str = "solana";
 const SESSION_INTENT: &str = "session";
@@ -253,6 +256,14 @@ struct PreparedOpen {
     deposit: u64,
     canonical_bump: u8,
     payload_splits: Vec<Split>,
+}
+
+/// Handoff between `prepare_topup` and `finalize_topup`: the co-signed
+/// tx plus the values the post-broadcast verify and record path needs.
+struct PreparedTopup {
+    tx: Transaction,
+    channel_id: Pubkey,
+    new_deposit: u64,
 }
 
 /// Server-side handler for the session intent.
@@ -845,6 +856,235 @@ impl SessionMethod {
         voucher::run_verify_voucher(self.store.as_ref(), &self.config, signed).await
     }
 
+    /// Server entry point for the `topup` action.
+    ///
+    /// Mirrors `process_open`'s broadcast discipline: reserve the
+    /// challenge, validate, co-sign, send, then commit the cache
+    /// before the confirm poll so a poll timeout can't let the client
+    /// re-broadcast a duplicate. After confirm, the on-chain deposit
+    /// is read and the store is bumped to whatever the chain
+    /// actually shows. A chain value above the operator's
+    /// `max_deposit` raises `MaxDepositExceeded` with `additional: 0`
+    /// to surface that the cap was already breached by another actor.
+    pub async fn process_topup(
+        &self,
+        payload: &TopUpPayload,
+    ) -> Result<Receipt, SessionError> {
+        let cached = self
+            .cache
+            .reserve(&payload.challenge_id, ChallengeIntentDiscriminant::TopUp)?;
+
+        // Anything failing here releases the reservation so the
+        // client can retry the same challenge.
+        let prepared = match self.prepare_topup(payload, &cached).await {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = self.cache.release(&payload.challenge_id);
+                return Err(e);
+            }
+        };
+
+        // Once the cluster accepts the tx the challenge is burned,
+        // regardless of how the confirm poll lands.
+        let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
+            preflight_commitment: Some(self.config.commitment.commitment),
+            ..Default::default()
+        };
+        let tx_sig = match self
+            .rpc
+            .send_transaction_with_config(&prepared.tx, send_config)
+            .await
+        {
+            Ok(sig) => sig,
+            Err(e) => {
+                let _ = self.cache.release(&payload.challenge_id);
+                return Err(client_error_to_session_error(e));
+            }
+        };
+
+        // Commit before the confirm poll, same ordering as `process_open`.
+        self.cache.commit(&payload.challenge_id)?;
+
+        self.finalize_topup(payload, prepared, tx_sig).await
+    }
+
+    /// Pre-broadcast prep for the topup flow: cross-check the cached
+    /// challenge, enforce deposit bounds, validate canonical bytes,
+    /// and co-sign as fee payer. Shape mirrors `prepare_open`.
+    async fn prepare_topup(
+        &self,
+        payload: &TopUpPayload,
+        cached: &ChallengeRecord,
+    ) -> Result<PreparedTopup, SessionError> {
+        let advertised_channel_id = match &cached.intent {
+            ChallengeIntent::TopUp { channel_id } => *channel_id,
+            // Discriminant got checked at reserve, the other arms can't land here.
+            _ => return Err(SessionError::ChallengeIntentMismatch),
+        };
+
+        let ParsedTopupPayload {
+            channel_id,
+            additional_amount,
+        } = parse_topup_payload(payload)?;
+
+        // Payload channel id has to match what the cached challenge advertised.
+        if channel_id != advertised_channel_id {
+            return Err(SessionError::ChallengeFieldMismatch {
+                field: "channelId",
+                advertised: advertised_channel_id.to_string(),
+                got: channel_id.to_string(),
+            });
+        }
+
+        // Both "absent record" and "wrong status" collapse into one
+        // `channelId` mismatch so a probing attacker can't distinguish them.
+        let record = self.store.get(&channel_id).await?.ok_or_else(|| {
+            SessionError::OnChainStateMismatch {
+                field: "channelId",
+                expected: "open channel".into(),
+                got: channel_id.to_string(),
+            }
+        })?;
+        if record.status != ChannelStatus::Open {
+            return Err(SessionError::OnChainStateMismatch {
+                field: "channelId",
+                expected: "open channel".into(),
+                got: channel_id.to_string(),
+            });
+        }
+
+        // `checked_add` catches the pathological u64 overflow before the cap check.
+        let new_deposit = record.deposit.checked_add(additional_amount).ok_or_else(|| {
+            SessionError::InvalidAmount(format!(
+                "deposit + additional overflows u64 (deposit={}, additional={})",
+                record.deposit, additional_amount
+            ))
+        })?;
+        if new_deposit > self.config.max_deposit {
+            return Err(SessionError::MaxDepositExceeded {
+                current: record.deposit,
+                additional: additional_amount,
+                max: self.config.max_deposit,
+            });
+        }
+
+        let DecodedTopupTx { mut tx } = validate_topup_tx_shape(
+            &payload.transaction,
+            &self.config,
+            &channel_id,
+            additional_amount,
+            &record.payer,
+            &record.mint,
+            &cached.recent_blockhash,
+        )?;
+
+        // Co-sign as fee payer.
+        let fee_payer = self.config.fee_payer.as_ref().ok_or_else(|| {
+            SessionError::InternalError("fee_payer not configured; v1 is server-submit".into())
+        })?;
+        let msg_data = tx.message_data();
+        let sig = fee_payer
+            .signer
+            .sign_message(&msg_data)
+            .await
+            .map_err(|e| SessionError::InternalError(format!("fee-payer sign failed: {e}")))?;
+        if tx.signatures.is_empty() {
+            return Err(SessionError::MaliciousTx {
+                reason: "transaction missing signature slot for fee payer".into(),
+            });
+        }
+        tx.signatures[0] = Signature::from(<[u8; 64]>::from(sig));
+
+        Ok(PreparedTopup {
+            tx,
+            channel_id,
+            new_deposit,
+        })
+    }
+
+    /// Post-broadcast finalisation. A confirm-poll timeout returns
+    /// `TopUpFailed { sig, reason }`; the recovery layer handles
+    /// signatures that land after that.
+    async fn finalize_topup(
+        &self,
+        payload: &TopUpPayload,
+        prepared: PreparedTopup,
+        tx_sig: Signature,
+    ) -> Result<Receipt, SessionError> {
+        let PreparedTopup {
+            tx: _,
+            channel_id,
+            new_deposit,
+        } = prepared;
+
+        // Poll until Confirmed or the broadcast-confirm timeout fires.
+        let confirm_commitment = CommitmentConfig::confirmed();
+        let mut confirmed = false;
+        let confirm_deadline = std::time::Instant::now() + self.config.broadcast_confirm_timeout;
+        while std::time::Instant::now() < confirm_deadline {
+            let resp = self
+                .rpc
+                .confirm_transaction_with_commitment(&tx_sig, confirm_commitment)
+                .await
+                .map_err(client_error_to_session_error)?;
+            if resp.value {
+                confirmed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !confirmed {
+            tracing::warn!(
+                signature = %tx_sig,
+                timeout_secs = self.config.broadcast_confirm_timeout.as_secs(),
+                "topup tx broadcast but failed to confirm within timeout; recovery layer will reconcile",
+            );
+            return Err(SessionError::TopUpFailed(
+                tx_sig,
+                format!(
+                    "did not reach Confirmed within {}s",
+                    self.config.broadcast_confirm_timeout.as_secs()
+                ),
+            ));
+        }
+
+        // Concurrent topups landing in the same window can push the
+        // chain above `new_deposit`. Treat chain as the truth: a
+        // value below it means this tx confirmed without moving the
+        // deposit as expected, and a value above `max_deposit` means
+        // someone else drove the channel past the operator cap.
+        let actual_deposit = verify_topup_reconciling(
+            &self.rpc,
+            self.config.commitment,
+            &channel_id,
+            new_deposit,
+        )
+        .await
+        .map_err(|e| verify_error_to_session_error(e, &channel_id))?;
+
+        let reconciled = apply_topup_reconciliation_policy(
+            actual_deposit,
+            new_deposit,
+            self.config.max_deposit,
+            &channel_id,
+            &tx_sig,
+        )?;
+
+        // Persist the chain figure, not `new_deposit`, so the record
+        // tracks chain after a concurrent-topup race.
+        self.store.record_deposit(&channel_id, reconciled).await?;
+
+        Ok(Receipt {
+            status: crate::protocol::core::ReceiptStatus::Success,
+            method: MethodName::from(METHOD_NAME),
+            timestamp: rfc3339_now(),
+            reference: tx_sig.to_string(),
+            challenge_id: payload.challenge_id.clone(),
+            accepted_cumulative: None,
+            spent: None,
+        })
+    }
+
     fn build_challenge(
         &self,
         encoded: Base64UrlJson,
@@ -1029,8 +1269,50 @@ fn client_error_to_session_error(e: ClientError) -> SessionError {
     SessionError::from(e)
 }
 
-/// Map `verify_open`'s `VerifyError` to a `SessionError`, carrying
-/// the offending on-chain field name on the conflict variants.
+/// Decide what to persist after a confirmed top-up. `actual` comes
+/// from [`verify_topup_reconciling`], so the "chain below expected"
+/// case has already been filtered out; this function only owns the
+/// cap-violation guardrail and the trace for the concurrent-topup race.
+///
+/// Returns `actual` on success whether or not it equals `new_deposit`.
+/// A chain value above `max_deposit` raises an operator alarm and
+/// returns `MaxDepositExceeded { additional: 0, .. }` so the caller
+/// can tell "this request didn't push us over" from "we were already over".
+fn apply_topup_reconciliation_policy(
+    actual: u64,
+    new_deposit: u64,
+    max_deposit: u64,
+    channel_id: &Pubkey,
+    tx_sig: &Signature,
+) -> Result<u64, SessionError> {
+    if actual > max_deposit {
+        tracing::error!(
+            channel_id = %channel_id,
+            actual_deposit = actual,
+            max_deposit,
+            signature = %tx_sig,
+            "on-chain deposit exceeds configured max_deposit; another actor drove the channel past the cap",
+        );
+        return Err(SessionError::MaxDepositExceeded {
+            current: actual,
+            additional: 0,
+            max: max_deposit,
+        });
+    }
+    if actual > new_deposit {
+        tracing::warn!(
+            channel_id = %channel_id,
+            expected_new_deposit = new_deposit,
+            actual_deposit = actual,
+            signature = %tx_sig,
+            "on-chain deposit exceeds expected; reconciling local record to chain value",
+        );
+    }
+    Ok(actual)
+}
+
+/// Map a `VerifyError` from any of the on-chain verify helpers into a
+/// `SessionError`, carrying the offending field name on the conflict variants.
 fn verify_error_to_session_error(e: VerifyError, channel_id: &Pubkey) -> SessionError {
     match e {
         VerifyError::NotFound => SessionError::OnChainStateMismatch {
@@ -1195,18 +1477,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_commits_challenge_before_confirm_poll() {
-        // Pin the post-broadcast ordering inside `process_open`. Once
-        // `send_transaction` returns Ok, the cache moves to Consumed
-        // before the confirm poll runs; a later `OpenTxUnconfirmed`
-        // therefore leaves the record Consumed, not Available, so the
-        // client can't re-broadcast a duplicate if the original lands
-        // a moment after the timeout.
-        //
-        // The cache state machine runs directly here; driving the
-        // surrounding broadcast/verify/persist needs a live cluster
-        // and the L1 oracle covers that. This test just locks the
-        // ordering `process_open` relies on.
+    // End-to-end commit-before-confirm-poll ordering is covered by the L1 oracle.
+    async fn cache_consumed_state_blocks_retry_for_open() {
+        // Once a challenge is Consumed, a second reservation on the
+        // same id rejects with `ChallengeUnbound` regardless of how
+        // the original tx settles. `process_open` commits before the
+        // confirm poll, so a poll timeout still leaves the record
+        // Consumed and the client can't sneak in a duplicate.
         let method = dummy_method();
         let challenge_id = "test-challenge-id-open-commit-ordering".to_string();
         let intent = ChallengeIntent::Open {
@@ -1252,6 +1529,440 @@ mod tests {
             .cache
             .reserve(&challenge_id, ChallengeIntentDiscriminant::Open)
             .expect_err("second reserve on Consumed challenge must reject");
+        assert!(
+            matches!(err, SessionError::ChallengeUnbound),
+            "expected ChallengeUnbound on retry, got {err:?}"
+        );
+    }
+
+    /// Build a `SessionMethod` with a fee payer attached so the topup
+    /// orchestration can reach `validate_topup_tx_shape`. Tests that
+    /// fail before broadcast use this without a live cluster.
+    fn dummy_method_with_fee_payer() -> (SessionMethod, Pubkey) {
+        use solana_keychain::MemorySigner;
+        use solana_sdk::signature::Keypair;
+        let kp = Keypair::new();
+        let bytes = kp.to_bytes();
+        let signer: Arc<dyn solana_keychain::SolanaSigner> =
+            Arc::new(MemorySigner::from_bytes(&bytes).expect("memory signer"));
+        let fee_payer_pk = signer.pubkey();
+
+        let rpc = Arc::new(RpcClient::new("http://127.0.0.1:8899".to_string()));
+        let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
+        let mut config = SessionConfig::new_with_defaults(
+            Pubkey::new_from_array([1u8; 32]),
+            Pubkey::new_from_array([2u8; 32]),
+            Pubkey::new_from_array([3u8; 32]),
+            6,
+            Network::Localnet,
+            Pubkey::new_from_array([4u8; 32]),
+            Pricing {
+                amount_per_unit: 1_000,
+                unit_type: "request".into(),
+            },
+        );
+        config.max_deposit = 100_000;
+        config.min_deposit = 1_000;
+        config.fee_payer = Some(FeePayer { signer });
+        config.realm = Some("Test Realm".into());
+        config.secret_key = Some("test-secret-key".into());
+        let method =
+            SessionMethod::new_for_recover(config, store, rpc).expect("construct SessionMethod");
+        (method, fee_payer_pk)
+    }
+
+    /// Seed a `TopUp { channel_id }` challenge into the cache and
+    /// return its id so `process_topup` can reserve it.
+    fn seed_topup_challenge(method: &SessionMethod, channel_id: Pubkey) -> String {
+        let id = format!("topup-{channel_id}");
+        let issued_at = now_unix_seconds();
+        method
+            .cache
+            .insert(
+                id.clone(),
+                ChallengeRecord::new(
+                    ChallengeIntent::TopUp { channel_id },
+                    None,
+                    issued_at,
+                    Hash::new_from_array([7u8; 32]),
+                ),
+            )
+            .expect("seed topup challenge");
+        id
+    }
+
+    fn base_topup_record(channel_id: Pubkey, deposit: u64) -> ChannelRecord {
+        ChannelRecord {
+            channel_id,
+            payer: Pubkey::new_from_array([0xA1; 32]),
+            payee: Pubkey::new_from_array([0xA2; 32]),
+            mint: Pubkey::new_from_array([0xA3; 32]),
+            salt: 0xCAFE,
+            program_id: Pubkey::new_from_array([0xA4; 32]),
+            authorized_signer: Pubkey::new_from_array([0xA5; 32]),
+            deposit,
+            accepted_cumulative: 0,
+            on_chain_settled: 0,
+            last_voucher: None,
+            close_tx: None,
+            status: ChannelStatus::Open,
+            splits: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn topup_rejects_when_record_absent() {
+        // Cached challenge points at a channel id that isn't in the
+        // store. Surface as a `channelId` on-chain mismatch, same
+        // shape `verify_voucher` uses.
+        let (method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC1; 32]);
+        let challenge_id = seed_topup_challenge(&method, cid);
+
+        let payload = TopUpPayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid.to_string(),
+            additional_amount: "5000".into(),
+            transaction: String::new(),
+        };
+        let err = method
+            .process_topup(&payload)
+            .await
+            .expect_err("absent record must reject");
+        match err {
+            SessionError::OnChainStateMismatch { field, .. } => {
+                assert_eq!(field, "channelId");
+            }
+            other => panic!("expected OnChainStateMismatch, got {other:?}"),
+        }
+
+        // Pre-broadcast failures release the reservation so the
+        // client can retry.
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    #[tokio::test]
+    async fn topup_rejects_when_status_not_open() {
+        let (method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC2; 32]);
+        let mut record = base_topup_record(cid, 10_000);
+        record.status = ChannelStatus::Closing;
+        method.store.insert(record).await.unwrap();
+        let challenge_id = seed_topup_challenge(&method, cid);
+
+        let payload = TopUpPayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid.to_string(),
+            additional_amount: "5000".into(),
+            transaction: String::new(),
+        };
+        let err = method
+            .process_topup(&payload)
+            .await
+            .expect_err("non-Open status must reject");
+        match err {
+            SessionError::OnChainStateMismatch { field, .. } => {
+                assert_eq!(field, "channelId");
+            }
+            other => panic!("expected OnChainStateMismatch, got {other:?}"),
+        }
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    #[tokio::test]
+    async fn topup_rejects_when_additional_zero() {
+        let (method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC3; 32]);
+        method
+            .store
+            .insert(base_topup_record(cid, 10_000))
+            .await
+            .unwrap();
+        let challenge_id = seed_topup_challenge(&method, cid);
+
+        let payload = TopUpPayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid.to_string(),
+            additional_amount: "0".into(),
+            transaction: String::new(),
+        };
+        let err = method
+            .process_topup(&payload)
+            .await
+            .expect_err("zero additional must reject");
+        match err {
+            SessionError::InvalidAmount(msg) => {
+                assert!(msg.contains("additionalAmount"), "{msg}");
+            }
+            other => panic!("expected InvalidAmount, got {other:?}"),
+        }
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    #[tokio::test]
+    async fn topup_rejects_when_max_deposit_exceeded() {
+        let (method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC4; 32]);
+        // Record sits at 90k, cap is 100k; a 50k topup lands at 140k.
+        method
+            .store
+            .insert(base_topup_record(cid, 90_000))
+            .await
+            .unwrap();
+        let challenge_id = seed_topup_challenge(&method, cid);
+
+        let payload = TopUpPayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid.to_string(),
+            additional_amount: "50000".into(),
+            transaction: String::new(),
+        };
+        let err = method
+            .process_topup(&payload)
+            .await
+            .expect_err("max deposit exceeded must reject");
+        match err {
+            SessionError::MaxDepositExceeded {
+                current,
+                additional,
+                max,
+            } => {
+                assert_eq!(current, 90_000);
+                assert_eq!(additional, 50_000);
+                assert_eq!(max, 100_000);
+            }
+            other => panic!("expected MaxDepositExceeded, got {other:?}"),
+        }
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    /// Build a base64-encoded `getAccountInfo` response for a Channel
+    /// PDA with the supplied deposit. Other fields take canonical
+    /// values (version 1, status Open) so `verify_topup_reconciling`
+    /// short-circuits on the deposit check; tests using this helper
+    /// don't assert on them.
+    fn channel_account_info_json(deposit: u64) -> serde_json::Value {
+        use borsh::BorshSerialize;
+        use payment_channels_client::accounts::Channel;
+        use solana_address::Address;
+
+        let chan = Channel {
+            discriminator: 1, // ChannelDiscriminator value; from_bytes ignores
+            version: 1,
+            bump: 254,
+            status: payment_channels_client::types::ChannelStatus::Open as u8,
+            salt: 0,
+            deposit,
+            settled: 0,
+            paid_out: 0,
+            closure_started_at: 0,
+            payer_withdrawn_at: 0,
+            grace_period: 86_400,
+            distribution_hash: [0u8; 32],
+            payer: Address::new_from_array([0xA1; 32]),
+            payee: Address::new_from_array([0xA2; 32]),
+            authorized_signer: Address::new_from_array([0xA5; 32]),
+            mint: Address::new_from_array([0xA3; 32]),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        chan.serialize(&mut buf).expect("borsh serialize Channel");
+        let b64 = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        };
+        serde_json::json!({
+            "context": { "slot": 1, "apiVersion": null },
+            "value": {
+                "lamports": 0u64,
+                "data": [b64, "base64"],
+                "owner": payment_channels_client::programs::PAYMENT_CHANNELS_ID.to_string(),
+                "executable": false,
+                "rentEpoch": 0u64,
+                "space": buf.len() as u64,
+            }
+        })
+    }
+
+    /// Mock `RpcClient` whose `getAccountInfo` returns a Channel with
+    /// the supplied deposit. The default mock-sender covers everything
+    /// else the helpers don't touch.
+    fn mock_rpc_with_channel_deposit(deposit: u64) -> Arc<RpcClient> {
+        use solana_rpc_client::api::request::RpcRequest;
+        let mut mocks = std::collections::HashMap::new();
+        mocks.insert(RpcRequest::GetAccountInfo, channel_account_info_json(deposit));
+        Arc::new(RpcClient::new_mock_with_mocks(
+            "succeeds".to_string(),
+            mocks,
+        ))
+    }
+
+    #[tokio::test]
+    async fn topup_reconciles_when_on_chain_exceeds_expected() {
+        // Concurrent-topup race: our tx confirms, a sibling tx lands
+        // in the same window, so chain reads higher than expected.
+        // The verify helper returns the chain figure, the policy
+        // accepts it (still under the cap), the store records it.
+        use crate::store::InMemoryChannelStore;
+
+        let cid = Pubkey::new_from_array([0xD1; 32]);
+        let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
+        store
+            .insert(base_topup_record(cid, 10_000))
+            .await
+            .unwrap();
+
+        let expected_new_deposit = 12_000;
+        let actual_on_chain = 14_000;
+        let max_deposit = 100_000;
+        let rpc = mock_rpc_with_channel_deposit(actual_on_chain);
+
+        let actual = verify_topup_reconciling(
+            &rpc,
+            CommitmentConfig::confirmed(),
+            &cid,
+            expected_new_deposit,
+        )
+        .await
+        .expect("reconciling helper returns actual deposit");
+        assert_eq!(actual, actual_on_chain);
+
+        let tx_sig = Signature::from([0u8; 64]);
+        let reconciled = apply_topup_reconciliation_policy(
+            actual,
+            expected_new_deposit,
+            max_deposit,
+            &cid,
+            &tx_sig,
+        )
+        .expect("policy accepts actual within cap");
+        assert_eq!(reconciled, actual_on_chain);
+
+        store.record_deposit(&cid, reconciled).await.unwrap();
+        let record = store.get(&cid).await.unwrap().expect("record present");
+        assert_eq!(
+            record.deposit, actual_on_chain,
+            "record bumps to chain value, not the smaller expected_new_deposit",
+        );
+    }
+
+    #[tokio::test]
+    async fn topup_errors_when_on_chain_exceeds_max_deposit() {
+        // Operator alarm: another caller already drove the channel
+        // past the cap. `additional: 0` flags that this request
+        // wasn't the one that pushed it over.
+        let cid = Pubkey::new_from_array([0xD2; 32]);
+        let actual = 110_000;
+        let expected_new_deposit = 50_000;
+        let max_deposit = 100_000;
+        let tx_sig = Signature::from([0u8; 64]);
+
+        let err = apply_topup_reconciliation_policy(
+            actual,
+            expected_new_deposit,
+            max_deposit,
+            &cid,
+            &tx_sig,
+        )
+        .expect_err("actual above max must reject");
+        match err {
+            SessionError::MaxDepositExceeded {
+                current,
+                additional,
+                max,
+            } => {
+                assert_eq!(current, actual);
+                assert_eq!(additional, 0, "additional should be 0 when the cap was already breached");
+                assert_eq!(max, max_deposit);
+            }
+            other => panic!("expected MaxDepositExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn topup_errors_when_on_chain_below_expected() {
+        // Tx confirmed but the on-chain deposit is below expected.
+        // The verify helper rejects with `Mismatch::Deposit`, which
+        // the lifecycle maps to `OnChainStateMismatch { field:
+        // "deposit", .. }`.
+        let cid = Pubkey::new_from_array([0xD3; 32]);
+        let expected_new_deposit = 12_000;
+        let actual_on_chain = 11_000;
+        let rpc = mock_rpc_with_channel_deposit(actual_on_chain);
+
+        let err = verify_topup_reconciling(
+            &rpc,
+            CommitmentConfig::confirmed(),
+            &cid,
+            expected_new_deposit,
+        )
+        .await
+        .expect_err("on-chain below expected must reject");
+        match err {
+            VerifyError::Mismatch(Mismatch::Deposit { expected, got }) => {
+                assert_eq!(expected, expected_new_deposit);
+                assert_eq!(got, actual_on_chain);
+            }
+            other => panic!("expected Mismatch::Deposit, got {other:?}"),
+        }
+
+        // Same error through the lifecycle mapping becomes
+        // `OnChainStateMismatch { field: "deposit", .. }`.
+        let mapped = verify_error_to_session_error(
+            VerifyError::Mismatch(Mismatch::Deposit {
+                expected: expected_new_deposit,
+                got: actual_on_chain,
+            }),
+            &cid,
+        );
+        match mapped {
+            SessionError::OnChainStateMismatch { field, expected, got } => {
+                assert_eq!(field, "deposit");
+                assert_eq!(expected, expected_new_deposit.to_string());
+                assert_eq!(got, actual_on_chain.to_string());
+            }
+            other => panic!("expected OnChainStateMismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    // End-to-end commit-before-confirm-poll ordering is covered by the L1 oracle.
+    async fn cache_consumed_state_blocks_retry_for_topup() {
+        // Topup twin of `cache_consumed_state_blocks_retry_for_open`.
+        // Once the challenge is Consumed, a second reservation
+        // rejects with `ChallengeUnbound`. `process_topup` commits
+        // before the confirm poll, so a `TopUpFailed { sig, .. }`
+        // from a poll timeout still blocks client retries.
+        let (method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC5; 32]);
+        let challenge_id = seed_topup_challenge(&method, cid);
+
+        method
+            .cache
+            .reserve(&challenge_id, ChallengeIntentDiscriminant::TopUp)
+            .expect("reserve fresh topup challenge");
+        method
+            .cache
+            .commit(&challenge_id)
+            .expect("commit pending topup challenge");
+
+        let snapshot = method
+            .cache
+            .get(&challenge_id)
+            .expect("record stays in cache after commit");
+        assert_eq!(
+            snapshot.state,
+            challenge::ChallengeState::Consumed,
+            "topup challenge must be Consumed after commit, not Available"
+        );
+
+        let err = method
+            .cache
+            .reserve(&challenge_id, ChallengeIntentDiscriminant::TopUp)
+            .expect_err("second reserve on Consumed topup challenge must reject");
         assert!(
             matches!(err, SessionError::ChallengeUnbound),
             "expected ChallengeUnbound on retry, got {err:?}"
