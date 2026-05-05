@@ -11,9 +11,10 @@
 //!      and confirms the residual stays escrowed on the Open path.
 //!
 //! Covers only the `Open`-state distribute path. The `Finalized` branch
-//! (which tombstones the channel and sweeps to the treasury) is
-//! unreachable at this rev because upstream's `finalize` is stubbed;
-//! that coverage lands once upstream ships finalize.
+//! (which tombstones the channel and sweeps to the treasury) is exercised
+//! separately by `session_l1_tombstone_oracle.rs`, which drives the full
+//! close lifecycle end-to-end and asserts the resulting 1-byte tombstone
+//! shape.
 
 mod common;
 

@@ -216,3 +216,12 @@ l1-oracle-settle-finalize:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_settle_finalize_oracle -- --nocapture
+
+# Run the end-to-end tombstone oracle. Requires the pinned program .so.
+# Drives the full close lifecycle (open + settle + settle_and_finalize +
+# distribute) and asserts the post-distribute PDA is exactly [2u8] with
+# program ownership preserved.
+l1-oracle-tombstone:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_tombstone_oracle -- --nocapture
