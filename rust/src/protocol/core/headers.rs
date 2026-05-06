@@ -398,6 +398,8 @@ mod tests {
             challenge_id: "ch-test".to_string(),
             accepted_cumulative: None,
             spent: None,
+            tx_hash: None,
+            refunded: None,
         };
         let header = format_receipt(&receipt).unwrap();
         let parsed = parse_receipt(&header).unwrap();

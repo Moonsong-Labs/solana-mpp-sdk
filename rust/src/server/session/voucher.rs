@@ -117,6 +117,8 @@ fn build_receipt(
         challenge_id: challenge_id.unwrap_or_default().to_string(),
         accepted_cumulative: Some(accepted.to_string()),
         spent: Some(spent.to_string()),
+        tx_hash: None,
+        refunded: None,
     }
 }
 
@@ -384,6 +386,7 @@ mod tests {
             clock_skew_seconds,
             voucher_check_grace_seconds: DEFAULT_VOUCHER_CHECK_GRACE_SECONDS,
             fee_payer: None,
+            payee_signer: None,
             realm: Some("test".into()),
             secret_key: Some("test-secret".into()),
         }

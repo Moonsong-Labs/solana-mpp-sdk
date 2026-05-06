@@ -108,6 +108,24 @@ impl std::fmt::Debug for FeePayer {
     }
 }
 
+/// Operator-held signer for the channel's payee role. Same custody
+/// contract as [`FeePayer`]: the SDK never persists key material. The
+/// merchant signer in `settle_and_finalize` has to match `Channel.payee`,
+/// so this signer's pubkey has to equal `SessionConfig.payee` at runtime;
+/// `process_close` checks and bails loudly when they diverge.
+#[derive(Clone)]
+pub struct PayeeSigner {
+    pub signer: Arc<dyn solana_keychain::SolanaSigner>,
+}
+
+impl std::fmt::Debug for PayeeSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PayeeSigner")
+            .field("pubkey", &self.signer.pubkey())
+            .finish()
+    }
+}
+
 /// Operator-supplied config. Hand it to [`SessionBuilder`] before
 /// `recover()`. Store and RPC client come in through the builder, not
 /// here.
@@ -144,6 +162,16 @@ pub struct SessionConfig {
     /// delay between sign and submit. Defaults to 15s.
     pub voucher_check_grace_seconds: u32,
     pub fee_payer: Option<FeePayer>,
+    /// Operator-held signer for the channel's payee role. Required for
+    /// `process_close`: `settle_and_finalize` enforces that the merchant
+    /// transaction signer matches `Channel.payee`, which is set at open
+    /// time to `payee` above. Same custody contract as `fee_payer`: the
+    /// SDK never persists key material; operators wrap their custody in
+    /// a [`solana_keychain::SolanaSigner`] and pass it in via the
+    /// optional [`PayeeSigner`] facade. Optional because deployments
+    /// that only issue topup-like flows don't need it, but
+    /// `process_close` rejects with an internal error when absent.
+    pub payee_signer: Option<PayeeSigner>,
     /// Realm advertised in the WWW-Authenticate header. Falls back to
     /// [`DEFAULT_REALM`] (`"MPP Payment"`) when `None`.
     pub realm: Option<String>,
@@ -188,6 +216,7 @@ impl SessionConfig {
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
             voucher_check_grace_seconds: DEFAULT_VOUCHER_CHECK_GRACE_SECONDS,
             fee_payer: None,
+            payee_signer: None,
             realm: None,
             secret_key: None,
         }
@@ -839,6 +868,8 @@ impl SessionMethod {
             challenge_id: payload.challenge_id.clone(),
             accepted_cumulative: None,
             spent: None,
+            tx_hash: None,
+            refunded: None,
         })
     }
 
@@ -854,6 +885,43 @@ impl SessionMethod {
         signed: &crate::protocol::intents::session::SignedVoucher,
     ) -> Result<Receipt, SessionError> {
         voucher::run_verify_voucher(self.store.as_ref(), &self.config, signed).await
+    }
+
+    /// Server entry point for the `close` action.
+    ///
+    /// Cooperative close end-to-end. Re-runs voucher checks (with the
+    /// stricter close-time grace window) when a fresh voucher is
+    /// supplied, then bundles `[ed25519_verify?, settle_and_finalize,
+    /// distribute]` and broadcasts. The close tx is server-built; there
+    /// is no client-supplied tx to validate. Status flow: `Open` becomes
+    /// `CloseAttempting` before broadcast, then either rolls back to
+    /// `Open` on failure or advances to `ClosedPending` on confirm. An
+    /// async lift to `ClosedFinalized` runs in the background; the
+    /// response goes out at Confirmed.
+    pub async fn process_close(
+        &self,
+        payload: &crate::protocol::intents::session::ClosePayload,
+    ) -> Result<Receipt, SessionError> {
+        let payee_signer = self
+            .config
+            .payee_signer
+            .as_ref()
+            .ok_or_else(|| {
+                SessionError::InternalError(
+                    "payee_signer not configured; required by process_close".into(),
+                )
+            })?
+            .signer
+            .clone();
+        close::run_process_close(
+            &self.store,
+            &self.rpc,
+            &self.cache,
+            &self.config,
+            &payee_signer,
+            payload,
+        )
+        .await
     }
 
     /// Server entry point for the `topup` action.
@@ -1082,6 +1150,8 @@ impl SessionMethod {
             challenge_id: payload.challenge_id.clone(),
             accepted_cumulative: None,
             spent: None,
+            tx_hash: None,
+            refunded: None,
         })
     }
 
@@ -1445,6 +1515,7 @@ mod tests {
             clock_skew_seconds: DEFAULT_CLOCK_SKEW_SECONDS,
             voucher_check_grace_seconds: DEFAULT_VOUCHER_CHECK_GRACE_SECONDS,
             fee_payer: None,
+            payee_signer: None,
             realm: Some("Test Realm".into()),
             secret_key: Some("test-secret-key".into()),
         };
@@ -1967,6 +2038,235 @@ mod tests {
             matches!(err, SessionError::ChallengeUnbound),
             "expected ChallengeUnbound on retry, got {err:?}"
         );
+    }
+
+    /// Seed a `Close { channel_id }` challenge into the cache and
+    /// return its id so `process_close` can reserve it.
+    fn seed_close_challenge(method: &SessionMethod, channel_id: Pubkey) -> String {
+        let id = format!("close-{channel_id}");
+        let issued_at = now_unix_seconds();
+        method
+            .cache
+            .insert(
+                id.clone(),
+                ChallengeRecord::new(
+                    ChallengeIntent::Close { channel_id },
+                    None,
+                    issued_at,
+                    Hash::new_from_array([7u8; 32]),
+                ),
+            )
+            .expect("seed close challenge");
+        id
+    }
+
+    #[tokio::test]
+    async fn close_rejects_when_record_absent() {
+        // Cached challenge points at an unknown channel id. Surfaces as
+        // a `channelId` on-chain mismatch, mirroring topup and
+        // verify_voucher.
+        let (mut method, _fp) = dummy_method_with_fee_payer();
+
+        // Wire in a payee signer so the early guard doesn't short-circuit
+        // ahead of the store lookup.
+        let kp = solana_sdk::signature::Keypair::new();
+        let bytes = kp.to_bytes();
+        let payee_signer: Arc<dyn solana_keychain::SolanaSigner> =
+            Arc::new(solana_keychain::MemorySigner::from_bytes(&bytes).unwrap());
+        let mut new_cfg = method.config.clone();
+        new_cfg.payee_signer = Some(crate::server::session::PayeeSigner {
+            signer: payee_signer,
+        });
+        method.config = new_cfg;
+
+        let cid = Pubkey::new_from_array([0xC1; 32]);
+        let challenge_id = seed_close_challenge(&method, cid);
+
+        let payload = crate::protocol::intents::session::ClosePayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid.to_string(),
+            voucher: None,
+        };
+        let err = method
+            .process_close(&payload)
+            .await
+            .expect_err("absent record must reject");
+        match err {
+            SessionError::OnChainStateMismatch { field, .. } => assert_eq!(field, "channelId"),
+            other => panic!("expected OnChainStateMismatch, got {other:?}"),
+        }
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    #[tokio::test]
+    async fn close_rejects_when_status_not_open() {
+        // CloseAttempting and Closing belong to recovery; the live
+        // process_close handler treats them as "channel not open".
+        let (mut method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC2; 32]);
+        let mut record = base_topup_record(cid, 10_000);
+        record.status = ChannelStatus::Closing;
+        method.store.insert(record).await.unwrap();
+
+        // Plug in a payee signer with a matching pubkey so the
+        // orchestration makes it past the early payee_signer guard.
+        let kp = solana_sdk::signature::Keypair::new();
+        let bytes = kp.to_bytes();
+        let payee_signer: Arc<dyn solana_keychain::SolanaSigner> =
+            Arc::new(solana_keychain::MemorySigner::from_bytes(&bytes).unwrap());
+        let payee_pk = payee_signer.pubkey();
+
+        let mut new_cfg = method.config.clone();
+        new_cfg.payee = payee_pk;
+        new_cfg.payee_signer = Some(crate::server::session::PayeeSigner {
+            signer: payee_signer,
+        });
+        // Re-seat the record with the matching payee pubkey so the
+        // wrong-status check stays the proximate cause of the rejection.
+        if let Some(mut r) = method.store.get(&cid).await.unwrap() {
+            r.payee = payee_pk;
+            // Delete and reinsert; this in-memory store has no update.
+            method.store.delete(&cid).await.unwrap();
+            method.store.insert(r).await.unwrap();
+        }
+        method.config = new_cfg;
+
+        let challenge_id = seed_close_challenge(&method, cid);
+        let payload = crate::protocol::intents::session::ClosePayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid.to_string(),
+            voucher: None,
+        };
+        let err = method
+            .process_close(&payload)
+            .await
+            .expect_err("non-Open status must reject");
+        match err {
+            SessionError::OnChainStateMismatch { field, .. } => assert_eq!(field, "channelId"),
+            other => panic!("expected OnChainStateMismatch, got {other:?}"),
+        }
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    #[tokio::test]
+    async fn close_rejects_when_payload_channel_diverges_from_challenge() {
+        // Cached intent advertises channel A, payload references B.
+        // Surfaces as a ChallengeFieldMismatch on `channelId`.
+        let (mut method, _fp) = dummy_method_with_fee_payer();
+
+        // Wire in a payee signer so the orchestration makes it past
+        // the early payee_signer guard.
+        let kp = solana_sdk::signature::Keypair::new();
+        let bytes = kp.to_bytes();
+        let payee_signer: Arc<dyn solana_keychain::SolanaSigner> =
+            Arc::new(solana_keychain::MemorySigner::from_bytes(&bytes).unwrap());
+        let mut new_cfg = method.config.clone();
+        new_cfg.payee_signer = Some(crate::server::session::PayeeSigner {
+            signer: payee_signer,
+        });
+        method.config = new_cfg;
+
+        let cid_advertised = Pubkey::new_from_array([0xC3; 32]);
+        let cid_other = Pubkey::new_from_array([0xC4; 32]);
+        let challenge_id = seed_close_challenge(&method, cid_advertised);
+
+        let payload = crate::protocol::intents::session::ClosePayload {
+            challenge_id: challenge_id.clone(),
+            channel_id: cid_other.to_string(),
+            voucher: None,
+        };
+        let err = method
+            .process_close(&payload)
+            .await
+            .expect_err("channel id divergence must reject");
+        match err {
+            SessionError::ChallengeFieldMismatch { field, .. } => assert_eq!(field, "channelId"),
+            other => panic!("expected ChallengeFieldMismatch, got {other:?}"),
+        }
+        let snapshot = method.cache.get(&challenge_id).expect("cached");
+        assert_eq!(snapshot.state, challenge::ChallengeState::Available);
+    }
+
+    #[tokio::test]
+    async fn cache_consumed_state_blocks_retry_for_close() {
+        // Once the close challenge is Consumed, a second reservation
+        // rejects with `ChallengeUnbound` regardless of how the original
+        // tx settled. Same commit-before-confirm-poll discipline as
+        // open and topup.
+        let (method, _fp) = dummy_method_with_fee_payer();
+        let cid = Pubkey::new_from_array([0xC5; 32]);
+        let challenge_id = seed_close_challenge(&method, cid);
+
+        method
+            .cache
+            .reserve(&challenge_id, ChallengeIntentDiscriminant::Close)
+            .expect("reserve fresh close challenge");
+        method
+            .cache
+            .commit(&challenge_id)
+            .expect("commit pending close challenge");
+
+        let snapshot = method.cache.get(&challenge_id).expect("cached after commit");
+        assert_eq!(
+            snapshot.state,
+            challenge::ChallengeState::Consumed,
+            "close challenge must be Consumed after commit, not Available",
+        );
+
+        let err = method
+            .cache
+            .reserve(&challenge_id, ChallengeIntentDiscriminant::Close)
+            .expect_err("second reserve on Consumed close challenge must reject");
+        assert!(
+            matches!(err, SessionError::ChallengeUnbound),
+            "expected ChallengeUnbound on retry, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn process_close_receipt_uses_builder_and_carries_tx_hash_refunded() {
+        // Structural mirror of the orchestration's success-path receipt
+        // construction. Drives the same builder chain `process_close`
+        // returns on confirm: method = "solana", reference = channel id,
+        // challenge id from the payload, with close amounts attached.
+        // The full RPC plumbing is exercised by the L1 oracle.
+        let cid = Pubkey::new_from_array([0xC9; 32]);
+        let challenge_id = "close-challenge-id".to_string();
+        let tx_sig = "5J7XU6vJ9zqsZjEYKkSKqjVJqz2J7XU6vJ9zqsZjEYKk";
+        let deposit: u64 = 10_000;
+        let settled: u64 = 250;
+        let refunded = deposit.saturating_sub(settled);
+
+        let receipt = Receipt::success(METHOD_NAME, cid.to_string(), challenge_id.clone())
+            .with_close_amounts(tx_sig, refunded);
+        let value = serde_json::to_value(&receipt).expect("receipt serializes");
+
+        assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("success"));
+        assert_eq!(
+            value.get("method").and_then(|v| v.as_str()),
+            Some(METHOD_NAME),
+        );
+        assert_eq!(
+            value.get("reference").and_then(|v| v.as_str()),
+            Some(cid.to_string().as_str()),
+        );
+        assert_eq!(
+            value.get("challengeId").and_then(|v| v.as_str()),
+            Some(challenge_id.as_str()),
+        );
+        assert_eq!(
+            value.get("txHash").and_then(|v| v.as_str()),
+            Some(tx_sig),
+        );
+        assert_eq!(
+            value.get("refunded").and_then(|v| v.as_str()),
+            Some(refunded.to_string().as_str()),
+        );
+        // Voucher fields stay omitted on the close path.
+        assert!(value.get("acceptedCumulative").is_none());
+        assert!(value.get("spent").is_none());
     }
 
     #[tokio::test]
