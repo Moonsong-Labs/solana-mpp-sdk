@@ -10,6 +10,12 @@ defaults:
   run:
     working-directory: typescript
 
+env:
+  # Use the system git CLI when fetching cargo git deps. The bundled libgit2
+  # client trips on the payment-channels git dep on hosted runners; the system
+  # client picks up actions/checkout credentials and is more forgiving.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   audit:
     name: Audit
