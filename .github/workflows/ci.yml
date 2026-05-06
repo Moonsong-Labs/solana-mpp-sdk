@@ -152,6 +152,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Configure git for private cargo deps
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PAYMENT_CHANNELS_PAT }}@github.com/Moonsong-Labs/".insteadOf "https://github.com/Moonsong-Labs/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -328,6 +331,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Configure git for private cargo deps
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PAYMENT_CHANNELS_PAT }}@github.com/Moonsong-Labs/".insteadOf "https://github.com/Moonsong-Labs/"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v5
         with:
@@ -417,6 +423,10 @@ jobs:
             start: cd python && python examples/payment_link_server.py &
     steps:
       - uses: actions/checkout@v5
+      - name: Configure git for private cargo deps
+        if: matrix.server == 'rust'
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.PAYMENT_CHANNELS_PAT }}@github.com/Moonsong-Labs/".insteadOf "https://github.com/Moonsong-Labs/"
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
