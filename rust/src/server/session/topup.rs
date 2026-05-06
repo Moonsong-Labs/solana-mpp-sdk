@@ -4,9 +4,10 @@
 //!
 //! Validation rebuilds the canonical `top_up` ix from server-side
 //! values (channel id, additional amount) and compares it against
-//! the submitted tx byte-for-byte. Same allow-list, signer-count,
-//! fee-payer-slot, and blockhash gates as `process_open`. Token-2022
-//! stays off the allow list so v1 keeps the classic-SPL boundary.
+//! the submitted tx byte-for-byte. Same single-ix, signer-count,
+//! signature-vec, fee-payer-slot, and blockhash gates as
+//! `process_open`. Token-2022 ATAs derive against a different program
+//! id, so v1 keeps the canonical ix on classic SPL.
 
 use solana_hash::Hash;
 use solana_instruction::Instruction;
@@ -19,15 +20,13 @@ use payment_channels_client::types::TopUpArgs;
 
 use crate::error::SessionError;
 use crate::protocol::intents::session::TopUpPayload;
-use crate::server::session::open::{
-    addr_to_pk, ata_address, ata_program_id, compute_budget_program_id, pk_to_addr, spl_token_id,
-};
+use crate::server::session::open::{addr_to_pk, ata_address, pk_to_addr, spl_token_id};
 use crate::server::session::SessionConfig;
 
-/// Validated top-up tx with slot 0 left empty for the fee-payer sig.
+/// Validated top-up tx; slot 0 stays empty for the caller to fill
+/// with the fee-payer sig.
 #[derive(Debug)]
 pub(crate) struct DecodedTopupTx {
-    /// Submitted tx; the caller drops the fee-payer sig into slot 0.
     pub tx: Transaction,
 }
 
@@ -39,8 +38,8 @@ pub struct CanonicalTopupInputs {
     pub additional_amount: u64,
 }
 
-/// Build the canonical `top_up` ix, matching what an honest client
-/// emits via upstream's `TopUpBuilder`.
+/// Build the canonical `top_up` ix matching what an honest client emits
+/// via upstream's `TopUpBuilder`.
 pub fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
     let token_program_pk = spl_token_id();
     let token_program = pk_to_addr(&token_program_pk);
@@ -49,8 +48,7 @@ pub fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
     let mint_addr = pk_to_addr(&inputs.mint);
     let channel_addr = pk_to_addr(&inputs.channel_id);
 
-    // Both ATAs use classic SPL Token. Upstream's program allow-list
-    // rejects Token-2022 mints anyway.
+    // Both ATAs derive against classic SPL Token in v1.
     let payer_token_account_pk = ata_address(&inputs.payer, &inputs.mint, &token_program_pk);
     let channel_token_account_pk =
         ata_address(&inputs.channel_id, &inputs.mint, &token_program_pk);
@@ -68,27 +66,9 @@ pub fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
         .instruction()
 }
 
-/// Programs that may appear in a top-up tx's `account_keys`. Same
-/// allow list as open: payment_channels, classic SPL Token, ATA,
-/// ComputeBudget, system. Token-2022 is intentionally off so v1
-/// rejects it at the shape boundary.
-fn topup_program_allow_list() -> [Pubkey; 5] {
-    [
-        addr_to_pk(&PAYMENT_CHANNELS_ID),
-        spl_token_id(),
-        ata_program_id(),
-        compute_budget_program_id(),
-        solana_sdk_ids::system_program::ID,
-    ]
-}
-
-/// Validate a client-submitted top-up tx.
-///
-/// Decodes the base64 partial-signed tx and walks the same gates as
-/// `validate_open_tx_shape`: every program is allow-listed, fee-payer
-/// sits at slot 0, exactly two required signatures, blockhash
-/// matches, and the `top_up` ix bytes equal what the server emits
-/// for the same `(channel_id, additional)`.
+/// Validate a client-submitted top-up tx. Walks the same gates as
+/// `validate_open_tx_shape` against the canonical `top_up` ix the
+/// server would emit for `(channel_id, additional)`.
 pub(crate) fn validate_topup_tx_shape(
     tx_b64: &str,
     config: &SessionConfig,
@@ -112,25 +92,17 @@ pub(crate) fn validate_topup_tx_shape(
         reason: format!("transaction bincode decode failed: {e}"),
     })?;
 
-    // Every program the message references has to be on the allow list.
-    let allow = topup_program_allow_list();
-    let pc_program_pk = addr_to_pk(&PAYMENT_CHANNELS_ID);
-    for ix in &tx.message.instructions {
-        let idx = ix.program_id_index as usize;
-        let key = tx.message.account_keys.get(idx).ok_or_else(|| {
-            SessionError::MaliciousTx {
-                reason: format!("compiled ix references account index {idx} out of range"),
-            }
-        })?;
-        let key_pk = addr_to_pk(key);
-        if !allow.contains(&key_pk) {
-            return Err(SessionError::MaliciousTx {
-                reason: format!("program {key_pk} not on the topup-tx allow list"),
-            });
-        }
+    // Any extra ix would land under the server's fee-payer signature.
+    if tx.message.instructions.len() != 1 {
+        return Err(SessionError::MaliciousTx {
+            reason: format!(
+                "expected exactly 1 instruction, got {}",
+                tx.message.instructions.len()
+            ),
+        });
     }
 
-    // Payer + server fee-payer = two sigs.
+    // Payer + server fee-payer.
     if tx.message.header.num_required_signatures != 2 {
         return Err(SessionError::MaliciousTx {
             reason: format!(
@@ -140,7 +112,19 @@ pub(crate) fn validate_topup_tx_shape(
         });
     }
 
-    // Fee-payer occupies `account_keys[0]` and has to match config.
+    // A short signature vec sails through the slot-0 overwrite the
+    // orchestrator does later; the cluster would only reject after
+    // broadcast.
+    let expected_sig_count = tx.message.header.num_required_signatures as usize;
+    if tx.signatures.len() != expected_sig_count {
+        return Err(SessionError::MaliciousTx {
+            reason: format!(
+                "expected {expected_sig_count} signatures, got {}",
+                tx.signatures.len()
+            ),
+        });
+    }
+
     let slot0 = tx
         .message
         .account_keys
@@ -170,20 +154,24 @@ pub(crate) fn validate_topup_tx_shape(
         additional_amount: expected_additional,
     });
 
-    let topup_ix_compiled = tx
+    let pc_program_pk = addr_to_pk(&PAYMENT_CHANNELS_ID);
+    let topup_ix_compiled = &tx.message.instructions[0];
+    let program_idx = topup_ix_compiled.program_id_index as usize;
+    let program_key = tx
         .message
-        .instructions
-        .iter()
-        .find(|ix| {
-            tx.message
-                .account_keys
-                .get(ix.program_id_index as usize)
-                .map(addr_to_pk)
-                == Some(pc_program_pk)
-        })
+        .account_keys
+        .get(program_idx)
         .ok_or_else(|| SessionError::MaliciousTx {
-            reason: "transaction does not invoke the payment-channels program".into(),
+            reason: format!("compiled ix references account index {program_idx} out of range"),
         })?;
+    if addr_to_pk(program_key) != pc_program_pk {
+        return Err(SessionError::MaliciousTx {
+            reason: format!(
+                "expected payment-channels program at instruction[0], got {}",
+                addr_to_pk(program_key)
+            ),
+        });
+    }
 
     if topup_ix_compiled.data != canonical_ix.data {
         return Err(SessionError::MaliciousTx {
@@ -200,16 +188,18 @@ pub(crate) fn validate_topup_tx_shape(
             ),
         });
     }
+    let account_keys_len = tx.message.account_keys.len();
     for (i, (slot_idx, expected_meta)) in topup_ix_compiled
         .accounts
         .iter()
         .zip(canonical_ix.accounts.iter())
         .enumerate()
     {
+        let slot = *slot_idx as usize;
         let got = tx
             .message
             .account_keys
-            .get(*slot_idx as usize)
+            .get(slot)
             .ok_or_else(|| SessionError::MaliciousTx {
                 reason: format!("topup ix account index {slot_idx} out of range"),
             })?;
@@ -222,12 +212,30 @@ pub(crate) fn validate_topup_tx_shape(
                 ),
             });
         }
+        let got_signer = tx.message.is_signer(slot);
+        if got_signer != expected_meta.is_signer {
+            return Err(SessionError::MaliciousTx {
+                reason: format!(
+                    "topup ix account #{i} signer flag mismatch: expected {}, got {}",
+                    expected_meta.is_signer, got_signer
+                ),
+            });
+        }
+        let got_writable =
+            crate::server::session::open::key_is_writable(&tx.message.header, account_keys_len, slot);
+        if got_writable != expected_meta.is_writable {
+            return Err(SessionError::MaliciousTx {
+                reason: format!(
+                    "topup ix account #{i} writable flag mismatch: expected {}, got {}",
+                    expected_meta.is_writable, got_writable
+                ),
+            });
+        }
     }
 
     Ok(DecodedTopupTx { tx })
 }
 
-/// Decode a wire `TopUpPayload`'s scalar fields.
 pub(crate) struct ParsedTopupPayload {
     pub channel_id: Pubkey,
     pub additional_amount: u64,
@@ -273,9 +281,8 @@ fn decode_pubkey(field: &'static str, raw: &str) -> Result<Pubkey, SessionError>
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `validate_topup_tx_shape`. Each case trips one
-    //! specific check; together they cover every rejection. The
-    //! end-to-end happy path lives in the L1 oracle.
+    //! Each case trips one specific check in `validate_topup_tx_shape`.
+    //! End-to-end happy-path coverage lives in the L1 oracle.
 
     use super::*;
     use crate::server::session::open::{addr_to_pk, pk_to_addr};
@@ -313,7 +320,7 @@ mod tests {
     }
 
     /// Canonical top-up tx signed by the payer; slot 0 stays empty
-    /// for the server to fill.
+    /// for the server's fee-payer sig.
     fn build_topup_payload_and_tx(
         config: &SessionConfig,
         payer: &Keypair,
@@ -376,7 +383,6 @@ mod tests {
             &blockhash,
         )
         .expect("canonical topup tx must validate");
-        // Slot 0 stays empty so the server can drop its sig in.
         assert_eq!(
             decoded.tx.signatures[0],
             solana_signature::Signature::default()
@@ -384,7 +390,9 @@ mod tests {
     }
 
     #[test]
-    fn extra_program_in_account_keys_rejects_with_malicious_tx() {
+    fn extra_instruction_rejects_with_malicious_tx() {
+        // System ix appended; the count check fires before any per-ix
+        // work, so even a benign program is rejected.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let cid = dummy_channel_id();
@@ -392,14 +400,15 @@ mod tests {
         let (mut payload, mut tx) =
             build_topup_payload_and_tx(&cfg, &payer, cid, 500_000, blockhash);
 
-        let bogus = solana_address::Address::new_from_array([0xAB; 32]);
-        tx.message.account_keys.push(bogus);
-        let bogus_idx = (tx.message.account_keys.len() - 1) as u8;
+        let system_addr =
+            solana_address::Address::new_from_array(solana_sdk_ids::system_program::ID.to_bytes());
+        tx.message.account_keys.push(system_addr);
+        let sys_idx = (tx.message.account_keys.len() - 1) as u8;
         tx.message
             .instructions
             .push(solana_message::compiled_instruction::CompiledInstruction {
-                program_id_index: bogus_idx,
-                accounts: vec![],
+                program_id_index: sys_idx,
+                accounts: vec![0, 1],
                 data: vec![],
             });
         payload.transaction = encode_tx_b64(&tx);
@@ -413,9 +422,40 @@ mod tests {
             &cfg.mint,
             &blockhash,
         )
-        .expect_err("unknown program must reject");
+        .expect_err("extra ix must reject");
         assert!(
-            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("not on the topup-tx allow list")),
+            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("expected exactly 1 instruction")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn signature_count_below_required_rejects() {
+        // Header still says two required sigs; vec is truncated to one
+        // so the slot-0 overwrite would wipe the lone client sig.
+        let (cfg, _) = config_with_fresh_fee_payer();
+        let payer = Keypair::new();
+        let cid = dummy_channel_id();
+        let blockhash = Hash::new_from_array([7u8; 32]);
+        let (mut payload, mut tx) =
+            build_topup_payload_and_tx(&cfg, &payer, cid, 500_000, blockhash);
+
+        assert_eq!(tx.message.header.num_required_signatures, 2);
+        tx.signatures.truncate(1);
+        payload.transaction = encode_tx_b64(&tx);
+
+        let err = validate_topup_tx_shape(
+            &payload.transaction,
+            &cfg,
+            &cid,
+            500_000,
+            &payer.pubkey(),
+            &cfg.mint,
+            &blockhash,
+        )
+        .expect_err("short signature vec must reject");
+        assert!(
+            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("expected 2 signatures")),
             "{err:?}"
         );
     }
@@ -501,9 +541,8 @@ mod tests {
 
     #[test]
     fn tampered_topup_ix_data_rejects() {
-        // Flip a byte inside the borsh-encoded `TopUpArgs.amount`.
-        // Byte 0 is the discriminator; bytes 1..=8 hold the u64
-        // amount, little-endian.
+        // Index 1 sits inside the `TopUpArgs.amount` u64 (byte 0 is
+        // the discriminator).
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let cid = dummy_channel_id();
@@ -515,8 +554,7 @@ mod tests {
         for ix in tx.message.instructions.iter_mut() {
             let key = tx.message.account_keys[ix.program_id_index as usize];
             if addr_to_pk(&key) == pc_program_pk {
-                let i = 1; // inside the amount window
-                ix.data[i] ^= 0xFF;
+                ix.data[1] ^= 0xFF;
                 break;
             }
         }
