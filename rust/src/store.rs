@@ -5,13 +5,16 @@
 //! and the on-chain settled value once a close confirms.
 //!
 //! `advance_watermark` is the only piece that has to be atomic. Two
-//! concurrent vouchers at the same cumulative will both call it; one
-//! wins (`Advanced`), the others get `Conflict` with the winner's
-//! cached receipt so we hand back the exact bytes the network saw,
-//! not a fresh re-derivation.
+//! concurrent vouchers at the same cumulative both call it; one wins
+//! (`Advanced`), the others get `Conflict` with the winner's cached
+//! receipt, so the loser hands back the exact bytes the network saw
+//! instead of re-deriving them. The winner's `last_voucher`, signature,
+//! and receipt all land alongside the watermark inside one critical
+//! section, so close can read `last_voucher` against any
+//! `accepted_cumulative` the store has committed without a torn read.
 //!
 //! `InMemoryChannelStore` is for tests and single-process demos.
-//! Anything production wants TTLs, persistence, and a real CAS.
+//! Production wants TTLs, persistence, and a real CAS.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -88,6 +91,9 @@ pub enum StoreError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    #[error("CAS invariant broken: {detail}")]
+    CasInvariantBroken { detail: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -100,18 +106,29 @@ pub trait ChannelStore: Send + Sync {
 
     async fn insert(&self, record: ChannelRecord) -> Result<(), StoreError>;
 
-    /// Advance the accepted watermark from `expected` to `new` atomically,
-    /// caching `signature` + `receipt_bytes` as the winner's receipt.
-    /// The winner sees `Advanced { prior }`; everyone else gets
-    /// `Conflict { current, winner_signature, winner_receipt }` so
-    /// they can hand back the network-committed receipt verbatim.
+    /// Advance the accepted watermark from `expected` to `new` atomically.
+    ///
+    /// `accepted_cumulative`, `last_voucher`, and the replay-cache
+    /// entry are written together inside one critical section. The
+    /// winner-only inputs (`winner_last_voucher`, `winner_signature`,
+    /// `winner_receipt_bytes`) land iff the call advances the
+    /// watermark; on conflict they are dropped and the existing
+    /// winner's cached entry comes back instead.
+    ///
+    /// Outcomes:
+    /// - `Advanced { prior }`: this caller won; `last_voucher`,
+    ///   signature, and receipt bytes are persisted.
+    /// - `Conflict { current, winner_signature, winner_receipt }`: a
+    ///   concurrent caller already committed at `current`, and two
+    ///   callers at the same cumulative see byte-identical responses.
     async fn advance_watermark(
         &self,
         channel_id: &Pubkey,
         expected: u64,
         new: u64,
-        signature: [u8; 64],
-        receipt_bytes: Vec<u8>,
+        winner_last_voucher: SignedVoucher,
+        winner_signature: [u8; 64],
+        winner_receipt_bytes: Vec<u8>,
     ) -> Result<AdvanceOutcome, StoreError>;
 
     async fn record_deposit(
@@ -282,8 +299,9 @@ impl ChannelStore for InMemoryChannelStore {
         channel_id: &Pubkey,
         expected: u64,
         new: u64,
-        signature: [u8; 64],
-        receipt_bytes: Vec<u8>,
+        winner_last_voucher: SignedVoucher,
+        winner_signature: [u8; 64],
+        winner_receipt_bytes: Vec<u8>,
     ) -> Result<AdvanceOutcome, StoreError> {
         let mut g = self.inner.write().await;
         let record = g
@@ -293,8 +311,9 @@ impl ChannelStore for InMemoryChannelStore {
         if record.accepted_cumulative == expected && new > expected {
             let prior = record.accepted_cumulative;
             record.accepted_cumulative = new;
+            record.last_voucher = Some(winner_last_voucher);
             g.voucher_cache
-                .insert((*channel_id, new), (receipt_bytes, signature));
+                .insert((*channel_id, new), (winner_receipt_bytes, winner_signature));
             return Ok(AdvanceOutcome::Advanced { prior });
         }
         let current = record.accepted_cumulative;
@@ -305,9 +324,11 @@ impl ChannelStore for InMemoryChannelStore {
                 winner_signature: sig,
                 winner_receipt: receipt,
             }),
-            None => Err(StoreError::Other(format!(
-                "cas conflict at cumulative {current} but winner receipt not cached"
-            ))),
+            None => Err(StoreError::CasInvariantBroken {
+                detail: format!(
+                    "cas conflict at cumulative {current} but winner receipt not cached"
+                ),
+            }),
         }
     }
 
@@ -398,15 +419,20 @@ impl ChannelStore for InMemoryChannelStore {
             .records
             .get_mut(channel_id)
             .ok_or(StoreError::NotFound(*channel_id))?;
-        if r.status != ChannelStatus::Closing {
-            return Err(StoreError::IllegalTransition {
+        match r.status {
+            ChannelStatus::Closing => {
+                r.status = ChannelStatus::Open;
+                Ok(())
+            }
+            // Already rolled back by an earlier recovery pass; no-op
+            // rather than the misleading `Open -> Open` IllegalTransition.
+            ChannelStatus::Open => Ok(()),
+            other => Err(StoreError::IllegalTransition {
                 channel_id: *channel_id,
-                from: r.status,
+                from: other,
                 to: ChannelStatus::Open,
-            });
+            }),
         }
-        r.status = ChannelStatus::Open;
-        Ok(())
     }
 
     async fn mark_closing(&self, channel_id: &Pubkey) -> Result<(), StoreError> {
@@ -703,19 +729,37 @@ mod tests {
         store.insert(record(cid, 1_000)).await.unwrap();
 
         let r1 = store
-            .advance_watermark(&cid, 0, 100, make_sig(1), b"r1".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(1),
+                b"r1".to_vec(),
+            )
             .await
             .unwrap();
         assert!(matches!(r1, AdvanceOutcome::Advanced { prior: 0 }));
 
         let r2 = store
-            .advance_watermark(&cid, 100, 250, make_sig(2), b"r2".to_vec())
+            .advance_watermark(
+                &cid,
+                100,
+                250,
+                signed_voucher(cid, 250),
+                make_sig(2),
+                b"r2".to_vec(),
+            )
             .await
             .unwrap();
         assert!(matches!(r2, AdvanceOutcome::Advanced { prior: 100 }));
 
         let stored = store.get(&cid).await.unwrap().unwrap();
         assert_eq!(stored.accepted_cumulative, 250);
+        assert_eq!(
+            stored.last_voucher.as_ref().unwrap().voucher.cumulative_amount,
+            "250"
+        );
     }
 
     #[tokio::test]
@@ -726,13 +770,27 @@ mod tests {
 
         // Winner
         store
-            .advance_watermark(&cid, 0, 100, make_sig(1), b"win".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(1),
+                b"win".to_vec(),
+            )
             .await
             .unwrap();
 
         // Loser presents stale expected=0 with new=50; CAS rejects.
         let outcome = store
-            .advance_watermark(&cid, 0, 50, make_sig(2), b"lose".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                50,
+                signed_voucher(cid, 50),
+                make_sig(2),
+                b"lose".to_vec(),
+            )
             .await
             .unwrap();
         match outcome {
@@ -756,14 +814,28 @@ mod tests {
         store.insert(record(cid, 1_000)).await.unwrap();
 
         store
-            .advance_watermark(&cid, 0, 100, make_sig(1), b"win".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(1),
+                b"win".to_vec(),
+            )
             .await
             .unwrap();
 
         // expected (0) matches the current watermark, but new (100) is
         // also the current watermark, so the strict-greater check rejects.
         let outcome = store
-            .advance_watermark(&cid, 0, 100, make_sig(2), b"lose".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(2),
+                b"lose".to_vec(),
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, AdvanceOutcome::Conflict { current: 100, .. }));
@@ -777,7 +849,14 @@ mod tests {
 
         // Winner advances 0 -> 100 and caches its receipt at (cid, 100).
         let outcome = store
-            .advance_watermark(&cid, 0, 100, make_sig(0xAA), b"alpha".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(0xAA),
+                b"alpha".to_vec(),
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, AdvanceOutcome::Advanced { prior: 0 }));
@@ -788,7 +867,14 @@ mod tests {
         // falls into the cache-lookup branch, and hands back the winner's
         // entry unchanged.
         let outcome = store
-            .advance_watermark(&cid, 100, 100, make_sig(0xBB), b"beta".to_vec())
+            .advance_watermark(
+                &cid,
+                100,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(0xBB),
+                b"beta".to_vec(),
+            )
             .await
             .unwrap();
         match outcome {
@@ -809,7 +895,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_watermark_returns_other_on_strict_regression_with_no_cached_winner() {
+    async fn advance_watermark_returns_cas_invariant_broken_on_strict_regression_with_no_cached_winner() {
         let store = InMemoryChannelStore::new();
         let cid = pk(1);
         store.insert(record(cid, 1_000)).await.unwrap();
@@ -819,15 +905,22 @@ mod tests {
         // the cache lookup at `(cid, 0)` misses since no winner ever
         // committed, and the fallback fires.
         let err = store
-            .advance_watermark(&cid, 50, 25, make_sig(0), b"x".to_vec())
+            .advance_watermark(
+                &cid,
+                50,
+                25,
+                signed_voucher(cid, 25),
+                make_sig(0),
+                b"x".to_vec(),
+            )
             .await
             .unwrap_err();
         match err {
-            StoreError::Other(msg) => assert!(
-                msg.contains("cas conflict at cumulative 0"),
-                "unexpected message: {msg}"
+            StoreError::CasInvariantBroken { detail } => assert!(
+                detail.contains("cas conflict at cumulative 0"),
+                "unexpected message: {detail}"
             ),
-            other => panic!("expected StoreError::Other, got {other:?}"),
+            other => panic!("expected StoreError::CasInvariantBroken, got {other:?}"),
         }
 
         // Store should be untouched.
@@ -846,14 +939,28 @@ mod tests {
         let s1 = store.clone();
         let s2 = store.clone();
         let h1 = tokio::spawn(async move {
-            s1.advance_watermark(&cid, 0, 500, make_sig(0xAA), b"alpha".to_vec())
-                .await
-                .unwrap()
+            s1.advance_watermark(
+                &cid,
+                0,
+                500,
+                signed_voucher(cid, 500),
+                make_sig(0xAA),
+                b"alpha".to_vec(),
+            )
+            .await
+            .unwrap()
         });
         let h2 = tokio::spawn(async move {
-            s2.advance_watermark(&cid, 0, 500, make_sig(0xBB), b"beta".to_vec())
-                .await
-                .unwrap()
+            s2.advance_watermark(
+                &cid,
+                0,
+                500,
+                signed_voucher(cid, 500),
+                make_sig(0xBB),
+                b"beta".to_vec(),
+            )
+            .await
+            .unwrap()
         });
         let (a, b) = (h1.await.unwrap(), h2.await.unwrap());
 
@@ -888,6 +995,57 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_atomically_writes_last_voucher() {
+        // Two concurrent winners A(100) and B(200): regardless of
+        // ordering, `accepted_cumulative` and `last_voucher` agree.
+        // The loser's `winner_last_voucher` drops because the conflict
+        // branch returns the winner's already-stamped state.
+        let store = Arc::new(InMemoryChannelStore::new());
+        let cid = pk(1);
+        store.insert(record(cid, 10_000)).await.unwrap();
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let h1 = tokio::spawn(async move {
+            s1.advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(0xAA),
+                b"a".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let h2 = tokio::spawn(async move {
+            s2.advance_watermark(
+                &cid,
+                0,
+                200,
+                signed_voucher(cid, 200),
+                make_sig(0xBB),
+                b"b".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let _ = h1.await.unwrap();
+        let _ = h2.await.unwrap();
+
+        let stored = store.get(&cid).await.unwrap().unwrap();
+        let last = stored
+            .last_voucher
+            .as_ref()
+            .expect("last_voucher persisted alongside watermark");
+        assert_eq!(
+            last.voucher.cumulative_amount,
+            stored.accepted_cumulative.to_string(),
+            "last_voucher.cumulative_amount must equal accepted_cumulative",
+        );
     }
 
     // ── Status transitions ────────────────────────────────────────────────────
@@ -932,7 +1090,14 @@ mod tests {
 
         // Voucher acceptance still works after a rollback.
         let outcome = store
-            .advance_watermark(&cid, 0, 50, make_sig(9), b"r".to_vec())
+            .advance_watermark(
+                &cid,
+                0,
+                50,
+                signed_voucher(cid, 50),
+                make_sig(9),
+                b"r".to_vec(),
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, AdvanceOutcome::Advanced { .. }));
@@ -1118,13 +1283,20 @@ mod tests {
         let s1 = store.clone();
         let s2 = store.clone();
         let h1 = tokio::spawn(async move {
-            s1.advance_watermark(&cid, 0, 700, make_sig(1), b"v".to_vec())
-                .await
-                .unwrap()
+            s1.advance_watermark(
+                &cid,
+                0,
+                700,
+                signed_voucher(cid, 700),
+                make_sig(1),
+                b"v".to_vec(),
+            )
+            .await
+            .unwrap()
         });
         let h2 = tokio::spawn(async move { s2.record_deposit(&cid, 5_000).await.unwrap() });
         let _ = h1.await.unwrap();
-        let _ = h2.await.unwrap();
+        h2.await.unwrap();
 
         let r = store.get(&cid).await.unwrap().unwrap();
         assert_eq!(r.accepted_cumulative, 700);
@@ -1169,12 +1341,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_rollback_rejects_non_closing_states() {
-        // Recovery mutator only accepts Closing as the from-state. Any
-        // other from-state surfaces as IllegalTransition.
+    async fn recovery_rollback_open_is_idempotent_noop() {
+        // Recovery accepts Closing -> Open and the Open self-edge (an
+        // earlier pass already rolled back). Other from-states stay
+        // IllegalTransition.
         let store = InMemoryChannelStore::new();
         let cid = pk(1);
         store.insert(record(cid, 1_000)).await.unwrap();
+
+        store
+            .mark_recovery_rollback_from_closing(&cid)
+            .await
+            .expect("Open -> Open recovery rollback is a no-op");
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rollback_rejects_finalized_states() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_close_attempting(&cid).await.unwrap();
+        store
+            .mark_closed_pending(&cid, make_signature(1))
+            .await
+            .unwrap();
+        store.mark_closed_finalized(&cid).await.unwrap();
 
         let err = store
             .mark_recovery_rollback_from_closing(&cid)
@@ -1183,7 +1378,7 @@ mod tests {
         assert!(matches!(
             err,
             StoreError::IllegalTransition {
-                from: ChannelStatus::Open,
+                from: ChannelStatus::ClosedFinalized,
                 to: ChannelStatus::Open,
                 ..
             }

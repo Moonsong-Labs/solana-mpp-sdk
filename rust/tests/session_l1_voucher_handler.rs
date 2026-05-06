@@ -226,13 +226,28 @@ async fn verify_voucher_advances_watermark_against_a_recovered_session_method() 
 
     let post = store.get(&channel_pda_mpp).await.unwrap().unwrap();
     assert_eq!(post.accepted_cumulative, cumulative);
+    let stored_voucher = post
+        .last_voucher
+        .as_ref()
+        .expect("last_voucher persisted alongside watermark advance");
+    assert_eq!(stored_voucher.signature, signed.signature);
+    assert_eq!(stored_voucher.voucher.cumulative_amount, "100000");
 
-    // Re-submitting the same voucher returns the cached receipt;
-    // spent doesn't double-count.
+    // Replay of identical voucher bytes hits the cache and returns a
+    // byte-identical receipt (same JSON, same timestamp). If the CAS
+    // and the cache write weren't folded together, the loser would
+    // see a fresh timestamp or a regression error depending on race
+    // timing.
     let receipt2 = method
         .verify_voucher(&signed)
         .await
         .expect("second voucher returns the cached receipt");
+    let receipt_bytes_a = serde_json::to_vec(&receipt).expect("serialize receipt a");
+    let receipt_bytes_b = serde_json::to_vec(&receipt2).expect("serialize receipt b");
+    assert_eq!(
+        receipt_bytes_a, receipt_bytes_b,
+        "replay returns byte-identical receipt to the first call",
+    );
     assert_eq!(receipt2.accepted_cumulative.as_deref(), Some("100000"));
 
     // A regression below the watermark rejects.

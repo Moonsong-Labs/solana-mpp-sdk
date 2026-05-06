@@ -57,9 +57,9 @@ fn parse_signed_voucher(signed: &SignedVoucher) -> Result<(ParsedVoucher, [u8; 3
             .unix_timestamp(),
     };
 
-    let signer_bytes = decode_fixed::<32>(&signed.signer, "signer")
+    let signer_bytes = decode_fixed::<32>(&signed.signer)
         .map_err(|_| SessionError::VoucherSignatureInvalid)?;
-    let sig_bytes = decode_fixed::<64>(&signed.signature, "signature")
+    let sig_bytes = decode_fixed::<64>(&signed.signature)
         .map_err(|_| SessionError::VoucherSignatureInvalid)?;
 
     Ok((
@@ -83,7 +83,7 @@ fn decode_pubkey(raw: &str, field: &'static str) -> Result<Pubkey, SessionError>
     Ok(Pubkey::new_from_array(arr))
 }
 
-fn decode_fixed<const N: usize>(raw: &str, _field: &'static str) -> Result<[u8; N], ()> {
+fn decode_fixed<const N: usize>(raw: &str) -> Result<[u8; N], ()> {
     let bytes = bs58::decode(raw).into_vec().map_err(|_| ())?;
     bytes.try_into().map_err(|_| ())
 }
@@ -98,23 +98,19 @@ fn now_unix_seconds() -> Result<i64, SessionError> {
 /// JSON receipt the handler returns and also caches as the winner's
 /// bytes for `(channel_id, cumulative)`.
 ///
-/// `reference: bs58(channel_id)` rather than `process_open`'s
-/// `reference: tx_sig` because voucher acceptance is off-chain and
-/// there's no tx signature until close. `accepted` is the new
-/// watermark; `spent` is `accepted - prior_watermark`, the units
-/// billed by this voucher.
-fn build_receipt(
-    channel_id: &Pubkey,
-    challenge_id: Option<&str>,
-    accepted: u64,
-    spent: u64,
-) -> Receipt {
+/// `reference: bs58(channel_id)` because voucher acceptance is
+/// off-chain and there's no tx signature until close. `accepted` is
+/// the new watermark; `spent` is `accepted - prior_watermark`. Voucher
+/// acceptance has no challenge so `challenge_id` is left empty. The
+/// close handler reuses this builder when stamping the apply-voucher
+/// cache entry, so future replays of that voucher see the same shape.
+pub(crate) fn build_voucher_receipt(channel_id: &Pubkey, accepted: u64, spent: u64) -> Receipt {
     Receipt {
         status: ReceiptStatus::Success,
         method: MethodName::from(METHOD_NAME),
         timestamp: rfc3339_now(),
         reference: channel_id.to_string(),
-        challenge_id: challenge_id.unwrap_or_default().to_string(),
+        challenge_id: String::new(),
         accepted_cumulative: Some(accepted.to_string()),
         spent: Some(spent.to_string()),
         tx_hash: None,
@@ -249,50 +245,28 @@ pub(crate) async fn run_verify_voucher(
     // never underflows thanks to the regression and zero-cumulative
     // guards above.
     let spent = cumulative_amount - record.accepted_cumulative;
-    let receipt = build_receipt(&channel_id, None, cumulative_amount, spent);
+    let receipt = build_voucher_receipt(&channel_id, cumulative_amount, spent);
     let receipt_bytes = serde_json::to_vec(&receipt)
         .map_err(|e| SessionError::InternalError(format!("serialize voucher receipt: {e}")))?;
 
-    // CAS. One code path covers both strictly-greater (winner) and
-    // equality-after-success (loser). When `expected` matches the
-    // current watermark but `new` doesn't exceed it, the store keys
-    // the cache at `(channel_id, current)` and hands the winner's
-    // bytes back. On `Advanced` we persist `last_voucher` and return
-    // the freshly-built receipt; on `Conflict` we deserialize the
-    // cached winner bytes. The cache was populated by an earlier
-    // `Advanced` in this handler, so a deserialize failure is a
-    // state bug (corrupted cache or schema drift), not a client
-    // error.
+    // CAS advances `accepted_cumulative`, stamps `last_voucher`, and
+    // seeds the replay cache in one critical section. Two callers at
+    // the same cumulative both succeed: one wins (`Advanced`), the
+    // other reads back the cached winner bytes (`Conflict`). A
+    // deserialize failure on the conflict branch is a state bug
+    // (corrupted cache or schema drift), not a client error.
     match store
         .advance_watermark(
             &channel_id,
             record.accepted_cumulative,
             cumulative_amount,
+            signed.clone(),
             sig_bytes,
             receipt_bytes,
         )
         .await?
     {
-        AdvanceOutcome::Advanced { prior: _ } => {
-            // The CAS above advanced the watermark and seeded the
-            // replay cache for this `(channel_id, cumulative)`.
-            // `record_last_voucher` is best-effort metadata: the
-            // in-memory store can't fail under its lock, but a remote
-            // DB-backed impl could. If it does, channel state stays
-            // consistent because subsequent replays at the same
-            // cumulative hit the cache and read the winner's receipt
-            // back; the caller sees an internal error for a payment
-            // we actually accepted.
-            //
-            // Remote stores need to keep this order: CAS first, then
-            // `record_last_voucher`. Reversing it would let a
-            // watermark advance only after a partial-record write,
-            // breaking the rule that the replay cache is the
-            // authoritative receipt source for any watermark the
-            // store has committed.
-            store.record_last_voucher(&channel_id, signed.clone()).await?;
-            Ok(receipt)
-        }
+        AdvanceOutcome::Advanced { prior: _ } => Ok(receipt),
         AdvanceOutcome::Conflict {
             current: _,
             winner_signature: _,

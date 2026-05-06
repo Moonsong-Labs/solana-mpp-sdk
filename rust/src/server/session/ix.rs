@@ -51,7 +51,6 @@ use crate::protocol::intents::session::{SignedVoucher, Split};
 use crate::server::session::open::{
     ata_address, ata_program_id, pk_to_addr, spl_token_id,
 };
-use crate::server::session::SessionConfig;
 use crate::store::ChannelRecord;
 
 /// Compute budget for the settle_and_finalize tx. The apply-voucher
@@ -83,13 +82,10 @@ const MAX_TX_BYTES: usize = 1232;
 /// shape on both close paths. Only the fee payer signs; the recipient
 /// field of `CreateIdempotent` is unsigned.
 pub(crate) fn build_ata_preflight_tx(
-    config: &SessionConfig,
     record: &ChannelRecord,
     blockhash: &Hash,
     fee_payer: &Pubkey,
 ) -> Result<Transaction, SessionError> {
-    let _ = config;
-
     let mut ixs = compute_budget_prelude(PREFLIGHT_COMPUTE_UNIT_LIMIT);
     ixs.extend(create_idempotent_ata_ixs(record, fee_payer));
 
@@ -108,15 +104,12 @@ pub(crate) fn build_ata_preflight_tx(
 /// both real signatures in (slot 0 = fee payer, slot 1 = merchant)
 /// before broadcasting.
 pub(crate) fn build_settle_tx_apply_voucher(
-    config: &SessionConfig,
     record: &ChannelRecord,
     voucher: &SignedVoucher,
     blockhash: &Hash,
     fee_payer: &Pubkey,
     payee_signer: &Pubkey,
 ) -> Result<Transaction, SessionError> {
-    let _ = config;
-
     let (cumulative_amount, expires_at) = parse_voucher_scalars(voucher)?;
     let signer_bytes = decode_fixed::<32>(&voucher.signer)
         .ok_or(SessionError::VoucherSignatureInvalid)?;
@@ -174,14 +167,11 @@ fn decode_fixed<const N: usize>(raw: &str) -> Option<[u8; N]> {
 /// field in the args is a zeroed placeholder the program ignores when
 /// `has_voucher = 0`.
 pub(crate) fn build_settle_tx_lock_settled(
-    config: &SessionConfig,
     record: &ChannelRecord,
     blockhash: &Hash,
     fee_payer: &Pubkey,
     payee_signer: &Pubkey,
 ) -> Result<Transaction, SessionError> {
-    let _ = config;
-
     let settle_finalize_ix = build_settle_and_finalize_ix(record, None, payee_signer);
 
     let mut ixs = compute_budget_prelude(SETTLE_COMPUTE_UNIT_LIMIT);
@@ -205,13 +195,10 @@ pub(crate) fn build_settle_tx_lock_settled(
 /// logs a warning instead of erroring so the path stays exercisable
 /// in tests.
 pub(crate) fn build_distribute_tx(
-    config: &SessionConfig,
     record: &ChannelRecord,
     blockhash: &Hash,
     fee_payer: &Pubkey,
 ) -> Result<Transaction, SessionError> {
-    let _ = config;
-
     let distribute_ix = build_distribute_ix(record);
 
     let mut ixs = compute_budget_prelude(DISTRIBUTE_COMPUTE_UNIT_LIMIT);
@@ -471,11 +458,8 @@ mod tests {
     use crate::program::payment_channels::voucher::VoucherSigner;
     use crate::protocol::intents::session::{SigType, SignedVoucher, VoucherData};
     use crate::server::session::open::addr_to_pk;
-    use crate::server::session::{Network, Pricing};
     use crate::store::ChannelStatus;
     use ed25519_dalek::SigningKey;
-    use solana_commitment_config::CommitmentConfig;
-    use std::time::Duration;
 
     fn pk(b: u8) -> Pubkey {
         Pubkey::new_from_array([b; 32])
@@ -500,36 +484,6 @@ mod tests {
                 recipient: pk(0xB1),
                 share_bps: 1_000,
             }],
-        }
-    }
-
-    fn base_config() -> SessionConfig {
-        SessionConfig {
-            operator: pk(1),
-            payee: pk(0xA2),
-            mint: pk(0xA3),
-            decimals: 6,
-            network: Network::Localnet,
-            program_id: pk(0xA4),
-            pricing: Pricing {
-                amount_per_unit: 1,
-                unit_type: "request".into(),
-            },
-            splits: Vec::new(),
-            max_deposit: 10_000_000,
-            min_deposit: 1,
-            min_voucher_delta: 0,
-            voucher_ttl_seconds: 60,
-            grace_period_seconds: 86_400,
-            challenge_ttl_seconds: 300,
-            commitment: CommitmentConfig::confirmed(),
-            broadcast_confirm_timeout: Duration::from_secs(30),
-            clock_skew_seconds: 5,
-            voucher_check_grace_seconds: 15,
-            fee_payer: None,
-            payee_signer: None,
-            realm: Some("test".into()),
-            secret_key: Some("test".into()),
         }
     }
 
@@ -574,14 +528,12 @@ mod tests {
     fn apply_voucher_settle_tx_has_precompile_directly_before_settle_and_finalize() {
         let cid = pk(0xC1);
         let record = base_record(cid);
-        let config = base_config();
         let voucher = signed_voucher(cid, 600_000);
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
         let merchant = pk(0xA2);
 
         let tx = build_settle_tx_apply_voucher(
-            &config,
             &record,
             &voucher,
             &blockhash,
@@ -620,15 +572,12 @@ mod tests {
     fn lock_settled_settle_tx_has_no_precompile() {
         let cid = pk(0xC2);
         let record = base_record(cid);
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
         let merchant = pk(0xA2);
 
-        let tx = build_settle_tx_lock_settled(
-            &config, &record, &blockhash, &fee_payer, &merchant,
-        )
-        .expect("lock-settled settle tx builds");
+        let tx = build_settle_tx_lock_settled(&record, &blockhash, &fee_payer, &merchant)
+            .expect("lock-settled settle tx builds");
 
         let ed25519_program_pk = solana_sdk_ids::ed25519_program::ID;
         for ix in &tx.message.instructions {
@@ -648,14 +597,12 @@ mod tests {
         // signature slots and the caller fills them in without resizing.
         let cid = pk(0xC3);
         let record = base_record(cid);
-        let config = base_config();
         let voucher = signed_voucher(cid, 600_000);
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
         let merchant = pk(0xA2);
 
         let tx_apply = build_settle_tx_apply_voucher(
-            &config,
             &record,
             &voucher,
             &blockhash,
@@ -666,10 +613,8 @@ mod tests {
         assert_eq!(tx_apply.message.header.num_required_signatures, 2);
         assert_eq!(tx_apply.signatures.len(), 2);
 
-        let tx_lock = build_settle_tx_lock_settled(
-            &config, &record, &blockhash, &fee_payer, &merchant,
-        )
-        .unwrap();
+        let tx_lock = build_settle_tx_lock_settled(&record, &blockhash, &fee_payer, &merchant)
+            .unwrap();
         assert_eq!(tx_lock.message.header.num_required_signatures, 2);
         assert_eq!(tx_lock.signatures.len(), 2);
     }
@@ -680,11 +625,10 @@ mod tests {
         // `CreateIdempotent`'s wallet meta is unsigned.
         let cid = pk(0xC9);
         let record = base_record(cid);
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
 
-        let tx = build_ata_preflight_tx(&config, &record, &blockhash, &fee_payer)
+        let tx = build_ata_preflight_tx(&record, &blockhash, &fee_payer)
             .expect("ata preflight builds");
         assert_eq!(tx.message.header.num_required_signatures, 1);
         assert_eq!(tx.signatures.len(), 1);
@@ -696,11 +640,10 @@ mod tests {
         // tx only needs the fee payer's signature.
         let cid = pk(0xCD);
         let record = base_record(cid);
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
 
-        let tx = build_distribute_tx(&config, &record, &blockhash, &fee_payer)
+        let tx = build_distribute_tx(&record, &blockhash, &fee_payer)
             .expect("distribute tx builds");
         assert_eq!(tx.message.header.num_required_signatures, 1);
         assert_eq!(tx.signatures.len(), 1);
@@ -723,11 +666,10 @@ mod tests {
                 share_bps: 3_000,
             },
         ];
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
 
-        let tx = build_distribute_tx(&config, &record, &blockhash, &fee_payer).unwrap();
+        let tx = build_distribute_tx(&record, &blockhash, &fee_payer).unwrap();
 
         let pc_program = addr_to_pk(&payment_channels_client::programs::PAYMENT_CHANNELS_ID);
         let distribute = tx
@@ -753,11 +695,10 @@ mod tests {
         // account into the message. Has to stay under 1232 bytes.
         let cid = pk(0xCA);
         let record = record_with_splits(cid, MAX_SPLITS);
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
 
-        let tx = build_ata_preflight_tx(&config, &record, &blockhash, &fee_payer)
+        let tx = build_ata_preflight_tx(&record, &blockhash, &fee_payer)
             .expect("ata preflight builds at MAX_SPLITS");
         let bytes = bincode::serialize(&tx).expect("serialize");
         assert!(
@@ -772,14 +713,12 @@ mod tests {
     fn apply_voucher_settle_tx_fits_in_packet_limit_at_max_splits() {
         let cid = pk(0xCB);
         let record = record_with_splits(cid, MAX_SPLITS);
-        let config = base_config();
         let voucher = signed_voucher(cid, 600_000);
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
         let merchant = pk(0xA2);
 
         let tx = build_settle_tx_apply_voucher(
-            &config,
             &record,
             &voucher,
             &blockhash,
@@ -800,15 +739,12 @@ mod tests {
     fn lock_settled_settle_tx_fits_in_packet_limit_at_max_splits() {
         let cid = pk(0xCC);
         let record = record_with_splits(cid, MAX_SPLITS);
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
         let merchant = pk(0xA2);
 
-        let tx = build_settle_tx_lock_settled(
-            &config, &record, &blockhash, &fee_payer, &merchant,
-        )
-        .expect("lock-settled settle tx builds at MAX_SPLITS");
+        let tx = build_settle_tx_lock_settled(&record, &blockhash, &fee_payer, &merchant)
+            .expect("lock-settled settle tx builds at MAX_SPLITS");
         let bytes = bincode::serialize(&tx).expect("serialize");
         assert!(
             bytes.len() <= MAX_TX_BYTES,
@@ -833,11 +769,10 @@ mod tests {
         // review time.
         let cid = pk(0xCE);
         let record = base_record(cid); // 1 split, smallest tail
-        let config = base_config();
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
 
-        let tx = build_distribute_tx(&config, &record, &blockhash, &fee_payer)
+        let tx = build_distribute_tx(&record, &blockhash, &fee_payer)
             .expect("distribute tx builds (size warning fires)");
         let bytes = bincode::serialize(&tx).expect("serialize");
         assert!(

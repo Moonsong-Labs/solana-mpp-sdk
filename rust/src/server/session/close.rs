@@ -77,8 +77,8 @@ use super::SessionConfig;
 /// in-band check already verified.
 #[derive(Debug, Clone)]
 pub(crate) enum CloseAction<'a> {
-    /// `voucher.cumulative_amount > record.on_chain_settled`: apply the
-    /// voucher and finalize.
+    /// `voucher.cumulative_amount > chain_settled`: apply the voucher
+    /// and finalize.
     ApplyVoucher {
         voucher: &'a SignedVoucher,
         cumulative_amount: u64,
@@ -88,11 +88,24 @@ pub(crate) enum CloseAction<'a> {
     LockSettled,
 }
 
-/// Pick the close path from a payload and record. Borrows the voucher
-/// without copying.
+/// Lifetime-free copy of `CloseAction` so the post-confirm receipt
+/// builder can distinguish apply-voucher from lock-settled without
+/// dragging the `'a` borrow through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseActionTag {
+    ApplyVoucher,
+    LockSettled,
+}
+
+/// Pick the close path, comparing the wire voucher's cumulative
+/// against a `chain_settled` read fresh off the channel PDA. If a
+/// prior crashed-mid-close cycle left the chain advanced while the
+/// store still reads `Open`, the stored `on_chain_settled` is stale
+/// and a valid `ApplyVoucher` voucher would otherwise be misclassified
+/// as `LockSettled`.
 pub(crate) fn decide_close_action<'a>(
     payload: &'a ClosePayload,
-    record: &ChannelRecord,
+    chain_settled: u64,
 ) -> Result<CloseAction<'a>, SessionError> {
     let Some(voucher) = payload.voucher.as_ref() else {
         return Ok(CloseAction::LockSettled);
@@ -102,7 +115,7 @@ pub(crate) fn decide_close_action<'a>(
         .cumulative_amount
         .parse()
         .map_err(|e| SessionError::InvalidAmount(format!("cumulativeAmount: {e}")))?;
-    if cumulative_amount > record.on_chain_settled {
+    if cumulative_amount > chain_settled {
         Ok(CloseAction::ApplyVoucher {
             voucher,
             cumulative_amount,
@@ -364,45 +377,106 @@ async fn run_inner(
         )));
     }
 
-    // Decide the close path plus voucher recheck. Build all three txs up
-    // front so any builder error (including an oversize-tx hard error)
-    // surfaces before we touch the store.
-    let action = decide_close_action(payload, &record)?;
+    // Read settled off the chain PDA before deciding the close path.
+    // The stored `on_chain_settled` can lag chain after a
+    // crashed-mid-close cycle, which would misclassify a valid
+    // ApplyVoucher voucher as LockSettled. Erroring on RPC failure
+    // would lock the channel out of cooperative close until recovery
+    // runs, so fall back to the stored value with a warning.
+    let chain_settled = match read_settled_from_chain(rpc, config, &channel_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                refetch_error = ?e,
+                stored_settled = record.on_chain_settled,
+                "decide_close_action: chain settled refetch failed; falling back to stored value",
+            );
+            record.on_chain_settled
+        }
+    };
+    let action = decide_close_action(payload, chain_settled)?;
     let preflight_tx = build_ata_preflight_tx(
-        config,
         &record,
         recent_blockhash,
         &fee_payer_pk,
     )?;
-    let (settled_after, settle_tx_unsigned) = match &action {
+
+    // Captured for the apply-voucher receipt branch below; the voucher
+    // fields mirror what `verify_voucher` would return for the same
+    // voucher.
+    let prior_accepted = record.accepted_cumulative;
+    let (action_variant, settled_after, settle_tx_unsigned) = match &action {
         CloseAction::ApplyVoucher {
             voucher,
             cumulative_amount,
         } => {
             recheck_voucher_for_close(voucher, *cumulative_amount, &record, config)?;
+
+            // Reserve the watermark through the same CAS `verify_voucher`
+            // uses. The CAS is the single linearisation point, so a
+            // concurrent voucher cannot advance `accepted_cumulative`
+            // above the close voucher between here and
+            // `mark_close_attempting`.
+            let prior_for_voucher_receipt = record.accepted_cumulative;
+            let spent = cumulative_amount.saturating_sub(prior_for_voucher_receipt);
+            let cas_receipt = crate::server::session::voucher::build_voucher_receipt(
+                &channel_id,
+                *cumulative_amount,
+                spent,
+            );
+            let cas_receipt_bytes = serde_json::to_vec(&cas_receipt).map_err(|e| {
+                SessionError::InternalError(format!(
+                    "serialize close-voucher cache receipt: {e}"
+                ))
+            })?;
+            let sig_bytes = decode_fixed::<64>(&voucher.signature)
+                .ok_or(SessionError::VoucherSignatureInvalid)?;
+
+            match store
+                .advance_watermark(
+                    &channel_id,
+                    prior_for_voucher_receipt,
+                    *cumulative_amount,
+                    (*voucher).clone(),
+                    sig_bytes,
+                    cas_receipt_bytes,
+                )
+                .await?
+            {
+                crate::store::AdvanceOutcome::Advanced { prior: _ } => {}
+                crate::store::AdvanceOutcome::Conflict { current, .. } => {
+                    // A concurrent voucher already committed at or
+                    // above this cumulative. The close voucher would
+                    // commit a stale watermark on chain; reject so the
+                    // caller resnapshots.
+                    return Err(SessionError::VoucherCumulativeRegression {
+                        stored: current,
+                        got: *cumulative_amount,
+                    });
+                }
+            }
+
             let tx = build_settle_tx_apply_voucher(
-                config,
                 &record,
                 voucher,
                 recent_blockhash,
                 &fee_payer_pk,
                 &merchant_pk,
             )?;
-            (*cumulative_amount, tx)
+            (CloseActionTag::ApplyVoucher, *cumulative_amount, tx)
         }
         CloseAction::LockSettled => {
             let tx = build_settle_tx_lock_settled(
-                config,
                 &record,
                 recent_blockhash,
                 &fee_payer_pk,
                 &merchant_pk,
             )?;
-            (record.on_chain_settled, tx)
+            (CloseActionTag::LockSettled, chain_settled, tx)
         }
     };
     let distribute_tx_unsigned = build_distribute_tx(
-        config,
         &record,
         recent_blockhash,
         &fee_payer_pk,
@@ -582,15 +656,9 @@ async fn run_inner(
         );
         return Err(e.into());
     }
-    if let Err(e) = store.record_close_signature(&channel_id, tx_sig).await {
-        tracing::error!(
-            channel_id = %channel_id,
-            signature = %tx_sig,
-            store_error = %e,
-            "tx confirmed on-chain but record_close_signature failed; recovery will see chain tombstoned vs store CloseAttempting; investigate",
-        );
-        return Err(e.into());
-    }
+    // `mark_closed_pending` flips the status and stamps `close_tx` in
+    // a single mutation; a separate `record_close_signature` would
+    // widen the partial-failure window for no benefit.
     if let Err(e) = store.mark_closed_pending(&channel_id, tx_sig).await {
         tracing::error!(
             channel_id = %channel_id,
@@ -654,10 +722,21 @@ async fn run_inner(
     });
 
     let refunded = record.deposit.saturating_sub(settled_after);
-    Ok(
-        Receipt::success(METHOD_NAME, channel_id.to_string(), payload.challenge_id.clone())
-            .with_close_amounts(tx_sig.to_string(), refunded),
+    let mut receipt = Receipt::success(
+        METHOD_NAME,
+        channel_id.to_string(),
+        payload.challenge_id.clone(),
     )
+    .with_close_amounts(tx_sig.to_string(), refunded);
+    // Apply-voucher closes commit a fresh voucher to chain, so the
+    // receipt carries the same `acceptedCumulative` / `spent` fields a
+    // `verify_voucher` receipt would for that voucher. Lock-settled
+    // closes have no voucher to attribute.
+    if action_variant == CloseActionTag::ApplyVoucher {
+        let spent = settled_after.saturating_sub(prior_accepted);
+        receipt = receipt.with_voucher_amounts(settled_after, spent);
+    }
+    Ok(receipt)
 }
 
 /// Poll `confirm_transaction_with_commitment` for `Confirmed` until the
@@ -849,12 +928,17 @@ async fn read_settled_from_chain(
 }
 
 /// Best-known settled value when `read_settled_from_chain` fails after
-/// the distribute tx confirmed. Usually means the FINALIZED branch
-/// closed the PDA in the same tx, so the chain layout is gone:
+/// the distribute tx confirmed. Typically means the FINALIZED branch
+/// tombstoned the PDA in the same tx, so the chain layout is gone:
 ///
 /// 1. `record.last_voucher.cumulative_amount` if a voucher is stashed
-///    (that's what ApplyVoucher would have committed).
-/// 2. `record.on_chain_settled` otherwise, the pre-close watermark.
+///    (what ApplyVoucher would have committed).
+/// 2. `record.on_chain_settled` otherwise (pre-close watermark).
+///
+/// Branch 2 is suspect: a crashed-mid-confirm ApplyVoucher leaves the
+/// chain figure ahead of the stored one and the fallback records the
+/// stale value. Logged at `error!` so an operator can reconcile via
+/// the on-chain history of `record.close_tx`.
 fn tombstone_refetch_fallback(
     record: &ChannelRecord,
     channel_id: &Pubkey,
@@ -876,12 +960,15 @@ fn tombstone_refetch_fallback(
             amount
         }
         None => {
-            tracing::warn!(
+            tracing::error!(
                 channel_id = %channel_id,
                 signature = %tx_sig,
                 fallback_amount = record.on_chain_settled,
-                "tombstone-after-confirm fallback: no last_voucher; using stored on_chain_settled = {}",
+                "tombstone-after-confirm fallback: no last_voucher; recording stored on_chain_settled = {} as the post-close settled. \
+                 This value is suspect: if the original close ran ApplyVoucher before crashing, the chain figure has advanced past the store. \
+                 Reconcile via the on-chain history of close_tx={}",
                 record.on_chain_settled,
+                tx_sig,
             );
             record.on_chain_settled
         }
@@ -912,13 +999,7 @@ async fn finish_post_tombstone(
     };
 
     match record.status {
-        ChannelStatus::CloseAttempting => {
-            store.record_close_signature(&record.channel_id, close_sig).await?;
-            store
-                .mark_closed_pending(&record.channel_id, close_sig)
-                .await?;
-        }
-        ChannelStatus::Closing => {
+        ChannelStatus::CloseAttempting | ChannelStatus::Closing => {
             store
                 .mark_closed_pending(&record.channel_id, close_sig)
                 .await?;
@@ -984,11 +1065,10 @@ async fn run_close_retry_broadcast(
     // status and runs the right transition (Open: lock-and-finalize;
     // Closing: lock-and-finalize mid-grace). Re-running this against a
     // Closing PDA in recovery is fine.
-    let preflight_tx = build_ata_preflight_tx(config, &record, &recent_blockhash, &fee_payer_pk)?;
+    let preflight_tx = build_ata_preflight_tx(&record, &recent_blockhash, &fee_payer_pk)?;
     let settle_tx_unsigned =
-        build_settle_tx_lock_settled(config, &record, &recent_blockhash, &fee_payer_pk, &merchant_pk)?;
-    let distribute_tx_unsigned =
-        build_distribute_tx(config, &record, &recent_blockhash, &fee_payer_pk)?;
+        build_settle_tx_lock_settled(&record, &recent_blockhash, &fee_payer_pk, &merchant_pk)?;
+    let distribute_tx_unsigned = build_distribute_tx(&record, &recent_blockhash, &fee_payer_pk)?;
 
     let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
         preflight_commitment: Some(config.commitment.commitment),
@@ -1052,15 +1132,6 @@ async fn run_close_retry_broadcast(
             signature = %tx_sig,
             store_error = %e,
             "RetryClose tx confirmed but record_on_chain_settled failed",
-        );
-        return Err(e.into());
-    }
-    if let Err(e) = store.record_close_signature(&channel_id, tx_sig).await {
-        tracing::error!(
-            channel_id = %channel_id,
-            signature = %tx_sig,
-            store_error = %e,
-            "RetryClose tx confirmed but record_close_signature failed",
         );
         return Err(e.into());
     }
@@ -1229,13 +1300,10 @@ mod tests {
     #[test]
     fn voucher_higher_cumulative_routes_to_apply_voucher() {
         let signer = fresh_signing_key(0x11);
-        let authorized = Pubkey::new_from_array(signer.verifying_key_bytes());
         let cid = pk(0xC1);
-        let mut record = base_record(cid, authorized, 10_000);
-        record.on_chain_settled = 100;
         let v = mint_voucher(&signer, &cid, 500, None);
         let payload = close_payload("ch", cid, Some(v));
-        match decide_close_action(&payload, &record).unwrap() {
+        match decide_close_action(&payload, 100).unwrap() {
             CloseAction::ApplyVoucher { cumulative_amount, .. } => {
                 assert_eq!(cumulative_amount, 500)
             }
@@ -1246,14 +1314,11 @@ mod tests {
     #[test]
     fn voucher_equal_cumulative_routes_to_lock_settled() {
         let signer = fresh_signing_key(0x12);
-        let authorized = Pubkey::new_from_array(signer.verifying_key_bytes());
         let cid = pk(0xC2);
-        let mut record = base_record(cid, authorized, 10_000);
-        record.on_chain_settled = 500;
         let v = mint_voucher(&signer, &cid, 500, None);
         let payload = close_payload("ch", cid, Some(v));
         assert!(matches!(
-            decide_close_action(&payload, &record).unwrap(),
+            decide_close_action(&payload, 500).unwrap(),
             CloseAction::LockSettled
         ));
     }
@@ -1261,12 +1326,28 @@ mod tests {
     #[test]
     fn missing_voucher_routes_to_lock_settled() {
         let cid = pk(0xC3);
-        let record = base_record(cid, pk(0x33), 10_000);
         let payload = close_payload("ch", cid, None);
         assert!(matches!(
-            decide_close_action(&payload, &record).unwrap(),
+            decide_close_action(&payload, 0).unwrap(),
             CloseAction::LockSettled
         ));
+    }
+
+    #[test]
+    fn decide_close_action_uses_chain_settled_not_stored() {
+        // Voucher at 600 against chain settled=500 (the stored value
+        // 700 would have routed to LockSettled). Pin that the decision
+        // is taken on the chain-fresh figure.
+        let signer = fresh_signing_key(0x13);
+        let cid = pk(0xC4);
+        let v = mint_voucher(&signer, &cid, 600, None);
+        let payload = close_payload("ch", cid, Some(v));
+        match decide_close_action(&payload, 500).unwrap() {
+            CloseAction::ApplyVoucher { cumulative_amount, .. } => {
+                assert_eq!(cumulative_amount, 600);
+            }
+            other => panic!("expected ApplyVoucher with chain-fresh settled, got {other:?}"),
+        }
     }
 
     #[test]
