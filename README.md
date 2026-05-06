@@ -23,7 +23,7 @@ The Solana MPP SDK is available in 5 languages. Every implementation follows the
 | **SPL tokens** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Token-2022** | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Replay protection** | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Session (pay-as-you-go)** | — | — | — | — | — |
+| **Session (pay-as-you-go)** | — | ✅ | — | — | — |
 
 ### Testing
 
@@ -163,6 +163,58 @@ let mpp = Mpp::new(Config {
 let challenge = mpp.charge("1.00")?;
 let receipt = mpp.verify_credential(&credential).await?;
 ```
+</details>
+
+### Server (session)
+
+Pay-as-you-go over a payment channel. The session intent issues a 402, opens a channel on-chain, accepts vouchers off-chain, and settles cooperatively at close. Rust v1 ships server-co-signed session only (the operator adds the fee-payer signature and broadcasts); pull-mode session is out of v1 scope.
+
+<details>
+<summary>Rust</summary>
+
+```rust
+use std::sync::Arc;
+use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
+use solana_mpp::{
+    session, solana_keychain::{MemorySigner, SolanaSigner}, ChannelStore, FeePayer,
+    InMemoryChannelStore, Network, PayeeSigner, Pricing, RpcClient, SessionConfig,
+};
+
+let mut cfg = SessionConfig::new_with_defaults(
+    operator,
+    payee,
+    mint,
+    6, // decimals
+    Network::MainnetBeta,
+    program_id,
+    Pricing { amount_per_unit: 1_000, unit_type: "request".into() },
+);
+
+// Wrap your custody (env, KMS, HSM, wallet file) in a SolanaSigner.
+// MemorySigner shown for brevity; production deployments use KMS/HSM.
+let fee_payer: Arc<dyn SolanaSigner> = Arc::new(MemorySigner::from_bytes(&fee_payer_bytes)?);
+let payee_signer: Arc<dyn SolanaSigner> = Arc::new(MemorySigner::from_bytes(&payee_bytes)?);
+cfg.fee_payer = Some(FeePayer { signer: fee_payer });
+cfg.payee_signer = Some(PayeeSigner { signer: payee_signer });
+
+let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
+let rpc: Arc<dyn RpcClient> = Arc::new(SolanaRpcClient::new(rpc_url));
+
+let method = session(cfg)
+    .with_store(store)
+    .with_rpc(rpc)
+    .recover()
+    .await?;
+
+// Issue a 402 challenge for an open or topup, accept vouchers, close.
+let challenge = method.build_challenge_for_open(Default::default()).await?;
+let receipt   = method.process_open(&open_payload).await?;
+let receipt   = method.verify_voucher(&voucher).await?;
+let receipt   = method.process_topup(&topup_payload).await?;
+let receipt   = method.process_close(&close_payload).await?;
+```
+
+`fee_payer` is required: v1 is server-submit, so the operator pays SOL fees on every channel transaction. `payee_signer` is required for `process_close`: the program's `settle_and_finalize` enforces that the merchant transaction signer matches `Channel.payee`, set at open time to the `payee` field on `SessionConfig`. The SDK never persists key material; both signers are facades over your existing custody.
 </details>
 
 ### Payment Links

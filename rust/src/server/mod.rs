@@ -10,3 +10,7 @@ pub mod html;
 pub mod session;
 
 pub use charge::{check_network_blockhash, ChargeOptions, Config, Mpp, VerificationError};
+pub use session::{
+    FeePayer, Network, OpenChallengeOptions, PayeeSigner, Pricing, RecoveryOptions,
+    SessionBuilder, SessionConfig, SessionMethod,
+};

@@ -81,6 +81,22 @@ pub use store::{
     Store, StoreError,
 };
 
+// Async RPC trait the session lifecycle talks to. Operators pass an
+// `Arc<dyn RpcClient>` to `SessionBuilder::with_rpc`; the blanket impl
+// for `solana_client::nonblocking::rpc_client::RpcClient` covers the
+// common case.
+pub use program::payment_channels::rpc::RpcClient;
+
+// Session intent server surface. The `session(cfg)` factory is the
+// only supported entry point; `SessionMethod` is constructed via
+// `SessionBuilder::recover()` so startup recovery is a hard
+// prerequisite for serving requests.
+#[cfg(feature = "server")]
+pub use server::session::{
+    session, FeePayer, Network, OpenChallengeOptions, PayeeSigner, Pricing, RecoveryOptions,
+    SessionBuilder, SessionConfig, SessionMethod,
+};
+
 // Re-export crates callers need to use with the charge builder.
 pub use solana_keychain;
 pub use solana_rpc_client;

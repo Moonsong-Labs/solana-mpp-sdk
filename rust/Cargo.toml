@@ -176,3 +176,23 @@ required-features = ["server", "client"]
 [[test]]
 name = "charge_integration"
 required-features = ["server", "client"]
+
+[[test]]
+name = "session_l1_open_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_topup_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_close_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_voucher_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_recover"
+required-features = ["server"]
