@@ -225,3 +225,43 @@ l1-oracle-tombstone:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_tombstone_oracle -- --nocapture
+
+# Run the open handler oracle. Walks `process_open` against a
+# litesvm-backed RpcClient and checks the broadcast lands plus the
+# store ends up with the Open record.
+l1-oracle-open-handler:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_open_handler -- --nocapture
+
+# Run the voucher handler oracle. `verify_voucher` against a recovered
+# SessionMethod across accept, CAS conflict, regression, and
+# over-deposit branches.
+l1-oracle-voucher-handler:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_voucher_handler -- --nocapture
+
+# Run the topup handler oracle. Walks challenge issuance, canonical
+# tx shape, broadcast, and post-confirm reconciliation against the
+# on-chain deposit.
+l1-oracle-topup-handler:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_topup_handler -- --nocapture
+
+# Run the close handler oracle. Lock-settled path lands today;
+# apply-voucher stays ignored pending the merchant-signer wiring.
+# Real-cluster validation is on the L2 surfpool list since the
+# distribute tx blows past the 1232-byte packet limit.
+l1-oracle-close-handler:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_close_handler -- --nocapture
+
+# Run the recover oracle. `SessionBuilder::recover` across the
+# resume, drop-orphan, and unsettled-revenue scenarios.
+l1-oracle-recover:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_recover -- --nocapture

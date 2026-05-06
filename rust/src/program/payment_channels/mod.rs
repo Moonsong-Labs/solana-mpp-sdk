@@ -18,6 +18,7 @@ pub mod state;    // Channel PDA derivation + typed ChannelView
 
 // SDK-owned orchestration and RPC helpers.
 pub mod ix;
+pub mod rpc;
 pub mod verify;
 
 // SDK-owned splits canonicalization. Mirrors upstream's preimage layout

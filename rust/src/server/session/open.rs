@@ -47,7 +47,7 @@ pub(crate) struct DecodedOpenTx {
 /// `salt`, `deposit`, and `grace_period` come from the wire
 /// `OpenPayload` (already parsed and bounds-checked); `splits` is the
 /// typed form the caller validated against the cached challenge.
-pub(crate) struct CanonicalOpenInputs<'a> {
+pub struct CanonicalOpenInputs<'a> {
     pub payer: Pubkey,
     pub payee: Pubkey,
     pub mint: Pubkey,
@@ -94,7 +94,7 @@ fn id_v2_to_v3(bytes: [u8; 32]) -> Pubkey {
 }
 
 /// SPL Token program id as v3 `Pubkey`.
-pub(crate) fn spl_token_id() -> Pubkey {
+pub fn spl_token_id() -> Pubkey {
     id_v2_to_v3(spl_token::id().to_bytes())
 }
 
@@ -111,7 +111,7 @@ pub(crate) fn compute_budget_program_id() -> Pubkey {
 /// Derive the ATA for `(wallet, mint, token_program)`. Mirrors
 /// `spl_associated_token_account_client::address::get_associated_token_address_with_program_id`
 /// but stays in v3 `Pubkey` to skip the dual-version crate hop.
-pub(crate) fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubkey {
+pub fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubkey {
     let (pda, _) = Pubkey::find_program_address(
         &[
             wallet.as_ref(),
@@ -126,7 +126,7 @@ pub(crate) fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pub
 /// Build the canonical `open` ix we expect to find in the client's
 /// submitted tx. Same shape an honest client builds via
 /// `OpenBuilder`.
-pub(crate) fn build_canonical_open_ix(inputs: &CanonicalOpenInputs<'_>) -> Instruction {
+pub fn build_canonical_open_ix(inputs: &CanonicalOpenInputs<'_>) -> Instruction {
     // Event authority PDA, single seed `b"event_authority"`. Upstream
     // declares it in `program/payment_channels/src/event_engine.rs`
     // but doesn't re-export it through the Codama client, so derive

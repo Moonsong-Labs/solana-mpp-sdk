@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod lite_svm_client;
+
 use payment_channels_client::programs::PAYMENT_CHANNELS_ID;
 use solana_address::Address;
 use solana_pubkey::Pubkey as MppPubkey;

@@ -6,13 +6,13 @@
 use payment_channels_client::types::ChannelStatus;
 use solana_account_decoder_client_types::{UiAccount, UiAccountEncoding};
 use solana_client::client_error::{ClientError, ClientErrorKind};
-use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::RpcError;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use tracing::debug;
 
+use crate::program::payment_channels::rpc::RpcClient;
 use crate::program::payment_channels::state::{ChannelView, CLOSED_CHANNEL_DISCRIMINATOR};
 
 /// Build the `RpcAccountInfoConfig` used by every `verify_*` helper.
@@ -142,7 +142,7 @@ pub struct ExpectedOpenState {
 /// The hash check runs last so the cheaper field comparisons can
 /// short-circuit first.
 pub async fn verify_open(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
     expected: &ExpectedOpenState,
@@ -242,7 +242,7 @@ pub async fn verify_open(
 /// value, so the caller can fold a concurrent-topup race into its
 /// own deposit policy without losing the actual chain figure.
 pub async fn verify_topup_reconciling(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
     expected_new_deposit: u64,
@@ -282,7 +282,7 @@ pub async fn verify_topup_reconciling(
 /// Verify a `settle` left the channel still `Open` with the expected
 /// settled amount. Settle does not transition status; finalize does.
 pub async fn verify_settled(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
     expected_settled: u64,
@@ -323,7 +323,7 @@ pub async fn verify_settled(
 /// amount and grace period, and that `closure_started_at` has been
 /// populated by the on-chain transition.
 pub async fn verify_closing(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
     expected_settled: u64,
@@ -434,7 +434,7 @@ enum TombstoneProbe {
 /// `Box<ClientErrorKind>` on the 3.x track, hence the `*` deref in the
 /// pattern.
 async fn tombstone_probe(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
 ) -> Result<TombstoneProbe, VerifyError> {
@@ -485,7 +485,7 @@ async fn tombstone_probe(
 /// hold independent proof the channel previously existed and was
 /// closed) should use `verify_finalized_or_absent` instead.
 pub async fn verify_tombstoned(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
 ) -> Result<(), VerifyError> {
@@ -519,7 +519,7 @@ pub async fn verify_tombstoned(
 /// "channel never existed" become indistinguishable, and recovery code
 /// will treat unrelated absent PDAs as already-closed.
 pub async fn verify_finalized_or_absent(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     commitment: CommitmentConfig,
     channel_id: &Pubkey,
 ) -> Result<(), VerifyError> {

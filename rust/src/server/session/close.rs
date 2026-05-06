@@ -218,7 +218,7 @@ fn decode_fixed<const N: usize>(raw: &str) -> Option<[u8; N]> {
 /// live RPC).
 pub(crate) async fn run_process_close(
     store: &Arc<dyn ChannelStore>,
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     cache: &ChallengeCache,
     config: &SessionConfig,
     payee_signer: &Arc<dyn solana_keychain::SolanaSigner>,
@@ -304,7 +304,7 @@ async fn prepare_preflight_for_broadcast(
 #[allow(clippy::too_many_arguments)]
 async fn run_inner(
     store: &Arc<dyn ChannelStore>,
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     cache: &ChallengeCache,
     config: &SessionConfig,
     payee_signer: &Arc<dyn solana_keychain::SolanaSigner>,
@@ -605,7 +605,7 @@ async fn run_inner(
     // tx confirmed but on-chain state diverged from expectation (fork
     // recovery, tx replaced, validator drift). Log and proceed; the
     // store carries the close signature for reconciliation.
-    if let Err(e) = verify_tombstoned(rpc, config.commitment, &channel_id).await {
+    if let Err(e) = verify_tombstoned(rpc.as_ref(), config.commitment, &channel_id).await {
         tracing::warn!(
             channel_id = %channel_id,
             signature = %tx_sig,
@@ -666,7 +666,7 @@ async fn run_inner(
 /// recipient ATAs aren't visible yet. Maps RPC errors and timeouts into
 /// typed `SessionError`s so the caller can roll back uniformly.
 async fn wait_for_confirmed(
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     signature: &Signature,
     timeout: &Duration,
 ) -> Result<(), SessionError> {
@@ -710,7 +710,7 @@ async fn wait_for_confirmed(
 /// source of truth either way.
 pub(crate) async fn run_close_retry(
     store: &dyn ChannelStore,
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> Result<(), SessionError> {
@@ -740,7 +740,7 @@ pub(crate) async fn run_close_retry(
 }
 
 async fn peek_chain_state(
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     config: &SessionConfig,
     channel_id: &Pubkey,
 ) -> Result<OnChainChannelStatus, SessionError> {
@@ -810,7 +810,7 @@ async fn peek_chain_state(
 /// post-confirm path uses this so the store reflects chain truth, not
 /// the (possibly stale) stored value.
 async fn read_settled_from_chain(
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     config: &SessionConfig,
     channel_id: &Pubkey,
 ) -> Result<u64, SessionError> {
@@ -949,7 +949,7 @@ async fn finish_post_tombstone(
 
 async fn run_close_retry_broadcast(
     store: &dyn ChannelStore,
-    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    rpc: &Arc<dyn crate::program::payment_channels::rpc::RpcClient>,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> Result<(), SessionError> {
@@ -1074,7 +1074,7 @@ async fn run_close_retry_broadcast(
         return Err(e.into());
     }
 
-    if let Err(e) = verify_tombstoned(rpc, config.commitment, &channel_id).await {
+    if let Err(e) = verify_tombstoned(rpc.as_ref(), config.commitment, &channel_id).await {
         tracing::warn!(
             channel_id = %channel_id,
             signature = %tx_sig,
@@ -1337,7 +1337,7 @@ mod tests {
     /// Mock RPC client whose `send_transaction` always returns an RPC
     /// error. The default mock-sender returns success; rebuilding it
     /// with a custom sender exercises the rollback path.
-    fn mock_rpc_send_failure() -> Arc<solana_client::nonblocking::rpc_client::RpcClient> {
+    fn mock_rpc_send_failure() -> Arc<dyn crate::program::payment_channels::rpc::RpcClient> {
         // Simplest "always fail" shape: `RpcClient::new_mock` with a URL
         // the sender is configured to fail on.
         Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new_mock(
@@ -1583,9 +1583,11 @@ mod tests {
         // InternalError and the caller logs + falls back to the stored
         // value. Happy-path refetch lives in the L1 oracle.
         let cid = pk(0xD1);
-        let rpc = Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new_mock(
-            "succeeds".to_string(),
-        ));
+        let rpc: Arc<dyn crate::program::payment_channels::rpc::RpcClient> = Arc::new(
+            solana_client::nonblocking::rpc_client::RpcClient::new_mock(
+                "succeeds".to_string(),
+            ),
+        );
         let config = base_config();
         let err = read_settled_from_chain(&rpc, &config, &cid)
             .await

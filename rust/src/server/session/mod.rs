@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use solana_client::client_error::ClientError;
-use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -35,11 +34,14 @@ use solana_transaction::{Transaction, TransactionError};
 use tokio::task::JoinHandle;
 
 use crate::error::SessionError;
+use crate::program::payment_channels::rpc::RpcClient;
 use crate::program::payment_channels::state::find_channel_pda;
 use crate::program::payment_channels::verify::{
     verify_open, verify_topup_reconciling, ExpectedOpenState, Mismatch, VerifyError,
 };
-use crate::protocol::core::{compute_challenge_id, Base64UrlJson, MethodName, PaymentChallenge, Receipt};
+use crate::protocol::core::{
+    compute_challenge_id, Base64UrlJson, MethodName, PaymentChallenge, Receipt,
+};
 use crate::protocol::intents::session::{
     typed_to_wire, wire_to_typed, MethodDetails, OpenPayload, SessionRequest, Split, TopUpPayload,
 };
@@ -307,7 +309,7 @@ pub struct SessionMethod {
     /// Realm with the default applied.
     realm: String,
     store: Arc<dyn ChannelStore>,
-    rpc: Arc<RpcClient>,
+    rpc: Arc<dyn RpcClient>,
     cache: ChallengeCache,
     /// Plain `JoinHandle` because `SessionMethod` is not `Clone`, so
     /// the `Drop` impl owns the only handle. If we ever make this
@@ -341,7 +343,7 @@ impl SessionMethod {
     pub(crate) fn new_for_recover(
         config: SessionConfig,
         store: Arc<dyn ChannelStore>,
-        rpc: Arc<RpcClient>,
+        rpc: Arc<dyn RpcClient>,
     ) -> Result<Self, SessionError> {
         let secret_key = resolve_secret_key(&config.secret_key)?;
         let realm = resolve_realm(&config.realm);
@@ -366,7 +368,7 @@ impl SessionMethod {
         &self.store
     }
 
-    pub fn rpc(&self) -> &Arc<RpcClient> {
+    pub fn rpc(&self) -> &Arc<dyn RpcClient> {
         &self.rpc
     }
 
@@ -458,18 +460,18 @@ impl SessionMethod {
         &self,
         channel_id: &Pubkey,
     ) -> Result<PaymentChallenge, SessionError> {
-        let record = self
-            .store
-            .get(channel_id)
-            .await?
-            .ok_or_else(|| SessionError::InternalError(format!("unknown channel {channel_id}")))?;
+        let record =
+            self.store.get(channel_id).await?.ok_or_else(|| {
+                SessionError::InternalError(format!("unknown channel {channel_id}"))
+            })?;
 
         let blockhash = self.rpc.get_latest_blockhash().await?;
         let intent = ChallengeIntent::TopUp {
             channel_id: *channel_id,
         };
 
-        let request = self.session_request_for_known_channel(channel_id, &record.splits, &blockhash);
+        let request =
+            self.session_request_for_known_channel(channel_id, &record.splits, &blockhash);
         let encoded = Base64UrlJson::from_typed(&request)
             .map_err(|e| SessionError::InternalError(format!("encode topup body: {e}")))?;
         let challenge = self.build_challenge(encoded, None)?;
@@ -490,18 +492,18 @@ impl SessionMethod {
         // Bail early if the channel is unknown. The close handler
         // checks again, but no point handing out a challenge we
         // already know we can't honour.
-        let record = self
-            .store
-            .get(channel_id)
-            .await?
-            .ok_or_else(|| SessionError::InternalError(format!("unknown channel {channel_id}")))?;
+        let record =
+            self.store.get(channel_id).await?.ok_or_else(|| {
+                SessionError::InternalError(format!("unknown channel {channel_id}"))
+            })?;
 
         let blockhash = self.rpc.get_latest_blockhash().await?;
         let intent = ChallengeIntent::Close {
             channel_id: *channel_id,
         };
 
-        let request = self.session_request_for_known_channel(channel_id, &record.splits, &blockhash);
+        let request =
+            self.session_request_for_known_channel(channel_id, &record.splits, &blockhash);
         let encoded = Base64UrlJson::from_typed(&request)
             .map_err(|e| SessionError::InternalError(format!("encode close body: {e}")))?;
         let challenge = self.build_challenge(encoded, None)?;
@@ -575,10 +577,7 @@ impl SessionMethod {
     /// against a tx that's still landing. After Consumed, any later
     /// error (timeout, verify failure) bubbles up with the challenge
     /// already burned and recovery handles signature reconciliation.
-    pub async fn process_open(
-        &self,
-        payload: &OpenPayload,
-    ) -> Result<Receipt, SessionError> {
+    pub async fn process_open(&self, payload: &OpenPayload) -> Result<Receipt, SessionError> {
         // Reserve under `Open` intent.
         let cached = self
             .cache
@@ -603,7 +602,11 @@ impl SessionMethod {
             preflight_commitment: Some(self.config.commitment.commitment),
             ..Default::default()
         };
-        let tx_sig = match self.rpc.send_transaction_with_config(&prepared.tx, send_config).await {
+        let tx_sig = match self
+            .rpc
+            .send_transaction_with_config(&prepared.tx, send_config)
+            .await
+        {
             Ok(sig) => sig,
             Err(e) => {
                 let _ = self.cache.release(&payload.challenge_id);
@@ -647,7 +650,13 @@ impl SessionMethod {
                     advertised_splits,
                     min_deposit,
                     max_deposit,
-                } => (*payee, *mint, advertised_splits.clone(), *min_deposit, *max_deposit),
+                } => (
+                    *payee,
+                    *mint,
+                    advertised_splits.clone(),
+                    *min_deposit,
+                    *max_deposit,
+                ),
                 // Discriminant was checked at reserve, so this arm is
                 // unreachable.
                 _ => {
@@ -694,8 +703,7 @@ impl SessionMethod {
         // Re-derive `(channel_pda, canonical_bump)` and reject on
         // drift before doing any tx-shape work.
         let payer = parse_pubkey_field("payer", &payload.payer)?;
-        let authorized_signer =
-            parse_pubkey_field("authorizedSigner", &payload.authorized_signer)?;
+        let authorized_signer = parse_pubkey_field("authorizedSigner", &payload.authorized_signer)?;
         let salt: u64 = payload
             .salt
             .parse()
@@ -731,7 +739,12 @@ impl SessionMethod {
             deposit: tx_deposit,
             grace_period: tx_grace,
             canonical_bump: tx_bump,
-        } = validate_open_tx_shape(payload, &payload_splits, &self.config, &cached.recent_blockhash)?;
+        } = validate_open_tx_shape(
+            payload,
+            &payload_splits,
+            &self.config,
+            &cached.recent_blockhash,
+        )?;
         // Sanity asserts. The canonical-bytes comparison above already
         // covers equivalence, but a typed cross-check gives a clearer
         // error if the payload-vs-tx parsing layers drift.
@@ -824,7 +837,7 @@ impl SessionMethod {
         // On-chain verify. Map `VerifyError` onto the public surface
         // error, carrying the offending field name.
         verify_open(
-            &self.rpc,
+            self.rpc.as_ref(),
             self.config.commitment,
             &channel_id,
             &ExpectedOpenState {
@@ -934,10 +947,7 @@ impl SessionMethod {
     /// actually shows. A chain value above the operator's
     /// `max_deposit` raises `MaxDepositExceeded` with `additional: 0`
     /// to surface that the cap was already breached by another actor.
-    pub async fn process_topup(
-        &self,
-        payload: &TopUpPayload,
-    ) -> Result<Receipt, SessionError> {
+    pub async fn process_topup(&self, payload: &TopUpPayload) -> Result<Receipt, SessionError> {
         let cached = self
             .cache
             .reserve(&payload.challenge_id, ChallengeIntentDiscriminant::TopUp)?;
@@ -1022,12 +1032,15 @@ impl SessionMethod {
         }
 
         // `checked_add` catches the pathological u64 overflow before the cap check.
-        let new_deposit = record.deposit.checked_add(additional_amount).ok_or_else(|| {
-            SessionError::InvalidAmount(format!(
-                "deposit + additional overflows u64 (deposit={}, additional={})",
-                record.deposit, additional_amount
-            ))
-        })?;
+        let new_deposit = record
+            .deposit
+            .checked_add(additional_amount)
+            .ok_or_else(|| {
+                SessionError::InvalidAmount(format!(
+                    "deposit + additional overflows u64 (deposit={}, additional={})",
+                    record.deposit, additional_amount
+                ))
+            })?;
         if new_deposit > self.config.max_deposit {
             return Err(SessionError::MaxDepositExceeded {
                 current: record.deposit,
@@ -1122,7 +1135,7 @@ impl SessionMethod {
         // deposit as expected, and a value above `max_deposit` means
         // someone else drove the channel past the operator cap.
         let actual_deposit = verify_topup_reconciling(
-            &self.rpc,
+            self.rpc.as_ref(),
             self.config.commitment,
             &channel_id,
             new_deposit,
@@ -1217,7 +1230,7 @@ pub fn session(config: SessionConfig) -> SessionBuilder {
 pub struct SessionBuilder {
     config: SessionConfig,
     store: Option<Arc<dyn ChannelStore>>,
-    rpc: Option<Arc<RpcClient>>,
+    rpc: Option<Arc<dyn RpcClient>>,
     recovery: RecoveryOptions,
 }
 
@@ -1227,7 +1240,7 @@ impl SessionBuilder {
         self
     }
 
-    pub fn with_rpc(mut self, rpc: Arc<RpcClient>) -> Self {
+    pub fn with_rpc(mut self, rpc: Arc<dyn RpcClient>) -> Self {
         self.rpc = Some(rpc);
         self
     }
@@ -1341,7 +1354,10 @@ fn parse_pubkey_field(field: &'static str, raw: &str) -> Result<Pubkey, SessionE
 /// the cluster has tried the tx. Pre-send detection isn't reliable, so
 /// this catches the post-send case and treats the rest as transient.
 fn client_error_to_session_error(e: ClientError) -> SessionError {
-    if matches!(e.get_transaction_error(), Some(TransactionError::BlockhashNotFound)) {
+    if matches!(
+        e.get_transaction_error(),
+        Some(TransactionError::BlockhashNotFound)
+    ) {
         return SessionError::BlockhashMismatch {
             expected: "challenge-bound recent blockhash".to_string(),
             got: "BlockhashNotFound (expired or unknown to the cluster)".to_string(),
@@ -1501,7 +1517,10 @@ mod tests {
     fn dummy_method() -> SessionMethod {
         // Local URL only; these tests exercise the pure body builder
         // and never hit the RPC.
-        let rpc = Arc::new(RpcClient::new("http://127.0.0.1:8899".to_string()));
+        let rpc: Arc<dyn RpcClient> =
+            Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(
+                "http://127.0.0.1:8899".to_string(),
+            ));
         let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
         let config = SessionConfig {
             operator: Pubkey::new_from_array([1u8; 32]),
@@ -1629,7 +1648,10 @@ mod tests {
             Arc::new(MemorySigner::from_bytes(&bytes).expect("memory signer"));
         let fee_payer_pk = signer.pubkey();
 
-        let rpc = Arc::new(RpcClient::new("http://127.0.0.1:8899".to_string()));
+        let rpc: Arc<dyn RpcClient> =
+            Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new(
+                "http://127.0.0.1:8899".to_string(),
+            ));
         let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
         let mut config = SessionConfig::new_with_defaults(
             Pubkey::new_from_array([1u8; 32]),
@@ -1872,14 +1894,19 @@ mod tests {
     /// Mock `RpcClient` whose `getAccountInfo` returns a Channel with
     /// the supplied deposit. The default mock-sender covers everything
     /// else the helpers don't touch.
-    fn mock_rpc_with_channel_deposit(deposit: u64) -> Arc<RpcClient> {
+    fn mock_rpc_with_channel_deposit(deposit: u64) -> Arc<dyn RpcClient> {
         use solana_rpc_client::api::request::RpcRequest;
         let mut mocks = std::collections::HashMap::new();
-        mocks.insert(RpcRequest::GetAccountInfo, channel_account_info_json(deposit));
-        Arc::new(RpcClient::new_mock_with_mocks(
-            "succeeds".to_string(),
-            mocks,
-        ))
+        mocks.insert(
+            RpcRequest::GetAccountInfo,
+            channel_account_info_json(deposit),
+        );
+        Arc::new(
+            solana_client::nonblocking::rpc_client::RpcClient::new_mock_with_mocks(
+                "succeeds".to_string(),
+                mocks,
+            ),
+        )
     }
 
     #[tokio::test]
@@ -1892,10 +1919,7 @@ mod tests {
 
         let cid = Pubkey::new_from_array([0xD1; 32]);
         let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
-        store
-            .insert(base_topup_record(cid, 10_000))
-            .await
-            .unwrap();
+        store.insert(base_topup_record(cid, 10_000)).await.unwrap();
 
         let expected_new_deposit = 12_000;
         let actual_on_chain = 14_000;
@@ -1903,7 +1927,7 @@ mod tests {
         let rpc = mock_rpc_with_channel_deposit(actual_on_chain);
 
         let actual = verify_topup_reconciling(
-            &rpc,
+            rpc.as_ref(),
             CommitmentConfig::confirmed(),
             &cid,
             expected_new_deposit,
@@ -1957,7 +1981,10 @@ mod tests {
                 max,
             } => {
                 assert_eq!(current, actual);
-                assert_eq!(additional, 0, "additional should be 0 when the cap was already breached");
+                assert_eq!(
+                    additional, 0,
+                    "additional should be 0 when the cap was already breached"
+                );
                 assert_eq!(max, max_deposit);
             }
             other => panic!("expected MaxDepositExceeded, got {other:?}"),
@@ -1976,7 +2003,7 @@ mod tests {
         let rpc = mock_rpc_with_channel_deposit(actual_on_chain);
 
         let err = verify_topup_reconciling(
-            &rpc,
+            rpc.as_ref(),
             CommitmentConfig::confirmed(),
             &cid,
             expected_new_deposit,
@@ -2001,7 +2028,11 @@ mod tests {
             &cid,
         );
         match mapped {
-            SessionError::OnChainStateMismatch { field, expected, got } => {
+            SessionError::OnChainStateMismatch {
+                field,
+                expected,
+                got,
+            } => {
                 assert_eq!(field, "deposit");
                 assert_eq!(expected, expected_new_deposit.to_string());
                 assert_eq!(got, actual_on_chain.to_string());
@@ -2219,7 +2250,10 @@ mod tests {
             .commit(&challenge_id)
             .expect("commit pending close challenge");
 
-        let snapshot = method.cache.get(&challenge_id).expect("cached after commit");
+        let snapshot = method
+            .cache
+            .get(&challenge_id)
+            .expect("cached after commit");
         assert_eq!(
             snapshot.state,
             challenge::ChallengeState::Consumed,
@@ -2254,7 +2288,10 @@ mod tests {
             .with_close_amounts(tx_sig, refunded);
         let value = serde_json::to_value(&receipt).expect("receipt serializes");
 
-        assert_eq!(value.get("status").and_then(|v| v.as_str()), Some("success"));
+        assert_eq!(
+            value.get("status").and_then(|v| v.as_str()),
+            Some("success")
+        );
         assert_eq!(
             value.get("method").and_then(|v| v.as_str()),
             Some(METHOD_NAME),
@@ -2267,10 +2304,7 @@ mod tests {
             value.get("challengeId").and_then(|v| v.as_str()),
             Some(challenge_id.as_str()),
         );
-        assert_eq!(
-            value.get("txHash").and_then(|v| v.as_str()),
-            Some(tx_sig),
-        );
+        assert_eq!(value.get("txHash").and_then(|v| v.as_str()), Some(tx_sig),);
         assert_eq!(
             value.get("refunded").and_then(|v| v.as_str()),
             Some(refunded.to_string().as_str()),

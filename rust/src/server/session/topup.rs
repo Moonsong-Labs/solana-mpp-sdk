@@ -32,7 +32,7 @@ pub(crate) struct DecodedTopupTx {
 }
 
 /// Inputs for rebuilding the canonical `top_up` ix.
-pub(crate) struct CanonicalTopupInputs {
+pub struct CanonicalTopupInputs {
     pub payer: Pubkey,
     pub mint: Pubkey,
     pub channel_id: Pubkey,
@@ -41,7 +41,7 @@ pub(crate) struct CanonicalTopupInputs {
 
 /// Build the canonical `top_up` ix, matching what an honest client
 /// emits via upstream's `TopUpBuilder`.
-pub(crate) fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
+pub fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
     let token_program_pk = spl_token_id();
     let token_program = pk_to_addr(&token_program_pk);
 

@@ -400,6 +400,10 @@ fn fee_payer_only_distribute_tx(
         SessionError::InternalError(format!("distribute tx serialize failed: {e}"))
     })?;
     if serialized.len() > MAX_TX_BYTES {
+        // TODO: upstream PR shrinking DistributionRecipients (lowering MAX_SPLITS from 32 to 8 or
+        // switching to Vec<DistributionEntry>) is in flight. When it merges, the distribute tx
+        // will fit in the 1232-byte packet limit cleanly. Promote this warn to a hard size_guard
+        // at that point.
         tracing::warn!(
             tx_bytes = serialized.len(),
             limit = MAX_TX_BYTES,

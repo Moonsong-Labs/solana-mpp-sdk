@@ -12,14 +12,13 @@ use std::sync::Arc;
 use futures::stream::{self, StreamExt};
 use payment_channels_client::types::ChannelStatus as OnChainStatus;
 use solana_client::client_error::{ClientError, ClientErrorKind};
-use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::RpcError as RpcRequestError;
 use solana_pubkey::Pubkey;
 
-use crate::error::{
-    OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, SessionError,
-};
+use crate::error::{OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, SessionError};
+use crate::program::payment_channels::rpc::RpcClient;
+
 use crate::program::payment_channels::state::{ChannelView, CLOSED_CHANNEL_DISCRIMINATOR};
 use crate::program::payment_channels::verify::{
     verify_finalized_or_absent, verify_open, ExpectedOpenState, Mismatch, VerifyError,
@@ -74,7 +73,7 @@ pub enum RecoveryOutcome {
 /// batch surfaces or runs.
 pub async fn inspect_all(
     store: &dyn ChannelStore,
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     parallelism: usize,
 ) -> Result<Vec<RecoveryOutcome>, SessionError> {
@@ -104,7 +103,7 @@ pub async fn inspect_all(
 /// Classify one record. Each store status has a small set of legal
 /// on-chain shapes; anything else is a hard failure.
 pub(crate) async fn inspect_one(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> RecoveryOutcome {
@@ -120,7 +119,7 @@ pub(crate) async fn inspect_one(
 }
 
 async fn inspect_open(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> RecoveryOutcome {
@@ -180,14 +179,12 @@ async fn inspect_open(
                 channel_id: record.channel_id,
             }
         }
-        Err(VerifyError::Mismatch(m)) => {
-            RecoveryOutcome::HardFail(RecoveryFailure {
-                channel_id: record.channel_id,
-                kind: RecoveryFailureKind::VerifyOpenMismatch {
-                    field: mismatch_field(&m),
-                },
-            })
-        }
+        Err(VerifyError::Mismatch(m)) => RecoveryOutcome::HardFail(RecoveryFailure {
+            channel_id: record.channel_id,
+            kind: RecoveryFailureKind::VerifyOpenMismatch {
+                field: mismatch_field(&m),
+            },
+        }),
         Err(VerifyError::Rpc(e)) => RecoveryOutcome::HardFail(RecoveryFailure {
             channel_id: record.channel_id,
             kind: RecoveryFailureKind::RpcFailure {
@@ -204,7 +201,7 @@ async fn inspect_open(
 }
 
 async fn inspect_close_attempting(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> RecoveryOutcome {
@@ -235,7 +232,7 @@ async fn inspect_close_attempting(
 }
 
 async fn inspect_closing(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> RecoveryOutcome {
@@ -274,7 +271,7 @@ async fn inspect_closing(
 }
 
 async fn inspect_closed_pending(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> RecoveryOutcome {
@@ -305,7 +302,7 @@ async fn inspect_closed_pending(
 pub async fn apply_outcomes(
     outcomes: Vec<RecoveryOutcome>,
     store: &dyn ChannelStore,
-    rpc: &Arc<RpcClient>,
+    rpc: &Arc<dyn RpcClient>,
     method: &SessionMethod,
     allow_unsettled: bool,
 ) -> Result<(), SessionError> {
@@ -367,7 +364,9 @@ pub async fn apply_outcomes(
                 );
             }
             RecoveryOutcome::RollbackFromClosing { channel_id } => {
-                store.mark_recovery_rollback_from_closing(&channel_id).await?;
+                store
+                    .mark_recovery_rollback_from_closing(&channel_id)
+                    .await?;
                 tracing::info!(
                     channel_id = %channel_id,
                     "rolled Closing back to Open; probable fork rollback of request_close",
@@ -406,7 +405,7 @@ pub async fn apply_outcomes(
 /// status byte off a decoded `ChannelView`) and the tombstoned/absent
 /// terminals.
 async fn probe_chain_status(
-    rpc: &RpcClient,
+    rpc: &dyn RpcClient,
     config: &SessionConfig,
     channel_id: &Pubkey,
 ) -> Result<OnChainChannelStatus, String> {
@@ -572,14 +571,18 @@ mod tests {
     /// `RpcClient::new_mock("succeeds")` is the upstream-shipped success
     /// shim. `"fails"` makes every send error out. Either is enough to
     /// drive the inspect logic without a live cluster.
-    fn mock_rpc_failing() -> Arc<RpcClient> {
-        Arc::new(RpcClient::new_mock("fails".to_string()))
+    fn mock_rpc_failing() -> Arc<dyn RpcClient> {
+        Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new_mock(
+            "fails".to_string(),
+        ))
     }
 
-    fn mock_rpc_succeeds() -> Arc<RpcClient> {
+    fn mock_rpc_succeeds() -> Arc<dyn RpcClient> {
         // The mock fakes every account fetch as `AccountNotFound`, which
         // is exactly what `verify_open` reads as `NotFound`.
-        Arc::new(RpcClient::new_mock("succeeds".to_string()))
+        Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new_mock(
+            "succeeds".to_string(),
+        ))
     }
 
     #[tokio::test]
@@ -886,10 +889,7 @@ mod tests {
     /// handle (the tests pass `&dyn ChannelStore` directly), so a fresh
     /// placeholder InMemoryChannelStore is fine. RetryClose runs in the
     /// L1 oracle.
-    fn build_test_method(
-        _store: &InMemoryChannelStore,
-        rpc: &Arc<RpcClient>,
-    ) -> SessionMethod {
+    fn build_test_method(_store: &InMemoryChannelStore, rpc: &Arc<dyn RpcClient>) -> SessionMethod {
         let placeholder: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
         SessionMethod::new_for_recover(base_config(), placeholder, rpc.clone())
             .expect("construct SessionMethod")
