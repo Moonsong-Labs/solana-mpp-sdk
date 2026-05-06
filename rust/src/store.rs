@@ -148,6 +148,16 @@ pub trait ChannelStore: Send + Sync {
 
     async fn mark_close_rollback(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
 
+    /// Recovery-only rollback from `Closing` to `Open`. Inspect calls
+    /// this when it sees a `Closing` store record against an on-chain
+    /// `Open` channel (probable fork rollback of `request_close`).
+    /// Kept separate from `mark_close_rollback` so the regular close
+    /// path can't widen its rollback scope by accident.
+    async fn mark_recovery_rollback_from_closing(
+        &self,
+        channel_id: &Pubkey,
+    ) -> Result<(), StoreError>;
+
     async fn mark_closing(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
 
     async fn mark_closed_pending(
@@ -229,6 +239,12 @@ fn check_transition(
         (Open, CloseAttempting)
             | (Open, Closing)
             | (Open, ClosedPending)
+            // Recovery edge: Open jumps straight to Finalized when
+            // inspect finds the chain tombstoned with settled revenue
+            // and no unsettled delta. The channel closed cleanly
+            // without ever passing through CloseAttempting in this
+            // server's store.
+            | (Open, ClosedFinalized)
             | (CloseAttempting, ClosedPending)
             | (CloseAttempting, Open)
             | (Closing, ClosedPending)
@@ -369,6 +385,26 @@ impl ChannelStore for InMemoryChannelStore {
             .get_mut(channel_id)
             .ok_or(StoreError::NotFound(*channel_id))?;
         check_transition(*channel_id, r.status, ChannelStatus::Open)?;
+        r.status = ChannelStatus::Open;
+        Ok(())
+    }
+
+    async fn mark_recovery_rollback_from_closing(
+        &self,
+        channel_id: &Pubkey,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        if r.status != ChannelStatus::Closing {
+            return Err(StoreError::IllegalTransition {
+                channel_id: *channel_id,
+                from: r.status,
+                to: ChannelStatus::Open,
+            });
+        }
         r.status = ChannelStatus::Open;
         Ok(())
     }
@@ -1093,6 +1129,65 @@ mod tests {
         let r = store.get(&cid).await.unwrap().unwrap();
         assert_eq!(r.accepted_cumulative, 700);
         assert_eq!(r.deposit, 5_000);
+    }
+
+    #[tokio::test]
+    async fn closing_to_open_rollback_uses_recovery_mutator() {
+        // Trait-level mark_close_rollback only takes CloseAttempting to
+        // Open. A Closing record needs the recovery mutator. Cover
+        // both: recovery mutator succeeds, regular mutator rejects with
+        // IllegalTransition.
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_closing(&cid).await.unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Closing
+        );
+
+        // mark_close_rollback rejects Closing.
+        let err = store.mark_close_rollback(&cid).await.unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::IllegalTransition {
+                from: ChannelStatus::Closing,
+                to: ChannelStatus::Open,
+                ..
+            }
+        ));
+
+        // Recovery mutator drives Closing back to Open cleanly.
+        store
+            .mark_recovery_rollback_from_closing(&cid)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rollback_rejects_non_closing_states() {
+        // Recovery mutator only accepts Closing as the from-state. Any
+        // other from-state surfaces as IllegalTransition.
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        let err = store
+            .mark_recovery_rollback_from_closing(&cid)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::IllegalTransition {
+                from: ChannelStatus::Open,
+                to: ChannelStatus::Open,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

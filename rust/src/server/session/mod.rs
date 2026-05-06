@@ -1237,13 +1237,13 @@ impl SessionBuilder {
         self
     }
 
-    /// Run startup recovery and produce a [`SessionMethod`] only after
+    /// Run startup recovery and hand back a [`SessionMethod`] once
     /// every persisted channel has been reconciled with the cluster.
     ///
-    /// The recovery walk itself isn't here yet. For now this checks
-    /// that store and RPC are wired (so misconfig surfaces obviously)
-    /// and returns a typed "not yet implemented" so callers can still
-    /// depend on the builder shape.
+    /// Inspect first, apply second. Inspect runs against every record
+    /// without touching the store, so the operator sees every anomaly
+    /// up front instead of finding the store half-mutated after a
+    /// crash mid-apply.
     pub async fn recover(self) -> Result<SessionMethod, SessionError> {
         let store = self.store.ok_or_else(|| {
             SessionError::InternalError("session builder missing store; call with_store".into())
@@ -1251,18 +1251,29 @@ impl SessionBuilder {
         let rpc = self.rpc.ok_or_else(|| {
             SessionError::InternalError("session builder missing rpc; call with_rpc".into())
         })?;
+        let recovery = self.recovery;
 
-        // Build the eventual handler shape so `cargo check` keeps
-        // exercising it before the recovery walk exists. Drop it
-        // straight away so the sweeper doesn't keep running.
-        // `new_for_recover` resolves `secret_key` and `realm` up front
-        // so a bad secret config fails here, not on first challenge.
-        let _ = self.recovery;
-        drop(SessionMethod::new_for_recover(self.config, store, rpc)?);
+        let method =
+            SessionMethod::new_for_recover(self.config, Arc::clone(&store), Arc::clone(&rpc))?;
 
-        Err(SessionError::InternalError(
-            "recover not yet implemented".to_string(),
-        ))
+        let outcomes = recover::inspect_all(
+            store.as_ref(),
+            rpc.as_ref(),
+            method.config(),
+            recovery.parallelism,
+        )
+        .await?;
+
+        recover::apply_outcomes(
+            outcomes,
+            store.as_ref(),
+            &rpc,
+            &method,
+            recovery.allow_unsettled_on_startup,
+        )
+        .await?;
+
+        Ok(method)
     }
 }
 

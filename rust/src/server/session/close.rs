@@ -52,7 +52,8 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::Transaction;
 
-use crate::error::SessionError;
+use crate::error::{OnChainChannelStatus, SessionError};
+use crate::program::payment_channels::state::{ChannelView, CLOSED_CHANNEL_DISCRIMINATOR};
 use crate::program::payment_channels::verify::verify_tombstoned;
 use crate::program::payment_channels::voucher::{
     build_signed_payload, verify_voucher_signature, VoucherSignatureError,
@@ -690,6 +691,409 @@ async fn wait_for_confirmed(
     ))
 }
 
+/// Recovery-side close retry. Drives a stranded `CloseAttempting` (or
+/// `Closing`) record forward without a client challenge. Inspect
+/// already classified the on-chain state, so this picks the right tail
+/// of the close orchestration based on what the chain shows now.
+///
+/// - Chain still `Closing`: re-broadcast settle (lock-settled) and
+///   distribute against a fresh blockhash, then run the post-confirm
+///   store updates.
+/// - Chain already tombstoned or finalized: skip the broadcast. Push
+///   the store from `CloseAttempting` (or `Closing`) to `ClosedPending`
+///   using `record.close_tx` if present, then best-effort
+///   `mark_closed_finalized`.
+///
+/// Lock-settled retry rebuilds the settle ix without ApplyVoucher
+/// because re-running the voucher might double-count if it already
+/// landed in a prior settle. The on-chain `settled` figure is the
+/// source of truth either way.
+pub(crate) async fn run_close_retry(
+    store: &dyn ChannelStore,
+    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    config: &SessionConfig,
+    record: ChannelRecord,
+) -> Result<(), SessionError> {
+    let channel_id = record.channel_id;
+
+    // Re-probe so the match below sees a single observation. Inspect
+    // already classified this PDA, but if something changed between
+    // inspect and apply (another operator instance, a manual finalize)
+    // we want to act on the current state.
+    let state = peek_chain_state(rpc, config, &channel_id).await?;
+
+    match state {
+        OnChainChannelStatus::Closing => {
+            run_close_retry_broadcast(store, rpc, config, record).await
+        }
+        OnChainChannelStatus::Tombstoned | OnChainChannelStatus::Finalized => {
+            finish_post_tombstone(store, &record).await
+        }
+        OnChainChannelStatus::Open | OnChainChannelStatus::Absent => {
+            // Only reachable if the chain state shifted between inspect
+            // and apply. Bail loudly so the operator sees it.
+            Err(SessionError::InternalError(format!(
+                "channel {channel_id} chain state shifted between inspect and apply during RetryClose; restart recovery"
+            )))
+        }
+    }
+}
+
+async fn peek_chain_state(
+    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    config: &SessionConfig,
+    channel_id: &Pubkey,
+) -> Result<OnChainChannelStatus, SessionError> {
+    use solana_client::client_error::ClientErrorKind;
+    use solana_client::rpc_config::RpcAccountInfoConfig;
+    use solana_client::rpc_request::RpcError as RpcRequestError;
+
+    let info = RpcAccountInfoConfig {
+        encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
+        commitment: Some(config.commitment),
+        ..RpcAccountInfoConfig::default()
+    };
+
+    let resp = rpc.get_ui_account_with_config(channel_id, info).await;
+    let value = match resp {
+        Ok(r) => r.value,
+        Err(e) => {
+            if matches!(
+                &*e.kind,
+                ClientErrorKind::RpcError(RpcRequestError::RpcResponseError {
+                    code: -32004,
+                    ..
+                })
+            ) {
+                return Ok(OnChainChannelStatus::Absent);
+            }
+            return Err(client_error_to_session_error(e));
+        }
+    };
+    let Some(ui_account) = value else {
+        return Ok(OnChainChannelStatus::Absent);
+    };
+    let data = ui_account.data.decode().ok_or_else(|| {
+        SessionError::InternalError(format!(
+            "unexpected RPC encoding when probing channel {channel_id}"
+        ))
+    })?;
+
+    if data.len() == 1 {
+        if data[0] == CLOSED_CHANNEL_DISCRIMINATOR {
+            return Ok(OnChainChannelStatus::Tombstoned);
+        }
+        return Err(SessionError::InternalError(format!(
+            "channel {channel_id}: tombstone-length payload with wrong discriminator byte {}",
+            data[0]
+        )));
+    }
+
+    let view = ChannelView::from_account_data(&data)
+        .map_err(|e| SessionError::InternalError(format!("channel decode: {e}")))?;
+    use payment_channels_client::types::ChannelStatus as OnChainStatus;
+    let status = view.status();
+    if status == OnChainStatus::Open as u8 {
+        Ok(OnChainChannelStatus::Open)
+    } else if status == OnChainStatus::Closing as u8 {
+        Ok(OnChainChannelStatus::Closing)
+    } else if status == OnChainStatus::Finalized as u8 {
+        Ok(OnChainChannelStatus::Finalized)
+    } else {
+        Err(SessionError::InternalError(format!(
+            "channel {channel_id}: unrecognised status byte {status}"
+        )))
+    }
+}
+
+/// Read `settled` off a freshly-fetched channel PDA. The retry-broadcast
+/// post-confirm path uses this so the store reflects chain truth, not
+/// the (possibly stale) stored value.
+async fn read_settled_from_chain(
+    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    config: &SessionConfig,
+    channel_id: &Pubkey,
+) -> Result<u64, SessionError> {
+    use solana_client::rpc_config::RpcAccountInfoConfig;
+
+    let info = RpcAccountInfoConfig {
+        encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
+        commitment: Some(config.commitment),
+        ..RpcAccountInfoConfig::default()
+    };
+    let resp = rpc
+        .get_ui_account_with_config(channel_id, info)
+        .await
+        .map_err(client_error_to_session_error)?;
+    let ui_account = resp.value.ok_or_else(|| {
+        SessionError::InternalError(format!(
+            "channel {channel_id}: account vanished between confirm and refetch"
+        ))
+    })?;
+    let data = ui_account.data.decode().ok_or_else(|| {
+        SessionError::InternalError(format!(
+            "channel {channel_id}: unexpected RPC encoding when refetching settled"
+        ))
+    })?;
+    if data.len() == 1 {
+        // Tombstoned between confirm and refetch (cooperative close hit
+        // the FINALIZED branch and tombstoned in one ix). Caller falls
+        // back to the stored value and logs a warning.
+        return Err(SessionError::InternalError(format!(
+            "channel {channel_id}: tombstoned before settled could be refetched"
+        )));
+    }
+    let view = ChannelView::from_account_data(&data)
+        .map_err(|e| SessionError::InternalError(format!("channel decode: {e}")))?;
+    Ok(view.settled())
+}
+
+/// Best-known settled value when `read_settled_from_chain` fails after
+/// the distribute tx confirmed. Usually means the FINALIZED branch
+/// closed the PDA in the same tx, so the chain layout is gone:
+///
+/// 1. `record.last_voucher.cumulative_amount` if a voucher is stashed
+///    (that's what ApplyVoucher would have committed).
+/// 2. `record.on_chain_settled` otherwise, the pre-close watermark.
+fn tombstone_refetch_fallback(
+    record: &ChannelRecord,
+    channel_id: &Pubkey,
+    tx_sig: &Signature,
+) -> u64 {
+    let parsed = record
+        .last_voucher
+        .as_ref()
+        .and_then(|v| v.voucher.cumulative_amount.parse::<u64>().ok());
+    match parsed {
+        Some(amount) => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                signature = %tx_sig,
+                fallback_amount = amount,
+                "tombstone-after-confirm fallback: using last_voucher.cumulative_amount = {}",
+                amount,
+            );
+            amount
+        }
+        None => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                signature = %tx_sig,
+                fallback_amount = record.on_chain_settled,
+                "tombstone-after-confirm fallback: no last_voucher; using stored on_chain_settled = {}",
+                record.on_chain_settled,
+            );
+            record.on_chain_settled
+        }
+    }
+}
+
+async fn finish_post_tombstone(
+    store: &dyn ChannelStore,
+    record: &ChannelRecord,
+) -> Result<(), SessionError> {
+    // Can't refetch settled off a tombstoned PDA: the layout is gone,
+    // replaced by the 1-byte close discriminator. The stored value is
+    // the truthful figure if the original close finished its post-
+    // confirm writes before crashing, and the pre-close watermark
+    // otherwise. Operators who need the exact post-close settled have
+    // to read it off the on-chain history of `record.close_tx`.
+    let close_sig = match record.close_tx {
+        Some(sig) => sig,
+        None => {
+            let placeholder = Signature::default();
+            tracing::warn!(
+                channel_id = %record.channel_id,
+                signature = %placeholder,
+                "tombstone-only retry: original close_tx not persisted; recording zero signature placeholder",
+            );
+            placeholder
+        }
+    };
+
+    match record.status {
+        ChannelStatus::CloseAttempting => {
+            store.record_close_signature(&record.channel_id, close_sig).await?;
+            store
+                .mark_closed_pending(&record.channel_id, close_sig)
+                .await?;
+        }
+        ChannelStatus::Closing => {
+            store
+                .mark_closed_pending(&record.channel_id, close_sig)
+                .await?;
+        }
+        ChannelStatus::ClosedPending | ChannelStatus::ClosedFinalized => {
+            // Already past the broadcast; nothing to do here.
+        }
+        ChannelStatus::Open => {
+            return Err(SessionError::InternalError(format!(
+                "channel {} retry-close called against Open record",
+                record.channel_id
+            )));
+        }
+    }
+
+    if let Err(e) = store.mark_closed_finalized(&record.channel_id).await {
+        // Best-effort. A fork rollback could leave the chain in a state
+        // where promotion isn't legal yet; log and let the next recovery
+        // pass retry.
+        tracing::warn!(
+            channel_id = %record.channel_id,
+            store_error = %e,
+            "mark_closed_finalized after tombstone-only retry failed; ClosedPending stays",
+        );
+    }
+    Ok(())
+}
+
+async fn run_close_retry_broadcast(
+    store: &dyn ChannelStore,
+    rpc: &Arc<solana_client::nonblocking::rpc_client::RpcClient>,
+    config: &SessionConfig,
+    record: ChannelRecord,
+) -> Result<(), SessionError> {
+    let channel_id = record.channel_id;
+    let fee_payer_signer = config.fee_payer.as_ref().ok_or_else(|| {
+        SessionError::InternalError(
+            "fee_payer not configured; RetryClose needs server-submit credentials".into(),
+        )
+    })?;
+    let payee_signer = config.payee_signer.as_ref().ok_or_else(|| {
+        SessionError::InternalError(
+            "payee_signer not configured; RetryClose needs the merchant signer".into(),
+        )
+    })?;
+    let fee_payer_pk = fee_payer_signer.signer.pubkey();
+    let merchant_pk = payee_signer.signer.pubkey();
+    if merchant_pk != record.payee {
+        return Err(SessionError::InternalError(format!(
+            "configured payee signer {merchant_pk} does not match channel.payee {} during RetryClose",
+            record.payee
+        )));
+    }
+
+    // The original challenge's blockhash has long since expired by the
+    // time recovery runs; pull a fresh one.
+    let recent_blockhash = rpc.get_latest_blockhash().await.map_err(|e| {
+        SessionError::InternalError(format!("RetryClose: get_latest_blockhash failed: {e}"))
+    })?;
+
+    // Upstream's `settle_and_finalize { has_voucher: 0 }` accepts both
+    // Open and Closing on-chain states. The program reads the channel's
+    // status and runs the right transition (Open: lock-and-finalize;
+    // Closing: lock-and-finalize mid-grace). Re-running this against a
+    // Closing PDA in recovery is fine.
+    let preflight_tx = build_ata_preflight_tx(config, &record, &recent_blockhash, &fee_payer_pk)?;
+    let settle_tx_unsigned =
+        build_settle_tx_lock_settled(config, &record, &recent_blockhash, &fee_payer_pk, &merchant_pk)?;
+    let distribute_tx_unsigned =
+        build_distribute_tx(config, &record, &recent_blockhash, &fee_payer_pk)?;
+
+    let send_config = solana_client::rpc_config::RpcSendTransactionConfig {
+        preflight_commitment: Some(config.commitment.commitment),
+        ..Default::default()
+    };
+
+    // Broadcast each tx and wait for confirmation before moving on.
+    // Store starts at CloseAttempting or Closing; both can transition
+    // into ClosedPending after distribute confirms.
+
+    let preflight_signed =
+        prepare_preflight_for_broadcast(&fee_payer_signer.signer, preflight_tx).await?;
+    let preflight_sig = rpc
+        .send_transaction_with_config(&preflight_signed, send_config)
+        .await
+        .map_err(client_error_to_session_error)?;
+    wait_for_confirmed(rpc, &preflight_sig, &config.broadcast_confirm_timeout).await?;
+
+    let settle_signed = prepare_close_for_broadcast(
+        &fee_payer_signer.signer,
+        &payee_signer.signer,
+        settle_tx_unsigned,
+    )
+    .await?;
+    let settle_sig = rpc
+        .send_transaction_with_config(&settle_signed, send_config)
+        .await
+        .map_err(client_error_to_session_error)?;
+    wait_for_confirmed(rpc, &settle_sig, &config.broadcast_confirm_timeout).await?;
+
+    let distribute_signed =
+        prepare_preflight_for_broadcast(&fee_payer_signer.signer, distribute_tx_unsigned).await?;
+    let tx_sig = rpc
+        .send_transaction_with_config(&distribute_signed, send_config)
+        .await
+        .map_err(client_error_to_session_error)?;
+    wait_for_confirmed(rpc, &tx_sig, &config.broadcast_confirm_timeout).await?;
+
+    // Post-confirm: mirror run_inner's store updates. The stored
+    // `record.on_chain_settled` is stale if the original close ran
+    // ApplyVoucher before crashing, so refetch the PDA and read settled
+    // off the decoded account. Chain wins.
+    let on_chain_settled = match read_settled_from_chain(rpc, config, &channel_id).await {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                channel_id = %channel_id,
+                signature = %tx_sig,
+                refetch_error = ?e,
+                "RetryClose tx confirmed but could not refetch settled from chain; falling back",
+            );
+            tombstone_refetch_fallback(&record, &channel_id, &tx_sig)
+        }
+    };
+    if let Err(e) = store
+        .record_on_chain_settled(&channel_id, on_chain_settled)
+        .await
+    {
+        tracing::error!(
+            channel_id = %channel_id,
+            signature = %tx_sig,
+            store_error = %e,
+            "RetryClose tx confirmed but record_on_chain_settled failed",
+        );
+        return Err(e.into());
+    }
+    if let Err(e) = store.record_close_signature(&channel_id, tx_sig).await {
+        tracing::error!(
+            channel_id = %channel_id,
+            signature = %tx_sig,
+            store_error = %e,
+            "RetryClose tx confirmed but record_close_signature failed",
+        );
+        return Err(e.into());
+    }
+    if let Err(e) = store.mark_closed_pending(&channel_id, tx_sig).await {
+        tracing::error!(
+            channel_id = %channel_id,
+            signature = %tx_sig,
+            store_error = %e,
+            "RetryClose tx confirmed but mark_closed_pending failed",
+        );
+        return Err(e.into());
+    }
+
+    if let Err(e) = verify_tombstoned(rpc, config.commitment, &channel_id).await {
+        tracing::warn!(
+            channel_id = %channel_id,
+            signature = %tx_sig,
+            verify_error = ?verify_error_to_session_error(e, &channel_id),
+            "RetryClose post-confirm verify_tombstoned mismatch",
+        );
+    }
+
+    if let Err(e) = store.mark_closed_finalized(&channel_id).await {
+        tracing::warn!(
+            channel_id = %channel_id,
+            signature = %tx_sig,
+            store_error = %e,
+            "RetryClose mark_closed_finalized failed; record stays in ClosedPending",
+        );
+    }
+    Ok(())
+}
+
 fn parse_pubkey_field(field: &'static str, raw: &str) -> Result<Pubkey, SessionError> {
     let bytes = bs58::decode(raw)
         .into_vec()
@@ -1164,6 +1568,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn retry_close_writes_chain_settled_not_stored_value() {
+        // The retry-broadcast post-confirm path reads `settled` off a
+        // freshly-fetched on-chain account, not the stored record's
+        // `on_chain_settled` (which would be stale if the original close
+        // ran ApplyVoucher before crashing).
+        //
+        // No way to fake a valid Channel PDA payload through the mock
+        // RPC (synthesising borsh bytes that round-trip through
+        // ChannelView is L1-oracle territory). What we CAN pin is the
+        // helper's failure path: against an RPC that returns
+        // AccountNotFound, `read_settled_from_chain` surfaces an
+        // InternalError and the caller logs + falls back to the stored
+        // value. Happy-path refetch lives in the L1 oracle.
+        let cid = pk(0xD1);
+        let rpc = Arc::new(solana_client::nonblocking::rpc_client::RpcClient::new_mock(
+            "succeeds".to_string(),
+        ));
+        let config = base_config();
+        let err = read_settled_from_chain(&rpc, &config, &cid)
+            .await
+            .expect_err("AccountNotFound should surface as InternalError");
+        match err {
+            SessionError::InternalError(msg) => {
+                assert!(
+                    msg.contains("vanished") || msg.contains("encoding"),
+                    "expected refetch failure message, got {msg}",
+                );
+            }
+            other => panic!("expected InternalError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_post_tombstone_trusts_stored_settled() {
+        // Tombstoned PDAs can't be reread for settled: the layout is
+        // gone, replaced by the 1-byte close discriminator.
+        // `finish_post_tombstone` doesn't write a new on_chain_settled;
+        // it leaves whatever the store had. Pin that so a future change
+        // can't silently start writing zero or some other placeholder.
+        let cid = pk(0xD2);
+        let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
+        let mut record = base_record(cid, pk(0xAA), 10_000);
+        record.on_chain_settled = 4_321;
+        store.insert(record).await.unwrap();
+        store.mark_close_attempting(&cid).await.unwrap();
+
+        let stored = store.get(&cid).await.unwrap().unwrap();
+        finish_post_tombstone(store.as_ref(), &stored)
+            .await
+            .expect("tombstone finishing path runs");
+
+        let post = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(
+            post.on_chain_settled, 4_321,
+            "tombstone path must not overwrite the stored settled figure",
+        );
+        assert_eq!(post.status, ChannelStatus::ClosedFinalized);
+    }
+
     #[test]
     fn close_receipt_carries_tx_hash_and_refunded() {
         // The close receipt's wire shape carries the close tx hash and
@@ -1180,5 +1644,39 @@ mod tests {
             value.get("refunded").and_then(|v| v.as_str()),
             Some("250"),
         );
+    }
+
+    #[test]
+    fn retry_close_uses_last_voucher_when_refetch_sees_tombstone() {
+        // Refetch can see a tombstoned PDA when the cooperative close
+        // hits FINALIZED in one tx. With a voucher stashed, the fallback
+        // picks `last_voucher.cumulative_amount` over the stale
+        // `on_chain_settled`.
+        let signer = fresh_signing_key(0x55);
+        let cid = pk(0xE1);
+        let mut record = base_record(cid, pk(0xAA), 10_000);
+        record.on_chain_settled = 100;
+        record.last_voucher = Some(mint_voucher(&signer, &cid, 750, None));
+
+        let dummy_sig = Signature::default();
+        let value = tombstone_refetch_fallback(&record, &cid, &dummy_sig);
+        assert_eq!(
+            value, 750,
+            "fallback should pull from last_voucher.cumulative_amount, not on_chain_settled",
+        );
+    }
+
+    #[test]
+    fn retry_close_falls_back_to_stored_settled_when_no_last_voucher() {
+        // Counterpart for the LockSettled branch: no voucher stashed,
+        // fallback reads the stored on_chain_settled.
+        let cid = pk(0xE2);
+        let mut record = base_record(cid, pk(0xAA), 10_000);
+        record.on_chain_settled = 432;
+        record.last_voucher = None;
+
+        let dummy_sig = Signature::default();
+        let value = tombstone_refetch_fallback(&record, &cid, &dummy_sig);
+        assert_eq!(value, 432);
     }
 }
