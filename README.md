@@ -262,6 +262,49 @@ println!("close receipt: refunded={:?}", close.refunded);
 `PaidResponse` pre-buffers the body so `bytes()`, `text()`, `json::<T>()`, `status()`, `headers()`, `channel_id()`, `accepted_cumulative()`, `spent()`, and `receipt()` are all sync and cheap to call repeatedly.
 </details>
 
+### Run the local session demo
+
+`rust/examples/local_session_demo.rs` walks the full session lifecycle (open, voucher loop, topup, close) end-to-end against a real validator. The server-side `SessionMethod` and the client-side `SessionClient` both live in the same binary and call each other directly; on-chain traffic still rides real RPC.
+
+First, fetch the program binary fixture:
+
+```bash
+just fetch-program-binary
+```
+
+In one terminal, start a validator with the program loaded. The program id is the upstream `payment_channels_client::programs::PAYMENT_CHANNELS_ID`:
+
+```bash
+solana-test-validator --reset \
+  --bpf-program <PAYMENT_CHANNELS_ID> rust/tests/fixtures/payment_channels.so
+```
+
+In another terminal, from `rust/`:
+
+```bash
+RUSTFLAGS="-D warnings" cargo run --example local_session_demo --features="server,client"
+```
+
+Expected output (truncated):
+
+```
+setting up local fixture (rpc=http://127.0.0.1:8899)
+airdropped 10 SOL to payer ABC123...
+created mint XYZ789... (decimals 6)
+opened channel ChAn1d... with deposit 10000000
+voucher #1 accepted at cumulative 100000
+voucher #2 accepted at cumulative 200000
+voucher #3 accepted at cumulative 300000
+topped up channel ChAn1d...: deposit 10000000 to 10500000
+voucher #1 accepted at cumulative 350000
+closed channel ChAn1d...; settled 400000; tombstone confirmed
+
+summary
+  channel              ChAn1d...
+  signed cumulative    400000
+  ...
+```
+
 ### Payment Links
 
 Set `html: true` on `solana.charge()` and any endpoint becomes a shareable payment link. Browsers see a payment page; API clients get the standard `402` flow.

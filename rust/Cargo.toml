@@ -198,6 +198,10 @@ required-features = ["server"]
 name = "payment_link_server"
 required-features = ["server", "client"]
 
+[[example]]
+name = "local_session_demo"
+required-features = ["server", "client"]
+
 [[test]]
 name = "charge_integration"
 required-features = ["server", "client"]
