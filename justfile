@@ -265,3 +265,11 @@ l1-oracle-recover:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_recover -- --nocapture
+
+# Run the client round-trip oracle. Drives SessionClient builders into
+# the server lifecycle handlers in one process across the open, voucher,
+# topup, and close paths.
+l1-oracle-client:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_client_roundtrip -- --nocapture
