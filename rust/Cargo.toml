@@ -119,6 +119,11 @@ thiserror = "2"
 # can hand straight to their HTTP layer without re-mapping.
 http = "1"
 
+# Cheap-to-clone byte buffer used for pre-buffered HTTP response bodies in
+# `PaidResponse`. Already pulled in transitively via `http` and `reqwest`;
+# declaring it directly so the public type signature is stable.
+bytes = "1"
+
 # Async trait sugar (used by ChannelStore so impls don't have to hand-roll
 # the Pin<Box<dyn Future + Send + '_>> dance for every method).
 async-trait = "0.1"

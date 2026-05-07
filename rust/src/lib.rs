@@ -100,7 +100,7 @@ pub use server::session::{
 #[cfg(feature = "client")]
 pub use client::session::{
     select_session_challenge, ActiveSession, ClientPolicy, OpenTxBuild, OpenedChannel,
-    ResolvedPolicy, SessionCell, SessionClient, SessionReceipt, SessionRegistry,
+    PaidResponse, ResolvedPolicy, SessionCell, SessionClient, SessionReceipt, SessionRegistry,
 };
 
 // Re-export crates callers need to use with the charge builder.

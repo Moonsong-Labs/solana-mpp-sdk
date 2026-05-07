@@ -257,6 +257,11 @@ impl ActiveSession {
     ///
     /// Older or duplicate receipts (`accepted < self.accepted_cumulative`)
     /// are ignored. Out-of-order receipt delivery is normal.
+    ///
+    /// Voucher receipts always carry `accepted_cumulative`; close and
+    /// charge-success receipts leave it unset and never flow through
+    /// here. A missing field is a protocol violation, not a silent
+    /// no-op.
     pub fn on_receipt_accepted(&mut self, receipt: &SessionReceipt) -> Result<(), ClientError> {
         let expected_reference = self.channel_id_base58();
         if receipt.reference != expected_reference {
@@ -265,14 +270,19 @@ impl ActiveSession {
                 receipt.reference
             )));
         }
-        if receipt.accepted_cumulative > self.signed_cumulative {
+        let received = receipt.accepted_cumulative.ok_or_else(|| {
+            ClientError::ProtocolViolation(
+                "receipt missing acceptedCumulative for voucher acknowledgement".into(),
+            )
+        })?;
+        if received > self.signed_cumulative {
             return Err(ClientError::ProtocolViolation(format!(
                 "receipt accepted_cumulative {} exceeds signed {}",
-                receipt.accepted_cumulative, self.signed_cumulative
+                received, self.signed_cumulative
             )));
         }
-        if receipt.accepted_cumulative > self.accepted_cumulative {
-            self.accepted_cumulative = receipt.accepted_cumulative;
+        if received > self.accepted_cumulative {
+            self.accepted_cumulative = received;
         }
         Ok(())
     }
@@ -301,6 +311,21 @@ mod tests {
         let (signer, pubkey_bytes) = fresh_signer();
         let channel_id = Pubkey::new_unique();
         (ActiveSession::new(channel_id, signer, 0, deposit), pubkey_bytes)
+    }
+
+    /// Minimal `SessionReceipt` for the watermark tests. Other fields
+    /// don't affect `on_receipt_accepted`, so they get filler values.
+    fn make_receipt(reference: String, accepted_cumulative: u64) -> SessionReceipt {
+        SessionReceipt {
+            method: "solana".into(),
+            intent: "session".into(),
+            reference,
+            status: "success".into(),
+            accepted_cumulative: Some(accepted_cumulative),
+            spent: Some(0),
+            tx_hash: None,
+            extras: serde_json::Map::new(),
+        }
     }
 
     /// Build a `ChannelRecord` against a known authorized_signer. Only
@@ -550,26 +575,17 @@ mod tests {
         assert_eq!(s.accepted_cumulative(), 0);
 
         let reference = bs58::encode(s.channel_id().to_bytes()).into_string();
-        let receipt = SessionReceipt {
-            reference: reference.clone(),
-            accepted_cumulative: 300,
-        };
+        let receipt = make_receipt(reference.clone(), 300);
         s.on_receipt_accepted(&receipt).expect("first receipt applies");
         assert_eq!(s.accepted_cumulative(), 300);
 
         // Forward progress.
-        let receipt = SessionReceipt {
-            reference: reference.clone(),
-            accepted_cumulative: 500,
-        };
+        let receipt = make_receipt(reference.clone(), 500);
         s.on_receipt_accepted(&receipt).expect("forward receipt applies");
         assert_eq!(s.accepted_cumulative(), 500);
 
         // Out-of-order / duplicate: silently OK, watermark unchanged.
-        let stale = SessionReceipt {
-            reference,
-            accepted_cumulative: 200,
-        };
+        let stale = make_receipt(reference, 200);
         s.on_receipt_accepted(&stale).expect("stale receipt is benign");
         assert_eq!(s.accepted_cumulative(), 500);
     }
@@ -580,10 +596,7 @@ mod tests {
         s.sign_voucher(500, None).await.expect("seed");
 
         let bogus = bs58::encode(Pubkey::new_unique().to_bytes()).into_string();
-        let receipt = SessionReceipt {
-            reference: bogus,
-            accepted_cumulative: 200,
-        };
+        let receipt = make_receipt(bogus, 200);
         let err = s
             .on_receipt_accepted(&receipt)
             .expect_err("wrong reference rejected");
@@ -597,14 +610,40 @@ mod tests {
         s.sign_voucher(500, None).await.expect("seed");
 
         let reference = bs58::encode(s.channel_id().to_bytes()).into_string();
-        let receipt = SessionReceipt {
-            reference,
-            accepted_cumulative: 600,
-        };
+        let receipt = make_receipt(reference, 600);
         let err = s
             .on_receipt_accepted(&receipt)
             .expect_err("accepted > signed rejected");
         assert!(matches!(err, ClientError::ProtocolViolation(_)));
+        assert_eq!(s.accepted_cumulative(), 0);
+    }
+
+    /// A voucher receipt without `acceptedCumulative` is malformed.
+    /// The server only omits the field on terminal receipts (close,
+    /// charge-success), which never flow through this method, so we
+    /// surface a `ProtocolViolation` rather than leave the watermark
+    /// stuck.
+    #[tokio::test]
+    async fn on_receipt_accepted_rejects_missing_accepted_cumulative() {
+        let (mut s, _) = fresh_session(10_000);
+        s.sign_voucher(500, None).await.expect("seed");
+
+        let reference = bs58::encode(s.channel_id().to_bytes()).into_string();
+        let mut receipt = make_receipt(reference, 0);
+        receipt.accepted_cumulative = None;
+
+        let err = s
+            .on_receipt_accepted(&receipt)
+            .expect_err("missing acceptedCumulative rejected");
+        match err {
+            ClientError::ProtocolViolation(msg) => {
+                assert!(
+                    msg.contains("acceptedCumulative"),
+                    "expected diagnostic to name the missing field, got: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
+        }
         assert_eq!(s.accepted_cumulative(), 0);
     }
 }
