@@ -125,10 +125,10 @@ pub(crate) fn validate_canonical_multi_ix_tx_shape(
     // payer and blockhash. The compiler dedups account keys and
     // promotes signer / writable flags identically on both sides, so
     // two byte-equal canonical lists yield byte-equal compiled forms.
-    // Note: the open-side splits cap (rejected upstream of this gate at
-    // 32 entries) keeps the compiled key set well under the 256 u8
-    // index ceiling, so `Message::new_with_blockhash` cannot panic on
-    // a key-count overflow on the canonical side.
+    // The open-side splits cap (rejected upstream of this gate at
+    // `MAX_SPLITS` entries) keeps the compiled key set well under the
+    // 256 u8 index ceiling, so `Message::new_with_blockhash` cannot
+    // panic on a key-count overflow on the canonical side.
     let fee_payer_addr = Address::new_from_array(fee_payer_pk.to_bytes());
     let canonical_msg = Message::new_with_blockhash(
         canonical_ixs,

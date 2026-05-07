@@ -14,14 +14,14 @@
 //! - **distribute:** `[ComputeBudget, distribute]`. Single ix carrying
 //!   the full distribution args.
 //!
-//! Splitting into three txs is forced by upstream's
-//! `DistributionRecipients { count: u8, entries: [DistributionEntry; 32] }`
-//! shape. Borsh serializes the full 32-entry array regardless of
-//! `count`, so the distribute ix data alone is `1 + 32 * 34 = 1089`
-//! bytes. With base accounts and a signature, distribute is ~1600 bytes
-//! solo and cannot share a tx with anything else under Solana's
-//! 1232-byte packet limit. Folding `distribute` into the same tx as
-//! `settle_and_finalize` blows past the limit too.
+//! Splitting into three txs is a sizing decision: even with upstream's
+//! `Vec<DistributionEntry>` recipients (length-prefixed, only active
+//! entries serialized), folding `distribute` into the same tx as
+//! `settle_and_finalize` blows past Solana's 1232-byte packet limit
+//! once both ixs' account lists land on the same message. The ATA
+//! preflight is its own tx for the same reason: cold-start
+//! `CreateIdempotent` for payee, payer, treasury, and every split
+//! recipient adds a wallet meta per recipient.
 //!
 //! Fee payer is the operator's `config.fee_payer`. The merchant signer
 //! on `settle_and_finalize` is the operator's configured payee key:
@@ -30,7 +30,6 @@
 //! only needs the fee payer to sign; the on-chain ix doesn't authorize
 //! any party beyond the program-derived channel.
 
-use solana_address::Address;
 use solana_hash::Hash;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_message::Message;
@@ -39,13 +38,11 @@ use solana_signature::Signature;
 use solana_transaction::Transaction;
 
 use payment_channels_client::instructions::{DistributeBuilder, SettleAndFinalizeBuilder};
-use payment_channels_client::types::{
-    DistributeArgs, DistributionEntry, DistributionRecipients, SettleAndFinalizeArgs, VoucherArgs,
-};
+use payment_channels_client::types::{DistributeArgs, SettleAndFinalizeArgs, VoucherArgs};
 use solana_ed25519_program::new_ed25519_instruction_with_signature;
 
 use crate::error::SessionError;
-use crate::program::payment_channels::canonical_tx::create_ata_idempotent_ix;
+use crate::program::payment_channels::canonical_tx::{create_ata_idempotent_ix, splits_to_recipients};
 use crate::program::payment_channels::splits::TREASURY_OWNER;
 use crate::program::payment_channels::voucher::build_signed_payload;
 use crate::protocol::intents::session::{SignedVoucher, Split};
@@ -67,13 +64,12 @@ const PREFLIGHT_COMPUTE_UNIT_LIMIT: u32 = 300_000;
 const COMPUTE_UNIT_PRICE_MICROLAMPORTS: u64 = 1;
 
 /// Hard cap on serialized tx size. Solana rejects anything over the
-/// packet limit at the cluster boundary. ATA preflight and both
-/// settle_and_finalize variants fit comfortably; distribute does not
-/// under the current upstream args layout (`count: u8` plus fixed
-/// `[DistributionEntry; 32]`, which serializes to 1089 bytes regardless
-/// of active recipients). Each builder enforces the cap and surfaces a
-/// typed `InternalError` so the failure shows up at build time instead
-/// of as an opaque RPC rejection.
+/// packet limit at the cluster boundary. ATA preflight, both
+/// settle_and_finalize variants, and distribute all fit under this
+/// budget at the SDK's `MAX_SPLITS = 8` cardinality with the upstream
+/// `Vec<DistributionEntry>` args layout. Each builder enforces the cap
+/// and surfaces a typed `InternalError` so the failure shows up at
+/// build time instead of as an opaque RPC rejection.
 const MAX_TX_BYTES: usize = 1232;
 
 /// Build the ATA preflight tx: `[ComputeBudget,
@@ -183,16 +179,6 @@ pub(crate) fn build_settle_tx_lock_settled(
 /// fee payer signs; the upstream `distribute` ix lists no signer
 /// accounts (channel, payer, and token accounts are all `[writable]`
 /// without `is_signer`).
-///
-/// Heads-up: this tx currently exceeds Solana's 1232-byte packet limit
-/// because the upstream `DistributionRecipients` borsh shape
-/// (`count: u8` plus a fixed `[DistributionEntry; 32]`) serializes the
-/// full 32-entry array regardless of active recipients. Litesvm does
-/// not enforce the packet limit so L1 oracles pass; a live cluster
-/// rejects. The fix lives upstream (switch the args to a `Vec`-backed
-/// shape) or in SDK ALT support. Until either lands, the size guard
-/// logs a warning instead of erroring so the path stays exercisable
-/// in tests.
 pub(crate) fn build_distribute_tx(
     record: &ChannelRecord,
     blockhash: &Hash,
@@ -203,7 +189,7 @@ pub(crate) fn build_distribute_tx(
     let mut ixs = compute_budget_prelude(DISTRIBUTE_COMPUTE_UNIT_LIMIT);
     ixs.push(distribute_ix);
 
-    fee_payer_only_distribute_tx(ixs, fee_payer, blockhash)
+    fee_payer_only_tx(ixs, fee_payer, blockhash)
 }
 
 /// Build the `settle_and_finalize` ix. `voucher` is `Some` for the
@@ -341,37 +327,6 @@ fn fee_payer_only_tx(
     Ok(tx)
 }
 
-/// Distribute-tx variant of `fee_payer_only_tx`. Same shape, but the
-/// size check is a `tracing::warn!` because the distribute ix exceeds
-/// the packet limit under upstream's current args layout. See
-/// `build_distribute_tx` for the rationale.
-fn fee_payer_only_distribute_tx(
-    ixs: Vec<Instruction>,
-    fee_payer: &Pubkey,
-    blockhash: &Hash,
-) -> Result<Transaction, SessionError> {
-    let fee_payer_addr = pk_to_addr(fee_payer);
-    let message = Message::new_with_blockhash(&ixs, Some(&fee_payer_addr), blockhash);
-    let mut tx = Transaction::new_unsigned(message);
-    let required = tx.message.header.num_required_signatures as usize;
-    tx.signatures = vec![Signature::default(); required];
-    let serialized = bincode::serialize(&tx).map_err(|e| {
-        SessionError::InternalError(format!("distribute tx serialize failed: {e}"))
-    })?;
-    if serialized.len() > MAX_TX_BYTES {
-        // TODO: upstream PR shrinking DistributionRecipients (lowering MAX_SPLITS from 32 to 8 or
-        // switching to Vec<DistributionEntry>) is in flight. When it merges, the distribute tx
-        // will fit in the 1232-byte packet limit cleanly. Promote this warn to a hard size_guard
-        // at that point.
-        tracing::warn!(
-            tx_bytes = serialized.len(),
-            limit = MAX_TX_BYTES,
-            "distribute tx serialized size exceeds Solana packet limit; broadcast will be rejected on live clusters until upstream switches DistributionRecipients to a Vec-backed shape or the SDK adds ALT support",
-        );
-    }
-    Ok(tx)
-}
-
 /// Wrap a `[Instruction]` in a `Transaction` with two signature slots
 /// (fee payer + merchant). The caller fills them in.
 fn fee_payer_plus_merchant_tx(
@@ -404,24 +359,6 @@ fn enforce_size(tx: &Transaction) -> Result<(), SessionError> {
         )));
     }
     Ok(())
-}
-
-/// Convert typed `Split`s to upstream's `DistributionRecipients` shape.
-/// Mirrors the `splits_to_recipients` helper in `open.rs`; duplicated
-/// here so the close path doesn't reach into open's internals.
-fn splits_to_recipients(splits: &[Split]) -> DistributionRecipients {
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let mut entries: [DistributionEntry; 32] = std::array::from_fn(|_| zero_entry.clone());
-    for (i, s) in splits.iter().take(32).enumerate() {
-        entries[i] = DistributionEntry::from(s);
-    }
-    DistributionRecipients {
-        count: splits.len().min(32) as u8,
-        entries,
-    }
 }
 
 #[cfg(test)]
@@ -480,10 +417,9 @@ mod tests {
         }
     }
 
-    /// Maximum split count for the size-fit tests. Splits cap at 8; we
-    /// go up to that cap to exercise the cold-start preflight shape
-    /// against the packet limit.
-    const MAX_SPLITS: usize = 8;
+    /// Use the production `MAX_SPLITS` directly so the size-fit tests
+    /// exercise the actual cap.
+    use crate::program::payment_channels::canonical_tx::MAX_SPLITS;
 
     fn record_with_splits(channel_id: Pubkey, n: usize) -> ChannelRecord {
         let mut record = base_record(channel_id);
@@ -727,29 +663,22 @@ mod tests {
     }
 
     #[test]
-    fn distribute_tx_size_documents_upstream_args_blocker() {
-        // Pinned regression sentinel. The distribute tx is structurally
-        // over Solana's 1232-byte packet limit because upstream's
-        // `DistributionRecipients` is `count: u8 + [DistributionEntry; 32]`
-        // and borsh serializes the full 32-entry array (1089 bytes)
-        // regardless of `count`. Any drop in size below 1232 means
-        // upstream switched the args to a Vec-backed shape, and the
-        // soft-warn in `fee_payer_only_distribute_tx` should be promoted
-        // back to a hard cap. Litesvm does not enforce the packet limit,
-        // so the L1 distribute / tombstone oracles pass; a live cluster
-        // rejects. Tracked here so the failure mode is visible at code
-        // review time.
+    fn distribute_tx_fits_in_packet_limit_at_max_splits() {
+        // Build-time size budget: distribute with MAX_SPLITS recipients
+        // fits under Solana's 1232-byte packet limit. The L1 distribute
+        // and tombstone oracles cover the path against the loaded
+        // program.
         let cid = pk(0xCE);
-        let record = base_record(cid); // 1 split, smallest tail
+        let record = record_with_splits(cid, MAX_SPLITS);
         let blockhash = Hash::new_from_array([7u8; 32]);
         let fee_payer = pk(0xFE);
 
         let tx = build_distribute_tx(&record, &blockhash, &fee_payer)
-            .expect("distribute tx builds (size warning fires)");
+            .expect("distribute tx builds at MAX_SPLITS");
         let bytes = bincode::serialize(&tx).expect("serialize");
         assert!(
-            bytes.len() > MAX_TX_BYTES,
-            "distribute tx fit unexpectedly improved to {} bytes (limit {}); promote the soft-warn to a hard cap",
+            bytes.len() <= MAX_TX_BYTES,
+            "distribute tx is {} bytes, limit {}",
             bytes.len(),
             MAX_TX_BYTES,
         );

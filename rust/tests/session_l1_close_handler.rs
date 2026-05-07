@@ -2,15 +2,10 @@
 //!
 //! Close runs three back-to-back txs: idempotent ATA preflight,
 //! `settle_and_finalize` (with or without a voucher), then
-//! `distribute`. The distribute tx blows past Solana's 1232-byte
-//! packet limit because of upstream's `DistributionRecipients`
-//! shape; litesvm doesn't enforce the limit, so we can still walk
-//! the path here. Real-cluster validation is on the L2 surfpool list.
-//!
-//! TODO: upstream PR shrinking `DistributionRecipients` (lowering
-//! MAX_SPLITS from 32 to 8 or switching to `Vec<DistributionEntry>`)
-//! is in flight. Revisit this header when it merges; the L2 broadcast
-//! path opens up and this caveat goes away.
+//! `distribute`. With upstream's `Vec<DistributionEntry>` recipients,
+//! all three txs fit under Solana's 1232-byte packet limit. Litesvm
+//! exercises the same byte path here; real-cluster validation is on
+//! the L2 surfpool list.
 //!
 //! Both close paths are covered: lock-settled (no voucher, just
 //! tombstones the existing on-chain `settled` watermark) and
@@ -29,7 +24,7 @@ use ed25519_dalek::{Signer as DalekSigner, SigningKey};
 use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::OpenBuilder;
-use payment_channels_client::types::{DistributionEntry, DistributionRecipients, OpenArgs};
+use payment_channels_client::types::{DistributionEntry, OpenArgs};
 use solana_address::Address;
 use solana_message::Message;
 use solana_mpp::program::payment_channels::rpc::RpcClient as MppRpcClient;
@@ -109,25 +104,15 @@ async fn lock_settled_close_tombstones_channel_and_advances_store() {
         .to_bytes(),
     );
 
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
-        if i == 0 {
-            DistributionEntry {
-                recipient: payee,
-                bps: 10_000,
-            }
-        } else {
-            zero_entry.clone()
-        }
-    });
+    let recipients = vec![DistributionEntry {
+        recipient: payee,
+        bps: 10_000,
+    }];
     let open_args = OpenArgs {
         salt,
         deposit,
         grace_period: 60,
-        recipients: DistributionRecipients { count: 1, entries },
+        recipients,
     };
     let (event_authority_mpp, _) =
         MppPubkey::find_program_address(&[b"event_authority"], &program_id_mpp());
@@ -358,25 +343,15 @@ async fn apply_voucher_close_tombstones_channel_and_advances_store() {
         .to_bytes(),
     );
 
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
-        if i == 0 {
-            DistributionEntry {
-                recipient: payee,
-                bps: 10_000,
-            }
-        } else {
-            zero_entry.clone()
-        }
-    });
+    let recipients = vec![DistributionEntry {
+        recipient: payee,
+        bps: 10_000,
+    }];
     let open_args = OpenArgs {
         salt,
         deposit,
         grace_period: 60,
-        recipients: DistributionRecipients { count: 1, entries },
+        recipients,
     };
     let (event_authority_mpp, _) =
         MppPubkey::find_program_address(&[b"event_authority"], &program_id_mpp());
@@ -649,25 +624,15 @@ async fn close_apply_voucher_rejects_with_regression_when_concurrent_voucher_adv
         .to_bytes(),
     );
 
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
-        if i == 0 {
-            DistributionEntry {
-                recipient: payee,
-                bps: 10_000,
-            }
-        } else {
-            zero_entry.clone()
-        }
-    });
+    let recipients = vec![DistributionEntry {
+        recipient: payee,
+        bps: 10_000,
+    }];
     let open_args = OpenArgs {
         salt,
         deposit,
         grace_period: 60,
-        recipients: DistributionRecipients { count: 1, entries },
+        recipients,
     };
     let (event_authority_mpp, _) =
         MppPubkey::find_program_address(&[b"event_authority"], &program_id_mpp());

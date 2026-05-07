@@ -641,11 +641,10 @@ async fn tampered_ata_mint_rejects_as_malicious() {
 
 #[tokio::test]
 async fn splits_overflow_rejects_as_malicious() {
-    // 33 split recipients exceeds upstream's 32-entry
-    // `DistributionRecipients` shape. The open handler caps splits at
-    // the boundary and surfaces MaliciousTx before any tx-shape work
-    // runs, so the silent truncation in `splits_to_recipients` cannot
-    // hide a hash divergence.
+    // 9 split recipients exceeds the SDK's `MAX_SPLITS` cap of 8. The
+    // open handler rejects at the boundary with MaliciousTx before any
+    // tx-shape work runs, so an oversize splits list cannot reach the
+    // canonical builder.
     let fixture = boot_open_fixture("test-secret-key-open-splits-overflow", 73, 1_000_000);
     let OpenFixture {
         svm,
@@ -664,11 +663,11 @@ async fn splits_overflow_rejects_as_malicious() {
     let payer_pk = to_mpp(&payer.pubkey());
     let signer_pk = to_mpp(&authorized_signer.pubkey());
 
-    // 33 distinct recipients with low bps each (total well below 10_000);
+    // 9 distinct recipients with low bps each (total well below 10_000);
     // the canonical-hash path runs after the cap so the bps total does
     // not need to balance.
-    let mut splits_typed: Vec<Split> = Vec::with_capacity(33);
-    for i in 0..33u8 {
+    let mut splits_typed: Vec<Split> = Vec::with_capacity(9);
+    for i in 0..9u8 {
         splits_typed.push(Split::Bps {
             recipient: MppPubkey::new_from_array([0xB0 ^ i; 32]),
             share_bps: 10,
@@ -708,7 +707,7 @@ async fn splits_overflow_rejects_as_malicious() {
     });
     config.realm = Some("test".into());
     config.secret_key = Some(secret_key.into());
-    // Advertise the 33-split set so the challenge-equality check passes
+    // Advertise the 9-split set so the challenge-equality check passes
     // and the cap inside `validate_open_tx_shape` is what fires.
     config.splits = splits_typed.clone();
 
@@ -726,7 +725,7 @@ async fn splits_overflow_rejects_as_malicious() {
         .await
         .expect("issue open challenge");
 
-    // Build a canonical-shaped tx for these 33 splits. The cap fires
+    // Build a canonical-shaped tx for these 9 splits. The cap fires
     // before any tx-shape work, so the tx contents are immaterial; we
     // build them anyway so the failure is unambiguously the splits cap
     // rather than a payload-parsing or wire-decode issue.
@@ -788,11 +787,11 @@ async fn splits_overflow_rejects_as_malicious() {
     let err = method
         .process_open(&payload)
         .await
-        .expect_err("33-split open must reject");
+        .expect_err("9-split open must reject");
     assert_eq!(
         err.code(),
         MppErrorCode::MaliciousTx,
-        "expected MaliciousTx for splits.len() > 32, got {err:?}"
+        "expected MaliciousTx for splits.len() > 8, got {err:?}"
     );
 
     let post = store.get(&channel_pda).await.unwrap();
