@@ -16,7 +16,9 @@ use solana_client::rpc_config::RpcAccountInfoConfig;
 use solana_client::rpc_request::RpcError as RpcRequestError;
 use solana_pubkey::Pubkey;
 
-use crate::error::{OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, SessionError};
+use crate::error::{
+    OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, RpcError, SessionError,
+};
 use crate::program::payment_channels::rpc::RpcClient;
 
 use crate::program::payment_channels::state::{ChannelView, CLOSED_CHANNEL_DISCRIMINATOR};
@@ -68,9 +70,12 @@ pub enum RecoveryOutcome {
 /// Walk every persisted record in the relevant statuses and classify
 /// each one without touching the store.
 ///
-/// Runs in parallel up to `parallelism`. The returned vec lists every
-/// record, hard failures included; the apply pass decides whether the
-/// batch surfaces or runs.
+/// Runs in parallel up to `parallelism`, but emits outcomes in the
+/// same order `list_by_status` returned them. Same store + chain
+/// state therefore yields the same outcome sequence across restarts,
+/// which keeps log diffs and postmortems reproducible. The returned
+/// vec lists every record, hard failures included; the apply pass
+/// decides whether the batch surfaces or runs.
 pub async fn inspect_all(
     store: &dyn ChannelStore,
     rpc: &dyn RpcClient,
@@ -93,7 +98,7 @@ pub async fn inspect_all(
 
     let outcomes = stream::iter(records.into_iter())
         .map(|record| inspect_one(rpc, config, record))
-        .buffer_unordered(parallelism)
+        .buffered(parallelism)
         .collect::<Vec<_>>()
         .await;
 
@@ -187,16 +192,19 @@ async fn inspect_open(
         }),
         Err(VerifyError::Rpc(e)) => RecoveryOutcome::HardFail(RecoveryFailure {
             channel_id: record.channel_id,
-            kind: RecoveryFailureKind::RpcFailure {
-                message: format!("{e:#}"),
-            },
+            kind: RecoveryFailureKind::RpcFailure(RpcError::from(e)),
         }),
-        Err(other) => RecoveryOutcome::HardFail(RecoveryFailure {
-            channel_id: record.channel_id,
-            kind: RecoveryFailureKind::RpcFailure {
-                message: format!("{other:#}"),
-            },
-        }),
+        Err(e @ VerifyError::Decode(_))
+        | Err(e @ VerifyError::UnexpectedEncoding { .. })
+        | Err(e @ VerifyError::WrongLength { .. })
+        | Err(e @ VerifyError::WrongDiscriminator { .. }) => {
+            RecoveryOutcome::HardFail(RecoveryFailure {
+                channel_id: record.channel_id,
+                kind: RecoveryFailureKind::VerifyOpenInternal {
+                    message: format!("{e:#}"),
+                },
+            })
+        }
     }
 }
 
@@ -224,9 +232,9 @@ async fn inspect_close_attempting(
                 },
             })
         }
-        Err(message) => RecoveryOutcome::HardFail(RecoveryFailure {
+        Err(err) => RecoveryOutcome::HardFail(RecoveryFailure {
             channel_id: record.channel_id,
-            kind: RecoveryFailureKind::RpcFailure { message },
+            kind: probe_error_to_kind(err),
         }),
     }
 }
@@ -263,9 +271,9 @@ async fn inspect_closing(
                 on_chain: OnChainChannelStatus::Absent,
             },
         }),
-        Err(message) => RecoveryOutcome::HardFail(RecoveryFailure {
+        Err(err) => RecoveryOutcome::HardFail(RecoveryFailure {
             channel_id: record.channel_id,
-            kind: RecoveryFailureKind::RpcFailure { message },
+            kind: probe_error_to_kind(err),
         }),
     }
 }
@@ -275,15 +283,26 @@ async fn inspect_closed_pending(
     config: &SessionConfig,
     record: ChannelRecord,
 ) -> RecoveryOutcome {
+    // `verify_finalized_or_absent` accepts an absent PDA as evidence
+    // of finalization, so an absent PDA on a record that never logged
+    // a `close_tx` is ambiguous: either the channel was closed and
+    // GC'd, or it was never created. Refuse the promotion and surface
+    // it; tombstone-only evidence can still be reconciled out-of-band
+    // via `verify_tombstoned`.
+    if record.close_tx.is_none() {
+        return RecoveryOutcome::HardFail(RecoveryFailure {
+            channel_id: record.channel_id,
+            kind: RecoveryFailureKind::MissingCloseEvidence,
+        });
+    }
+
     match verify_finalized_or_absent(rpc, config.commitment, &record.channel_id).await {
         Ok(()) => RecoveryOutcome::Finalize {
             channel_id: record.channel_id,
         },
         Err(VerifyError::Rpc(e)) => RecoveryOutcome::HardFail(RecoveryFailure {
             channel_id: record.channel_id,
-            kind: RecoveryFailureKind::RpcFailure {
-                message: format!("{e:#}"),
-            },
+            kind: RecoveryFailureKind::RpcFailure(RpcError::from(e)),
         }),
         // Anything else (mid-grace Closing, wrong discriminator byte,
         // weird encoding) means the chain hasn't confirmed finalization
@@ -399,16 +418,23 @@ pub async fn apply_outcomes(
     Ok(())
 }
 
-/// Fetch the channel PDA and classify it. RPC errors come back as the
-/// formatted string the recovery layer stuffs into `RpcFailure`. Mirrors
-/// `tombstone_probe` from `verify.rs` but covers both live shapes (the
-/// status byte off a decoded `ChannelView`) and the tombstoned/absent
-/// terminals.
+/// Why `probe_chain_status` couldn't classify the PDA. Splitting RPC
+/// failures off decode / encoding failures lets the inspect callers
+/// route each onto its own `RecoveryFailureKind` instead of collapsing
+/// both onto `RpcFailure`.
+enum ProbeError {
+    Rpc(RpcError),
+    Internal(String),
+}
+
+/// Fetch the channel PDA and classify it. Mirrors `tombstone_probe` in
+/// `verify.rs` but covers both live shapes (the status byte off a
+/// decoded `ChannelView`) and the tombstoned / absent terminals.
 async fn probe_chain_status(
     rpc: &dyn RpcClient,
     config: &SessionConfig,
     channel_id: &Pubkey,
-) -> Result<OnChainChannelStatus, String> {
+) -> Result<OnChainChannelStatus, ProbeError> {
     let info = RpcAccountInfoConfig {
         encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
         commitment: Some(config.commitment),
@@ -422,7 +448,7 @@ async fn probe_chain_status(
             if is_account_not_found(&e) {
                 return Ok(OnChainChannelStatus::Absent);
             }
-            return Err(format!("{e:#}"));
+            return Err(ProbeError::Rpc(RpcError::from(e)));
         }
     };
 
@@ -432,32 +458,51 @@ async fn probe_chain_status(
 
     let data = match ui_account.data.decode() {
         Some(d) => d,
-        None => return Err(format!("unexpected RPC encoding for channel {channel_id}")),
+        None => {
+            return Err(ProbeError::Internal(format!(
+                "unexpected RPC encoding for channel {channel_id}"
+            )))
+        }
     };
 
     if data.len() == 1 {
         return if data[0] == CLOSED_CHANNEL_DISCRIMINATOR {
             Ok(OnChainChannelStatus::Tombstoned)
         } else {
-            Err(format!(
+            Err(ProbeError::Internal(format!(
                 "channel {channel_id}: tombstone-length payload with wrong discriminator byte {}",
                 data[0]
-            ))
+            )))
         };
     }
 
     let view = match ChannelView::from_account_data(&data) {
         Ok(v) => v,
-        Err(e) => return Err(format!("channel {channel_id}: decode failed: {e}")),
+        Err(e) => {
+            return Err(ProbeError::Internal(format!(
+                "channel {channel_id}: decode failed: {e}"
+            )))
+        }
     };
 
     match view.status() {
         s if s == OnChainStatus::Open as u8 => Ok(OnChainChannelStatus::Open),
         s if s == OnChainStatus::Closing as u8 => Ok(OnChainChannelStatus::Closing),
         s if s == OnChainStatus::Finalized as u8 => Ok(OnChainChannelStatus::Finalized),
-        other => Err(format!(
+        other => Err(ProbeError::Internal(format!(
             "channel {channel_id}: unrecognised status byte {other}"
-        )),
+        ))),
+    }
+}
+
+/// Fold a `ProbeError` onto the typed recovery failure kinds. RPC
+/// errors keep the typed `RpcError` payload; structural failures land
+/// on `VerifyOpenInternal` so transport outages stay distinguishable
+/// from decode / encoding bugs.
+fn probe_error_to_kind(err: ProbeError) -> RecoveryFailureKind {
+    match err {
+        ProbeError::Rpc(e) => RecoveryFailureKind::RpcFailure(e),
+        ProbeError::Internal(message) => RecoveryFailureKind::VerifyOpenInternal { message },
     }
 }
 
@@ -768,6 +813,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inspect_closed_pending_without_close_tx_hard_fails_with_missing_close_evidence() {
+        let cid = pk(0x61);
+        let mut record = base_record(cid, ChannelStatus::ClosedPending);
+        record.close_tx = None;
+        let rpc = mock_rpc_succeeds();
+
+        let outcome = inspect_one(rpc.as_ref(), &base_config(), record).await;
+        match outcome {
+            RecoveryOutcome::HardFail(RecoveryFailure {
+                channel_id,
+                kind: RecoveryFailureKind::MissingCloseEvidence,
+            }) => assert_eq!(channel_id, cid),
+            other => panic!("expected MissingCloseEvidence HardFail, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_pending_without_close_tx_does_not_promote_to_finalized() {
+        let cid = pk(0x62);
+        let store = InMemoryChannelStore::new();
+        let mut record = base_record(cid, ChannelStatus::Open);
+        store.insert(record.clone()).await.unwrap();
+        // `mark_closed_pending` insists on a signature, so feed it a
+        // placeholder and then clear `close_tx` back to None on the
+        // record under test. Mimics a corrupted store rather than the
+        // documented happy path.
+        store.mark_close_attempting(&cid).await.unwrap();
+        let placeholder_sig = solana_signature::Signature::default();
+        store
+            .mark_closed_pending(&cid, placeholder_sig)
+            .await
+            .unwrap();
+        record.status = ChannelStatus::ClosedPending;
+        record.close_tx = None;
+
+        let rpc = mock_rpc_failing();
+        let method = build_test_method(&store, &rpc);
+
+        let err = apply_outcomes(
+            vec![RecoveryOutcome::HardFail(RecoveryFailure {
+                channel_id: cid,
+                kind: RecoveryFailureKind::MissingCloseEvidence,
+            })],
+            &store,
+            &rpc,
+            &method,
+            false,
+        )
+        .await
+        .expect_err("missing close evidence must surface");
+
+        match err {
+            SessionError::RecoveryBatchFailed { failures } => {
+                assert_eq!(failures.len(), 1);
+                assert!(matches!(
+                    failures[0].kind,
+                    RecoveryFailureKind::MissingCloseEvidence
+                ));
+            }
+            other => panic!("expected RecoveryBatchFailed, got {other:?}"),
+        }
+
+        let post = store.get(&cid).await.unwrap().expect("record retained");
+        assert_eq!(post.status, ChannelStatus::ClosedPending);
+    }
+
+    #[tokio::test]
+    async fn inspect_open_against_account_not_found_carries_typed_drop_orphan_only() {
+        // Guards against accidentally collapsing every VerifyError
+        // onto RpcFailure: an Open record against an absent PDA must
+        // still surface as DropOrphan.
+        let cid = pk(0x63);
+        let record = base_record(cid, ChannelStatus::Open);
+        let rpc = mock_rpc_succeeds();
+        let outcome = inspect_one(rpc.as_ref(), &base_config(), record).await;
+        assert!(
+            matches!(outcome, RecoveryOutcome::DropOrphan { channel_id } if channel_id == cid),
+            "expected DropOrphan, got {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_failure_kind_carries_typed_rpc_error_payload() {
+        let kind = RecoveryFailureKind::RpcFailure(RpcError::from_message("connection reset"));
+        let rendered = format!("{kind}");
+        assert!(
+            rendered.contains("connection reset"),
+            "Display should include RpcError message; got {rendered}"
+        );
+        match kind {
+            RecoveryFailureKind::RpcFailure(e) => {
+                assert_eq!(e.message(), "connection reset");
+            }
+            other => panic!("expected RpcFailure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_all_yields_outcomes_in_list_by_status_order_across_runs() {
+        // `buffered(parallelism)` preserves submit order; drifting
+        // back to `buffer_unordered` would let apply order depend on
+        // RPC race outcomes and break log-diff reproducibility.
+        let store = InMemoryChannelStore::new();
+        let cids = [pk(0x71), pk(0x72), pk(0x73)];
+        for cid in cids {
+            store.insert(base_record(cid, ChannelStatus::Open)).await.unwrap();
+        }
+        let rpc = mock_rpc_failing();
+        let config = base_config();
+
+        let first = inspect_all(&store, rpc.as_ref(), &config, 4)
+            .await
+            .expect("first inspect");
+        let second = inspect_all(&store, rpc.as_ref(), &config, 4)
+            .await
+            .expect("second inspect");
+
+        let project = |outcomes: &[RecoveryOutcome]| -> Vec<Pubkey> {
+            outcomes
+                .iter()
+                .map(|o| match o {
+                    RecoveryOutcome::Resume { record } => record.channel_id,
+                    RecoveryOutcome::DropOrphan { channel_id } => *channel_id,
+                    RecoveryOutcome::Rollback { channel_id } => *channel_id,
+                    RecoveryOutcome::RollbackFromClosing { channel_id } => *channel_id,
+                    RecoveryOutcome::RetryClose { record } => record.channel_id,
+                    RecoveryOutcome::TransitionToClosing { channel_id } => *channel_id,
+                    RecoveryOutcome::Finalize { channel_id } => *channel_id,
+                    RecoveryOutcome::HardFail(f) => f.channel_id,
+                    RecoveryOutcome::NoOp { channel_id } => *channel_id,
+                })
+                .collect()
+        };
+
+        assert_eq!(first.len(), cids.len());
+        assert_eq!(
+            project(&first),
+            project(&second),
+            "buffered preserves list_by_status order across runs",
+        );
+    }
+
+    #[tokio::test]
     async fn apply_hard_fail_without_allow_unsettled_returns_recovery_batch_failed() {
         // Two failures in one batch surface as a single
         // RecoveryBatchFailed enumerating both.
@@ -784,9 +972,7 @@ mod tests {
             }),
             RecoveryOutcome::HardFail(RecoveryFailure {
                 channel_id: cid_b,
-                kind: RecoveryFailureKind::RpcFailure {
-                    message: "fetch failed".into(),
-                },
+                kind: RecoveryFailureKind::RpcFailure(RpcError::from_message("fetch failed")),
             }),
         ];
         let err = apply_outcomes(outcomes, &store, &rpc, &method, false)
@@ -841,9 +1027,7 @@ mod tests {
             }),
             RecoveryOutcome::HardFail(RecoveryFailure {
                 channel_id: pk(0x42),
-                kind: RecoveryFailureKind::RpcFailure {
-                    message: "boom".into(),
-                },
+                kind: RecoveryFailureKind::RpcFailure(RpcError::from_message("boom")),
             }),
         ];
         let err = apply_outcomes(outcomes, &store, &rpc, &method, true)
@@ -868,9 +1052,7 @@ mod tests {
             RecoveryOutcome::DropOrphan { channel_id: cid },
             RecoveryOutcome::HardFail(RecoveryFailure {
                 channel_id: pk(0x52),
-                kind: RecoveryFailureKind::RpcFailure {
-                    message: "abort".into(),
-                },
+                kind: RecoveryFailureKind::RpcFailure(RpcError::from_message("abort")),
             }),
         ];
         let err = apply_outcomes(outcomes, &store, &rpc, &method, false)

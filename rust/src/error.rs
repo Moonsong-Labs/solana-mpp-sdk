@@ -106,6 +106,14 @@ impl RpcError {
     pub fn message(&self) -> &str {
         &self.0
     }
+
+    /// Synthesise an `RpcError` from a literal message. Production
+    /// code goes through the `ClientError` `From` impl; this exists
+    /// for unit tests that need to fabricate a recovery failure.
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn from_message(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
 }
 
 impl From<solana_client::client_error::ClientError> for RpcError {
@@ -131,26 +139,17 @@ pub enum OnChainChannelStatus {
     Absent,
 }
 
-/// Typed reason a single channel failed recovery.
-///
-/// Covers the four shapes the inspect phase produces: unsettled
-/// revenue lying around at startup, an RPC fetch that failed, stored
-/// status disagreeing with on-chain in a way we can't reconcile, or a
-/// `verify_open` field check failing during inspection.
+/// Typed reason a single channel failed recovery. Operators branch on
+/// the variant; the wrapped fields carry whatever context the inspect
+/// phase had at the failure site.
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum RecoveryFailureKind {
     #[error("unsettled revenue on startup ({unsettled} units)")]
     UnsettledRevenue { unsettled: u64 },
 
-    #[error("rpc failure: {message}")]
-    RpcFailure {
-        // Stringified so the recovery surface stays version-agnostic.
-        // Field is `message` rather than `source` because thiserror would
-        // otherwise treat a `source` field as a source-chain link and
-        // require `std::error::Error`.
-        message: String,
-    },
+    #[error("rpc failure: {0}")]
+    RpcFailure(#[source] RpcError),
 
     #[error("state inversion: stored {stored:?}, on-chain {on_chain:?}")]
     StateInversion {
@@ -160,6 +159,23 @@ pub enum RecoveryFailureKind {
 
     #[error("verify_open mismatch on field {field}")]
     VerifyOpenMismatch { field: &'static str },
+
+    /// `verify_open` returned a non-RPC failure during inspection: a
+    /// decode error, unexpected RPC encoding, wrong account length, or
+    /// wrong discriminator. Distinct from `RpcFailure` so operators can
+    /// tell a transport outage apart from a structural mismatch in the
+    /// PDA data.
+    #[error("verify_open internal failure: {message}")]
+    VerifyOpenInternal { message: String },
+
+    /// `ClosedPending` record with no recorded `close_tx`. Without that
+    /// evidence, `verify_finalized_or_absent` can't tell a finalized
+    /// channel apart from one that never existed, so recovery refuses
+    /// to promote it to `ClosedFinalized`.
+    #[error(
+        "ClosedPending record without close_tx evidence; cannot distinguish finalized from never-existed"
+    )]
+    MissingCloseEvidence,
 }
 
 /// One channel's failure inside `RecoveryBatchFailed`.

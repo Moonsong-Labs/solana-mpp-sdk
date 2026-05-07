@@ -27,7 +27,8 @@ use solana_mpp::program::payment_channels::rpc::RpcClient as MppRpcClient;
 use solana_mpp::program::payment_channels::state::find_channel_pda;
 use solana_mpp::server::session::{session, Network, Pricing, SessionConfig};
 use solana_mpp::{
-    ChannelRecord, ChannelStatus, ChannelStore, InMemoryChannelStore, SessionError,
+    ChannelRecord, ChannelStatus, ChannelStore, InMemoryChannelStore, RecoveryFailureKind,
+    SessionError,
 };
 use solana_pubkey::Pubkey as MppPubkey;
 use solana_pubkey_v2::Pubkey as AtaPubkey;
@@ -377,4 +378,91 @@ async fn recover_hard_fails_when_record_has_unsettled_revenue_against_a_tombston
 
 fn record_matching_for(fixture: &OpenedFixture) -> ChannelRecord {
     record_matching(fixture)
+}
+
+#[tokio::test]
+async fn recover_hard_fails_when_closed_pending_record_lacks_close_tx_evidence() {
+    // Clean SVM (no open channel) plus a `ClosedPending` record with
+    // `close_tx = None` and an absent PDA. Without `close_tx` evidence
+    // recovery cannot tell finalized-and-GC'd apart from never-existed,
+    // so the gate must refuse to promote to `ClosedFinalized`.
+    let mut svm = LiteSVM::new();
+    svm.add_program_from_file(program_id_address(), program_so_path())
+        .expect("load program binary");
+
+    let payer = MppPubkey::new_from_array([0x55u8; 32]);
+    let payee = MppPubkey::new_from_array([0x66u8; 32]);
+    let mint = MppPubkey::new_from_array([0x77u8; 32]);
+    let authorized_signer = MppPubkey::new_from_array([0x88u8; 32]);
+    let salt: u64 = 99;
+    let (channel_pda, _) = find_channel_pda(
+        &payer,
+        &payee,
+        &mint,
+        &authorized_signer,
+        salt,
+        &program_id_mpp(),
+    );
+
+    let record = ChannelRecord {
+        channel_id: channel_pda,
+        payer,
+        payee,
+        mint,
+        salt,
+        program_id: program_id_mpp(),
+        authorized_signer,
+        deposit: 500_000,
+        accepted_cumulative: 0,
+        on_chain_settled: 0,
+        last_voucher: None,
+        close_tx: None,
+        status: ChannelStatus::ClosedPending,
+        splits: vec![],
+    };
+
+    let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
+    store.insert(record.clone()).await.unwrap();
+
+    let rpc: Arc<dyn MppRpcClient> = Arc::new(LiteSvmClient::new(svm));
+
+    let mut config = SessionConfig::new_with_defaults(
+        MppPubkey::new_from_array([0xaau8; 32]),
+        payee,
+        mint,
+        6,
+        Network::Localnet,
+        program_id_mpp(),
+        Pricing {
+            amount_per_unit: 1_000,
+            unit_type: "request".into(),
+        },
+    );
+    config.min_deposit = 1;
+    config.max_deposit = 10_000_000;
+    config.realm = Some("test".into());
+    config.secret_key = Some("test-secret-key-recover-missing-evidence".into());
+
+    let err = session(config)
+        .with_store(store.clone())
+        .with_rpc(rpc)
+        .recover()
+        .await
+        .expect_err("missing close_tx evidence must hard-fail recover");
+
+    match err {
+        SessionError::RecoveryBatchFailed { failures } => {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].channel_id, channel_pda);
+            assert!(
+                matches!(failures[0].kind, RecoveryFailureKind::MissingCloseEvidence),
+                "expected MissingCloseEvidence, got {:?}",
+                failures[0].kind
+            );
+        }
+        other => panic!("expected RecoveryBatchFailed, got {other:?}"),
+    }
+
+    let post = store.get(&channel_pda).await.unwrap().expect("record retained");
+    assert_eq!(post.status, ChannelStatus::ClosedPending);
 }
