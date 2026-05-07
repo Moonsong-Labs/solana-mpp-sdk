@@ -663,6 +663,10 @@ pub enum ClientError {
     #[error("protocol violation: {0}")]
     ProtocolViolation(String),
 
+    // loser branch in single-flight registry; caller should retry
+    #[error("session open contended: another caller's open attempt failed; retry to claim the slot")]
+    SessionOpenContended,
+
     #[error("policy violation: {0:?}")]
     PolicyViolation(PolicyErrorCode),
 

@@ -3,8 +3,10 @@
 
 mod active_session;
 mod receipt;
+pub mod registry;
 pub mod session_client;
 
 pub use active_session::ActiveSession;
 pub use receipt::SessionReceipt;
+pub use registry::{OpenedChannel, SessionCell, SessionRegistry};
 pub use session_client::{OpenTxBuild, SessionClient};
