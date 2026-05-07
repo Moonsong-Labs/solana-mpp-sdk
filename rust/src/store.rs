@@ -1,11 +1,538 @@
-//! Pluggable key-value store for replay protection and channel state.
+//! Per-channel server-side state.
 //!
-//! Modeled after the mpp-rs Store interface.
+//! `ChannelStore` holds what the server knows about each open channel:
+//! who's paying, the deposit, the watermark of vouchers we've accepted,
+//! and the on-chain settled value once a close confirms.
+//!
+//! `advance_watermark` is the only piece that has to be atomic. Two
+//! concurrent vouchers at the same cumulative both call it; one wins
+//! (`Advanced`), the others get `Conflict` with the winner's cached
+//! receipt, so the loser hands back the exact bytes the network saw
+//! instead of re-deriving them. The winner's `last_voucher`, signature,
+//! and receipt all land alongside the watermark inside one critical
+//! section, so close can read `last_voucher` against any
+//! `accepted_cumulative` the store has committed without a torn read.
+//!
+//! `InMemoryChannelStore` is for tests and single-process demos.
+//! Production wants TTLs, persistence, and a real CAS.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use solana_pubkey::Pubkey;
+use solana_signature::Signature;
+use tokio::sync::RwLock;
+
+use crate::protocol::intents::session::{SignedVoucher, Split};
+
+// ── Status, record, outcome, error ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelStatus {
+    Open,
+    CloseAttempting,
+    Closing,
+    ClosedPending,
+    ClosedFinalized,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelRecord {
+    pub channel_id: Pubkey,
+    pub payer: Pubkey,
+    pub payee: Pubkey,
+    pub mint: Pubkey,
+    pub salt: u64,
+    pub program_id: Pubkey,
+    pub authorized_signer: Pubkey,
+    pub deposit: u64,
+    pub accepted_cumulative: u64,
+    pub on_chain_settled: u64,
+    pub last_voucher: Option<SignedVoucher>,
+    pub close_tx: Option<Signature>,
+    pub status: ChannelStatus,
+    pub splits: Vec<Split>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AdvanceOutcome {
+    Advanced {
+        prior: u64,
+    },
+    Conflict {
+        current: u64,
+        winner_signature: [u8; 64],
+        winner_receipt: Vec<u8>,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("channel {0} not found")]
+    NotFound(Pubkey),
+
+    #[error("channel {0} already exists")]
+    AlreadyExists(Pubkey),
+
+    #[error("illegal status transition for channel {channel_id}: {from:?} -> {to:?}")]
+    IllegalTransition {
+        channel_id: Pubkey,
+        from: ChannelStatus,
+        to: ChannelStatus,
+    },
+
+    #[error("store request timed out")]
+    Timeout,
+
+    #[error("store connection lost")]
+    ConnectionLost,
+
+    #[error("serialization error: {0}")]
+    Serialization(String),
+
+    #[error("CAS invariant broken: {detail}")]
+    CasInvariantBroken { detail: String },
+
+    #[error("{0}")]
+    Other(String),
+}
+
+// ── Trait ──────────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait ChannelStore: Send + Sync {
+    async fn get(&self, channel_id: &Pubkey) -> Result<Option<ChannelRecord>, StoreError>;
+
+    async fn insert(&self, record: ChannelRecord) -> Result<(), StoreError>;
+
+    /// Advance the accepted watermark from `expected` to `new` atomically.
+    ///
+    /// `accepted_cumulative`, `last_voucher`, and the replay-cache
+    /// entry are written together inside one critical section. The
+    /// winner-only inputs (`winner_last_voucher`, `winner_signature`,
+    /// `winner_receipt_bytes`) land iff the call advances the
+    /// watermark; on conflict they are dropped and the existing
+    /// winner's cached entry comes back instead.
+    ///
+    /// Outcomes:
+    /// - `Advanced { prior }`: this caller won; `last_voucher`,
+    ///   signature, and receipt bytes are persisted.
+    /// - `Conflict { current, winner_signature, winner_receipt }`: a
+    ///   concurrent caller already committed at `current`, and two
+    ///   callers at the same cumulative see byte-identical responses.
+    async fn advance_watermark(
+        &self,
+        channel_id: &Pubkey,
+        expected: u64,
+        new: u64,
+        winner_last_voucher: SignedVoucher,
+        winner_signature: [u8; 64],
+        winner_receipt_bytes: Vec<u8>,
+    ) -> Result<AdvanceOutcome, StoreError>;
+
+    async fn record_deposit(
+        &self,
+        channel_id: &Pubkey,
+        new_deposit: u64,
+    ) -> Result<(), StoreError>;
+
+    async fn record_on_chain_settled(
+        &self,
+        channel_id: &Pubkey,
+        settled: u64,
+    ) -> Result<(), StoreError>;
+
+    async fn record_last_voucher(
+        &self,
+        channel_id: &Pubkey,
+        voucher: SignedVoucher,
+    ) -> Result<(), StoreError>;
+
+    async fn record_close_signature(
+        &self,
+        channel_id: &Pubkey,
+        sig: Signature,
+    ) -> Result<(), StoreError>;
+
+    // Status mutators. One forward edge per call; self-edges other than
+    // `ClosedFinalized -> ClosedFinalized` come back as
+    // `IllegalTransition`. The finalized self-edge is there so a repeated
+    // commitment poll is a no-op. If a flow needs to re-enter a close
+    // mutator (fork rollback, etc.), bookkeep that at the call-site
+    // rather than widening this trait.
+    async fn mark_close_attempting(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
+
+    async fn mark_close_rollback(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
+
+    /// Recovery-only rollback from `Closing` to `Open`. Inspect calls
+    /// this when it sees a `Closing` store record against an on-chain
+    /// `Open` channel (probable fork rollback of `request_close`).
+    /// Kept separate from `mark_close_rollback` so the regular close
+    /// path can't widen its rollback scope by accident.
+    async fn mark_recovery_rollback_from_closing(
+        &self,
+        channel_id: &Pubkey,
+    ) -> Result<(), StoreError>;
+
+    async fn mark_closing(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
+
+    async fn mark_closed_pending(
+        &self,
+        channel_id: &Pubkey,
+        tx: Signature,
+    ) -> Result<(), StoreError>;
+
+    async fn mark_closed_finalized(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
+
+    async fn list_by_status(
+        &self,
+        statuses: &[ChannelStatus],
+    ) -> Result<Vec<ChannelRecord>, StoreError>;
+
+    async fn delete(&self, channel_id: &Pubkey) -> Result<(), StoreError>;
+
+    async fn voucher_cache_insert(
+        &self,
+        channel_id: &Pubkey,
+        cumulative: u64,
+        signature: [u8; 64],
+        receipt_bytes: Vec<u8>,
+    ) -> Result<(), StoreError>;
+
+    async fn voucher_cache_lookup(
+        &self,
+        channel_id: &Pubkey,
+        cumulative: u64,
+    ) -> Result<Option<(Vec<u8>, [u8; 64])>, StoreError>;
+}
+
+// ── In-memory implementation ───────────────────────────────────────────────
+
+/// In-memory `ChannelStore` for tests and single-process demos.
+///
+/// Not production-grade. The voucher cache and records map grow
+/// unboundedly, closed records stick around until you `delete` them,
+/// and nothing gets persisted. A production backend needs TTL + LRU
+/// on the voucher cache and a retention policy on closed records.
+pub struct InMemoryChannelStore {
+    inner: Arc<RwLock<InMemoryInner>>,
+}
+
+struct InMemoryInner {
+    records: HashMap<Pubkey, ChannelRecord>,
+    /// Replay cache keyed by `(channel_id, cumulative)`. Value is
+    /// `(receipt_bytes, signature)`; CAS losers hand the cached
+    /// receipt back to their client unchanged.
+    voucher_cache: HashMap<(Pubkey, u64), (Vec<u8>, [u8; 64])>,
+}
+
+impl Default for InMemoryChannelStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InMemoryChannelStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InMemoryInner {
+                records: HashMap::new(),
+                voucher_cache: HashMap::new(),
+            })),
+        }
+    }
+}
+
+fn check_transition(
+    channel_id: Pubkey,
+    from: ChannelStatus,
+    to: ChannelStatus,
+) -> Result<(), StoreError> {
+    use ChannelStatus::*;
+    let ok = matches!(
+        (from, to),
+        // forward edges
+        (Open, CloseAttempting)
+            | (Open, Closing)
+            | (Open, ClosedPending)
+            // Recovery edge: Open jumps straight to Finalized when
+            // inspect finds the chain tombstoned with settled revenue
+            // and no unsettled delta. The channel closed cleanly
+            // without ever passing through CloseAttempting in this
+            // server's store.
+            | (Open, ClosedFinalized)
+            | (CloseAttempting, ClosedPending)
+            | (CloseAttempting, Open)
+            // Recovery edge: CloseAttempting / Closing without a
+            // recorded close_tx jumps straight to Finalized on a
+            // tombstoned chain rather than fabricating a placeholder
+            // signature in the ClosedPending intermediate.
+            | (CloseAttempting, ClosedFinalized)
+            | (Closing, ClosedPending)
+            | (Closing, ClosedFinalized)
+            | (ClosedPending, ClosedFinalized)
+            | (ClosedFinalized, ClosedFinalized)
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(StoreError::IllegalTransition {
+            channel_id,
+            from,
+            to,
+        })
+    }
+}
+
+#[async_trait]
+impl ChannelStore for InMemoryChannelStore {
+    async fn get(&self, channel_id: &Pubkey) -> Result<Option<ChannelRecord>, StoreError> {
+        Ok(self.inner.read().await.records.get(channel_id).cloned())
+    }
+
+    async fn insert(&self, record: ChannelRecord) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        if g.records.contains_key(&record.channel_id) {
+            return Err(StoreError::AlreadyExists(record.channel_id));
+        }
+        g.records.insert(record.channel_id, record);
+        Ok(())
+    }
+
+    async fn advance_watermark(
+        &self,
+        channel_id: &Pubkey,
+        expected: u64,
+        new: u64,
+        winner_last_voucher: SignedVoucher,
+        winner_signature: [u8; 64],
+        winner_receipt_bytes: Vec<u8>,
+    ) -> Result<AdvanceOutcome, StoreError> {
+        let mut g = self.inner.write().await;
+        let record = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        if record.accepted_cumulative == expected && new > expected {
+            let prior = record.accepted_cumulative;
+            record.accepted_cumulative = new;
+            record.last_voucher = Some(winner_last_voucher);
+            g.voucher_cache
+                .insert((*channel_id, new), (winner_receipt_bytes, winner_signature));
+            return Ok(AdvanceOutcome::Advanced { prior });
+        }
+        let current = record.accepted_cumulative;
+        let cache_key = (*channel_id, current);
+        match g.voucher_cache.get(&cache_key).cloned() {
+            Some((receipt, sig)) => Ok(AdvanceOutcome::Conflict {
+                current,
+                winner_signature: sig,
+                winner_receipt: receipt,
+            }),
+            None => Err(StoreError::CasInvariantBroken {
+                detail: format!(
+                    "cas conflict at cumulative {current} but winner receipt not cached"
+                ),
+            }),
+        }
+    }
+
+    async fn record_deposit(
+        &self,
+        channel_id: &Pubkey,
+        new_deposit: u64,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        r.deposit = new_deposit;
+        Ok(())
+    }
+
+    async fn record_on_chain_settled(
+        &self,
+        channel_id: &Pubkey,
+        settled: u64,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        r.on_chain_settled = settled;
+        Ok(())
+    }
+
+    async fn record_last_voucher(
+        &self,
+        channel_id: &Pubkey,
+        voucher: SignedVoucher,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        r.last_voucher = Some(voucher);
+        Ok(())
+    }
+
+    async fn record_close_signature(
+        &self,
+        channel_id: &Pubkey,
+        sig: Signature,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        r.close_tx = Some(sig);
+        Ok(())
+    }
+
+    async fn mark_close_attempting(&self, channel_id: &Pubkey) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        check_transition(*channel_id, r.status, ChannelStatus::CloseAttempting)?;
+        r.status = ChannelStatus::CloseAttempting;
+        Ok(())
+    }
+
+    async fn mark_close_rollback(&self, channel_id: &Pubkey) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        check_transition(*channel_id, r.status, ChannelStatus::Open)?;
+        r.status = ChannelStatus::Open;
+        Ok(())
+    }
+
+    async fn mark_recovery_rollback_from_closing(
+        &self,
+        channel_id: &Pubkey,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        match r.status {
+            ChannelStatus::Closing => {
+                r.status = ChannelStatus::Open;
+                Ok(())
+            }
+            // Already rolled back by an earlier recovery pass; no-op
+            // rather than the misleading `Open -> Open` IllegalTransition.
+            ChannelStatus::Open => Ok(()),
+            other => Err(StoreError::IllegalTransition {
+                channel_id: *channel_id,
+                from: other,
+                to: ChannelStatus::Open,
+            }),
+        }
+    }
+
+    async fn mark_closing(&self, channel_id: &Pubkey) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        check_transition(*channel_id, r.status, ChannelStatus::Closing)?;
+        r.status = ChannelStatus::Closing;
+        Ok(())
+    }
+
+    async fn mark_closed_pending(
+        &self,
+        channel_id: &Pubkey,
+        tx: Signature,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        check_transition(*channel_id, r.status, ChannelStatus::ClosedPending)?;
+        r.status = ChannelStatus::ClosedPending;
+        r.close_tx = Some(tx);
+        Ok(())
+    }
+
+    async fn mark_closed_finalized(&self, channel_id: &Pubkey) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        let r = g
+            .records
+            .get_mut(channel_id)
+            .ok_or(StoreError::NotFound(*channel_id))?;
+        check_transition(*channel_id, r.status, ChannelStatus::ClosedFinalized)?;
+        r.status = ChannelStatus::ClosedFinalized;
+        Ok(())
+    }
+
+    async fn list_by_status(
+        &self,
+        statuses: &[ChannelStatus],
+    ) -> Result<Vec<ChannelRecord>, StoreError> {
+        let g = self.inner.read().await;
+        Ok(g.records
+            .values()
+            .filter(|r| statuses.contains(&r.status))
+            .cloned()
+            .collect())
+    }
+
+    async fn delete(&self, channel_id: &Pubkey) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        if g.records.remove(channel_id).is_none() {
+            return Err(StoreError::NotFound(*channel_id));
+        }
+        Ok(())
+    }
+
+    async fn voucher_cache_insert(
+        &self,
+        channel_id: &Pubkey,
+        cumulative: u64,
+        signature: [u8; 64],
+        receipt_bytes: Vec<u8>,
+    ) -> Result<(), StoreError> {
+        let mut g = self.inner.write().await;
+        g.voucher_cache
+            .insert((*channel_id, cumulative), (receipt_bytes, signature));
+        Ok(())
+    }
+
+    async fn voucher_cache_lookup(
+        &self,
+        channel_id: &Pubkey,
+        cumulative: u64,
+    ) -> Result<Option<(Vec<u8>, [u8; 64])>, StoreError> {
+        let g = self.inner.read().await;
+        Ok(g.voucher_cache.get(&(*channel_id, cumulative)).cloned())
+    }
+}
+
+// ── Generic KV store (charge intent replay protection) ──
+//
+// Charge stores `(signature, status)` pairs to reject double-spends of
+// the same on-chain signature. An opaque JSON blob keyed by string is
+// the right shape for that, and it's deliberately separate from the
+// session intent's typed `ChannelStore`: different problems, no
+// migration planned.
 
 use std::future::Future;
 use std::pin::Pin;
 
-/// Async key-value store interface.
 pub trait Store: Send + Sync {
     fn get(
         &self,
@@ -23,8 +550,8 @@ pub trait Store: Send + Sync {
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
 
-    /// Atomically insert a value only if the key does not already exist.
-    /// Returns `true` if the value was inserted, `false` if the key was already present.
+    /// Insert only if the key isn't already there. Returns `true` on
+    /// insert, `false` on collision.
     fn put_if_absent(
         &self,
         key: &str,
@@ -32,15 +559,6 @@ pub trait Store: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>>;
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    #[error("Store error: {0}")]
-    Internal(String),
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-}
-
-/// In-memory store backed by a HashMap.
 pub struct MemoryStore {
     data: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
@@ -65,7 +583,7 @@ impl Store for MemoryStore {
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StoreError>> + Send + '_>>
     {
-        let result = self.data.lock().unwrap().get(key).cloned();
+        let result = self.data.lock().expect("store lock poisoned").get(key).cloned();
         Box::pin(async move {
             match result {
                 Some(raw) => {
@@ -88,7 +606,7 @@ impl Store for MemoryStore {
             serde_json::to_string(&value).map_err(|e| StoreError::Serialization(e.to_string()));
         Box::pin(async move {
             let serialized = serialized?;
-            self.data.lock().unwrap().insert(key, serialized);
+            self.data.lock().expect("store lock poisoned").insert(key, serialized);
             Ok(())
         })
     }
@@ -97,7 +615,7 @@ impl Store for MemoryStore {
         &self,
         key: &str,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        self.data.lock().unwrap().remove(key);
+        self.data.lock().expect("store lock poisoned").remove(key);
         Box::pin(async { Ok(()) })
     }
 
@@ -112,7 +630,7 @@ impl Store for MemoryStore {
         Box::pin(async move {
             let serialized = serialized?;
             use std::collections::hash_map::Entry;
-            let mut data = self.data.lock().unwrap();
+            let mut data = self.data.lock().expect("store lock poisoned");
             match data.entry(key) {
                 Entry::Occupied(_) => Ok(false),
                 Entry::Vacant(e) => {
@@ -124,475 +642,771 @@ impl Store for MemoryStore {
     }
 }
 
-// ── Channel store ──
-
-/// Persisted state of a payment channel, managed by the server.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChannelState {
-    /// On-chain channel address (base58).
-    ///
-    /// - Push sessions: Fiber channel address.
-    /// - Pull sessions: FixedDelegation PDA address.
-    pub channel_id: String,
-
-    /// Public key authorized to sign vouchers for this session (base58).
-    pub authorized_signer: String,
-
-    /// Total deposit / approved amount locked for this session (base units).
-    pub deposit: u64,
-
-    /// Highest cumulative amount accepted by the server (settled watermark).
-    pub cumulative: u64,
-
-    /// True once the channel has been finalized on-chain.
-    pub finalized: bool,
-
-    /// Signature of the highest accepted voucher (base64url).
-    /// Stored for idempotent replay detection.
-    pub highest_voucher_signature: Option<String>,
-
-    /// Unix timestamp (seconds) when cooperative close was requested.
-    /// Once set, no further vouchers are accepted.
-    pub close_requested_at: Option<u64>,
-
-    /// Pull-mode only: the client's wallet pubkey (base58).
-    ///
-    /// `Some` for pull sessions (SPL delegation); `None` for push sessions.
-    /// Stored at open time so the batch processor can derive the MultiDelegate
-    /// PDA and build `TransferFixed` instruction data at settlement.
-    pub operator: Option<String>,
-}
-
-/// Async store for channel state with compare-and-swap watermark advancement.
-///
-/// Implementations MUST guarantee that `advance_cumulative` is atomic to
-/// prevent double-spend under concurrent requests.
-pub trait ChannelStore: Send + Sync {
-    fn get_channel(
-        &self,
-        channel_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChannelState>, StoreError>> + Send + '_>>;
-
-    fn put_channel(
-        &self,
-        channel_id: &str,
-        state: ChannelState,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
-
-    /// Atomically read-modify-write channel state.
-    ///
-    /// The `updater` closure receives the current state (None if absent) and
-    /// returns the new state or an error. Implementations MUST guarantee the
-    /// entire read-modify-write is atomic — no concurrent update can interleave.
-    fn update_channel(
-        &self,
-        channel_id: &str,
-        updater: Box<dyn FnOnce(Option<ChannelState>) -> Result<ChannelState, StoreError> + Send>,
-    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>>;
-
-    /// Atomically advance the settled watermark from `expected` to `new`.
-    ///
-    /// Returns `true` if the swap succeeded (expected matched), `false` if
-    /// the watermark was already changed by a concurrent request.
-    fn advance_cumulative(
-        &self,
-        channel_id: &str,
-        expected: u64,
-        new: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>>;
-
-    /// Update the deposit cap after a top-up transaction.
-    fn update_deposit(
-        &self,
-        channel_id: &str,
-        new_deposit: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
-
-    /// Mark a channel as finalized (phase 1 close complete).
-    fn mark_finalized(
-        &self,
-        channel_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>>;
-}
-
-/// In-memory channel store backed by a Mutex.
-pub struct MemoryChannelStore {
-    data: std::sync::Mutex<std::collections::HashMap<String, ChannelState>>,
-}
-
-impl Default for MemoryChannelStore {
-    fn default() -> Self {
-        Self {
-            data: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
-impl MemoryChannelStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl ChannelStore for MemoryChannelStore {
-    fn get_channel(
-        &self,
-        channel_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ChannelState>, StoreError>> + Send + '_>> {
-        let result = self.data.lock().unwrap().get(channel_id).cloned();
-        Box::pin(async move { Ok(result) })
-    }
-
-    fn put_channel(
-        &self,
-        channel_id: &str,
-        state: ChannelState,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        self.data
-            .lock()
-            .unwrap()
-            .insert(channel_id.to_string(), state);
-        Box::pin(async { Ok(()) })
-    }
-
-    fn update_channel(
-        &self,
-        channel_id: &str,
-        updater: Box<dyn FnOnce(Option<ChannelState>) -> Result<ChannelState, StoreError> + Send>,
-    ) -> Pin<Box<dyn Future<Output = Result<ChannelState, StoreError>> + Send + '_>> {
-        let result = {
-            let mut data = self.data.lock().unwrap();
-            let current = data.get(channel_id).cloned();
-            let key = channel_id.to_string();
-            match updater(current) {
-                Ok(new_state) => {
-                    data.insert(key, new_state.clone());
-                    Ok(new_state)
-                }
-                Err(e) => Err(e),
-            }
-        };
-        Box::pin(async move { result })
-    }
-
-    fn advance_cumulative(
-        &self,
-        channel_id: &str,
-        expected: u64,
-        new: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<bool, StoreError>> + Send + '_>> {
-        let mut data = self.data.lock().unwrap();
-        match data.get_mut(channel_id) {
-            Some(state) if state.cumulative == expected => {
-                state.cumulative = new;
-                Box::pin(async { Ok(true) })
-            }
-            Some(_) => Box::pin(async { Ok(false) }),
-            None => Box::pin(async { Err(StoreError::Internal("Channel not found".to_string())) }),
-        }
-    }
-
-    fn update_deposit(
-        &self,
-        channel_id: &str,
-        new_deposit: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        let mut data = self.data.lock().unwrap();
-        match data.get_mut(channel_id) {
-            Some(state) => {
-                state.deposit = new_deposit;
-                Box::pin(async { Ok(()) })
-            }
-            None => Box::pin(async { Err(StoreError::Internal("Channel not found".to_string())) }),
-        }
-    }
-
-    fn mark_finalized(
-        &self,
-        channel_id: &str,
-    ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + '_>> {
-        let mut data = self.data.lock().unwrap();
-        match data.get_mut(channel_id) {
-            Some(state) => {
-                state.finalized = true;
-                Box::pin(async { Ok(()) })
-            }
-            None => Box::pin(async { Err(StoreError::Internal("Channel not found".to_string())) }),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::intents::session::{SigType, SignedVoucher, Split, VoucherData};
 
-    // ── MemoryStore ───────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn memory_store_get_put_delete() {
-        let store = MemoryStore::new();
-        assert!(store.get("missing").await.unwrap().is_none());
-
-        let value = serde_json::json!({"name": "alice"});
-        store.put("user:1", value.clone()).await.unwrap();
-        assert_eq!(store.get("user:1").await.unwrap(), Some(value));
-
-        store.delete("user:1").await.unwrap();
-        assert!(store.get("user:1").await.unwrap().is_none());
+    fn pk(b: u8) -> Pubkey {
+        Pubkey::new_from_array([b; 32])
     }
 
-    #[tokio::test]
-    async fn memory_store_put_if_absent_inserts_once() {
-        let store = MemoryStore::new();
-        let v = serde_json::json!(1);
-        assert!(store.put_if_absent("k", v.clone()).await.unwrap());
-        assert!(!store
-            .put_if_absent("k", serde_json::json!(2))
-            .await
-            .unwrap());
-        // Original value unchanged
-        assert_eq!(store.get("k").await.unwrap(), Some(v));
+    fn signed_voucher(channel_id: Pubkey, cumulative: u64) -> SignedVoucher {
+        SignedVoucher {
+            voucher: VoucherData {
+                channel_id: bs58::encode(channel_id.as_ref()).into_string(),
+                cumulative_amount: cumulative.to_string(),
+                expires_at: None,
+            },
+            signer: bs58::encode([0x33u8; 32]).into_string(),
+            signature: bs58::encode([0x44u8; 64]).into_string(),
+            signature_type: SigType::Ed25519,
+        }
     }
 
-    // ── MemoryChannelStore ────────────────────────────────────────────────────
+    fn split(recipient: Pubkey, share_bps: u16) -> Split {
+        Split::Bps {
+            recipient,
+            share_bps,
+        }
+    }
 
-    fn make_state(channel_id: &str, deposit: u64) -> ChannelState {
-        ChannelState {
-            channel_id: channel_id.to_string(),
-            authorized_signer: "signer1".to_string(),
+    fn record(channel_id: Pubkey, deposit: u64) -> ChannelRecord {
+        ChannelRecord {
+            channel_id,
+            payer: pk(0xA1),
+            payee: pk(0xA2),
+            mint: pk(0xA3),
+            salt: 0xCAFE,
+            program_id: pk(0xA4),
+            authorized_signer: pk(0xA5),
             deposit,
-            cumulative: 0,
-            finalized: false,
-            highest_voucher_signature: None,
-            close_requested_at: None,
-            operator: None,
+            accepted_cumulative: 0,
+            on_chain_settled: 0,
+            last_voucher: None,
+            close_tx: None,
+            status: ChannelStatus::Open,
+            splits: vec![split(pk(0xB1), 5_000)],
+        }
+    }
+
+    fn make_sig(b: u8) -> [u8; 64] {
+        [b; 64]
+    }
+
+    fn make_signature(b: u8) -> Signature {
+        Signature::from(make_sig(b))
+    }
+
+    // ── Insert / get ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn insert_and_get() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        let got = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(got.channel_id, cid);
+        assert_eq!(got.deposit, 1_000);
+        assert_eq!(got.status, ChannelStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn insert_rejects_duplicate() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        let err = store.insert(record(cid, 2_000)).await.unwrap_err();
+        assert!(matches!(err, StoreError::AlreadyExists(p) if p == cid));
+    }
+
+    #[tokio::test]
+    async fn get_missing_returns_none() {
+        let store = InMemoryChannelStore::new();
+        assert!(store.get(&pk(0xFF)).await.unwrap().is_none());
+    }
+
+    // ── advance_watermark ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn advance_watermark_monotonic() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        let r1 = store
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(1),
+                b"r1".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r1, AdvanceOutcome::Advanced { prior: 0 }));
+
+        let r2 = store
+            .advance_watermark(
+                &cid,
+                100,
+                250,
+                signed_voucher(cid, 250),
+                make_sig(2),
+                b"r2".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r2, AdvanceOutcome::Advanced { prior: 100 }));
+
+        let stored = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(stored.accepted_cumulative, 250);
+        assert_eq!(
+            stored.last_voucher.as_ref().unwrap().voucher.cumulative_amount,
+            "250"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_rejects_regression() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        // Winner
+        store
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(1),
+                b"win".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        // Loser presents stale expected=0 with new=50; CAS rejects.
+        let outcome = store
+            .advance_watermark(
+                &cid,
+                0,
+                50,
+                signed_voucher(cid, 50),
+                make_sig(2),
+                b"lose".to_vec(),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            AdvanceOutcome::Conflict {
+                current,
+                winner_signature,
+                winner_receipt,
+            } => {
+                assert_eq!(current, 100);
+                assert_eq!(winner_signature, make_sig(1));
+                assert_eq!(winner_receipt, b"win".to_vec());
+            }
+            _ => panic!("expected Conflict, got {outcome:?}"),
         }
     }
 
     #[tokio::test]
-    async fn channel_store_put_and_get() {
-        let store = MemoryChannelStore::new();
-        assert!(store.get_channel("c1").await.unwrap().is_none());
+    async fn advance_watermark_rejects_equality() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
 
         store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-        let state = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(state.deposit, 1_000_000);
-        assert_eq!(state.cumulative, 0);
-        assert!(!state.finalized);
-    }
-
-    #[tokio::test]
-    async fn channel_store_advance_cumulative_success() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 5_000_000))
-            .await
-            .unwrap();
-
-        let advanced = store.advance_cumulative("c1", 0, 1_000_000).await.unwrap();
-        assert!(advanced);
-
-        let state = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(state.cumulative, 1_000_000);
-    }
-
-    #[tokio::test]
-    async fn channel_store_advance_cumulative_wrong_expected_returns_false() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 5_000_000))
-            .await
-            .unwrap();
-
-        // Wrong expected value — simulates a lost race
-        let advanced = store
-            .advance_cumulative("c1", 999, 1_000_000)
-            .await
-            .unwrap();
-        assert!(!advanced);
-
-        // Watermark unchanged
-        let state = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(state.cumulative, 0);
-    }
-
-    #[tokio::test]
-    async fn channel_store_advance_cumulative_missing_channel_errors() {
-        let store = MemoryChannelStore::new();
-        assert!(store.advance_cumulative("ghost", 0, 100).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn channel_store_update_deposit_success() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-
-        store.update_deposit("c1", 5_000_000).await.unwrap();
-        let state = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(state.deposit, 5_000_000);
-    }
-
-    #[tokio::test]
-    async fn channel_store_update_deposit_missing_channel_errors() {
-        let store = MemoryChannelStore::new();
-        assert!(store.update_deposit("ghost", 5_000_000).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn channel_store_mark_finalized_success() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-
-        store.mark_finalized("c1").await.unwrap();
-        let state = store.get_channel("c1").await.unwrap().unwrap();
-        assert!(state.finalized);
-    }
-
-    #[tokio::test]
-    async fn channel_store_mark_finalized_missing_channel_errors() {
-        let store = MemoryChannelStore::new();
-        assert!(store.mark_finalized("ghost").await.is_err());
-    }
-
-    #[tokio::test]
-    async fn channel_store_put_overwrites_existing() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-        let mut updated = make_state("c1", 5_000_000);
-        updated.cumulative = 999;
-        store.put_channel("c1", updated).await.unwrap();
-
-        let state = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(state.deposit, 5_000_000);
-        assert_eq!(state.cumulative, 999);
-    }
-
-    // ── update_channel ────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn channel_store_update_channel_inserts_new() {
-        let store = MemoryChannelStore::new();
-        let state = store
-            .update_channel(
-                "c1",
-                Box::new(|state_opt| {
-                    assert!(state_opt.is_none());
-                    Ok(ChannelState {
-                        channel_id: "c1".to_string(),
-                        authorized_signer: "signer1".to_string(),
-                        deposit: 1_000_000,
-                        cumulative: 0,
-                        finalized: false,
-                        highest_voucher_signature: None,
-                        close_requested_at: None,
-                        operator: None,
-                    })
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(state.deposit, 1_000_000);
-        let stored = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(stored.deposit, 1_000_000);
-    }
-
-    #[tokio::test]
-    async fn channel_store_update_channel_modifies_existing() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-
-        let state = store
-            .update_channel(
-                "c1",
-                Box::new(|state_opt| {
-                    let s = state_opt.unwrap();
-                    Ok(ChannelState {
-                        cumulative: 500_000,
-                        ..s
-                    })
-                }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(state.cumulative, 500_000);
-        let stored = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(stored.cumulative, 500_000);
-    }
-
-    #[tokio::test]
-    async fn channel_store_update_channel_error_aborts() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-
-        let result = store
-            .update_channel(
-                "c1",
-                Box::new(|_state_opt| Err(StoreError::Internal("rejected".to_string()))),
-            )
-            .await;
-        assert!(result.is_err());
-        // State unchanged
-        let stored = store.get_channel("c1").await.unwrap().unwrap();
-        assert_eq!(stored.deposit, 1_000_000);
-        assert_eq!(stored.cumulative, 0);
-    }
-
-    #[tokio::test]
-    async fn channel_store_update_channel_atomicity() {
-        let store = MemoryChannelStore::new();
-        store
-            .put_channel("c1", make_state("c1", 1_000_000))
-            .await
-            .unwrap();
-
-        // First update
-        store
-            .update_channel(
-                "c1",
-                Box::new(|state_opt| {
-                    let s = state_opt.unwrap();
-                    Ok(ChannelState {
-                        cumulative: 100_000,
-                        ..s
-                    })
-                }),
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(1),
+                b"win".to_vec(),
             )
             .await
             .unwrap();
 
-        // Second update sees first update's result
-        let state = store
-            .update_channel(
-                "c1",
-                Box::new(|state_opt| {
-                    let s = state_opt.unwrap();
-                    assert_eq!(s.cumulative, 100_000);
-                    Ok(ChannelState {
-                        cumulative: 200_000,
-                        ..s
-                    })
-                }),
+        // expected (0) matches the current watermark, but new (100) is
+        // also the current watermark, so the strict-greater check rejects.
+        let outcome = store
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(2),
+                b"lose".to_vec(),
             )
             .await
             .unwrap();
-        assert_eq!(state.cumulative, 200_000);
+        assert!(matches!(outcome, AdvanceOutcome::Conflict { current: 100, .. }));
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_returns_conflict_on_equality_after_winner() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        // Winner advances 0 -> 100 and caches its receipt at (cid, 100).
+        let outcome = store
+            .advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(0xAA),
+                b"alpha".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AdvanceOutcome::Advanced { prior: 0 }));
+
+        // Replay: the loser read the record after the winner committed,
+        // so its `expected == new == 100`. The CAS sees
+        // `accepted_cumulative == expected` but `new > expected` is false,
+        // falls into the cache-lookup branch, and hands back the winner's
+        // entry unchanged.
+        let outcome = store
+            .advance_watermark(
+                &cid,
+                100,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(0xBB),
+                b"beta".to_vec(),
+            )
+            .await
+            .unwrap();
+        match outcome {
+            AdvanceOutcome::Conflict {
+                current,
+                winner_signature,
+                winner_receipt,
+            } => {
+                assert_eq!(current, 100);
+                assert_eq!(winner_signature, make_sig(0xAA));
+                assert_eq!(winner_receipt, b"alpha".to_vec());
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // Watermark still reflects the winner.
+        assert_eq!(store.get(&cid).await.unwrap().unwrap().accepted_cumulative, 100);
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_returns_cas_invariant_broken_on_strict_regression_with_no_cached_winner() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        // Caller-bug shape: `expected = 50`, `new = 25` against a fresh
+        // record (watermark 0). The CAS branch fails the equality check,
+        // the cache lookup at `(cid, 0)` misses since no winner ever
+        // committed, and the fallback fires.
+        let err = store
+            .advance_watermark(
+                &cid,
+                50,
+                25,
+                signed_voucher(cid, 25),
+                make_sig(0),
+                b"x".to_vec(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            StoreError::CasInvariantBroken { detail } => assert!(
+                detail.contains("cas conflict at cumulative 0"),
+                "unexpected message: {detail}"
+            ),
+            other => panic!("expected StoreError::CasInvariantBroken, got {other:?}"),
+        }
+
+        // Store should be untouched.
+        assert_eq!(store.get(&cid).await.unwrap().unwrap().accepted_cumulative, 0);
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_conflict_returns_winner_receipt() {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let cid = pk(1);
+        store.insert(record(cid, 10_000)).await.unwrap();
+
+        // Both tasks aim for the same watermark; the inner write lock
+        // serialises them so one wins and the other reads the cached
+        // receipt back.
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let h1 = tokio::spawn(async move {
+            s1.advance_watermark(
+                &cid,
+                0,
+                500,
+                signed_voucher(cid, 500),
+                make_sig(0xAA),
+                b"alpha".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let h2 = tokio::spawn(async move {
+            s2.advance_watermark(
+                &cid,
+                0,
+                500,
+                signed_voucher(cid, 500),
+                make_sig(0xBB),
+                b"beta".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let (a, b) = (h1.await.unwrap(), h2.await.unwrap());
+
+        let (advanced, conflict) = match (a, b) {
+            (a @ AdvanceOutcome::Advanced { .. }, b @ AdvanceOutcome::Conflict { .. }) => (a, b),
+            (a @ AdvanceOutcome::Conflict { .. }, b @ AdvanceOutcome::Advanced { .. }) => (b, a),
+            other => panic!("expected one Advanced + one Conflict, got {other:?}"),
+        };
+        let prior = match advanced {
+            AdvanceOutcome::Advanced { prior } => prior,
+            _ => unreachable!(),
+        };
+        assert_eq!(prior, 0);
+
+        match conflict {
+            AdvanceOutcome::Conflict {
+                current,
+                winner_signature,
+                winner_receipt,
+            } => {
+                assert_eq!(current, 500);
+                // Whichever call landed first owns the cached pair; the
+                // loser sees those exact bytes.
+                assert!(winner_signature == make_sig(0xAA) || winner_signature == make_sig(0xBB));
+                assert!(winner_receipt == b"alpha".to_vec() || winner_receipt == b"beta".to_vec());
+                let expected_receipt = if winner_signature == make_sig(0xAA) {
+                    b"alpha".to_vec()
+                } else {
+                    b"beta".to_vec()
+                };
+                assert_eq!(winner_receipt, expected_receipt);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn advance_watermark_atomically_writes_last_voucher() {
+        // Two concurrent winners A(100) and B(200): regardless of
+        // ordering, `accepted_cumulative` and `last_voucher` agree.
+        // The loser's `winner_last_voucher` drops because the conflict
+        // branch returns the winner's already-stamped state.
+        let store = Arc::new(InMemoryChannelStore::new());
+        let cid = pk(1);
+        store.insert(record(cid, 10_000)).await.unwrap();
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let h1 = tokio::spawn(async move {
+            s1.advance_watermark(
+                &cid,
+                0,
+                100,
+                signed_voucher(cid, 100),
+                make_sig(0xAA),
+                b"a".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let h2 = tokio::spawn(async move {
+            s2.advance_watermark(
+                &cid,
+                0,
+                200,
+                signed_voucher(cid, 200),
+                make_sig(0xBB),
+                b"b".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let _ = h1.await.unwrap();
+        let _ = h2.await.unwrap();
+
+        let stored = store.get(&cid).await.unwrap().unwrap();
+        let last = stored
+            .last_voucher
+            .as_ref()
+            .expect("last_voucher persisted alongside watermark");
+        assert_eq!(
+            last.voucher.cumulative_amount,
+            stored.accepted_cumulative.to_string(),
+            "last_voucher.cumulative_amount must equal accepted_cumulative",
+        );
+    }
+
+    // ── Status transitions ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn status_transitions_open_to_close_attempting_to_closed_pending_to_finalized() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        store.mark_close_attempting(&cid).await.unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::CloseAttempting
+        );
+
+        let sig = make_signature(7);
+        store.mark_closed_pending(&cid, sig).await.unwrap();
+        let r = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(r.status, ChannelStatus::ClosedPending);
+        assert_eq!(r.close_tx, Some(sig));
+
+        store.mark_closed_finalized(&cid).await.unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::ClosedFinalized
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_close_rollback_returns_to_open() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        store.mark_close_attempting(&cid).await.unwrap();
+        store.mark_close_rollback(&cid).await.unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Open
+        );
+
+        // Voucher acceptance still works after a rollback.
+        let outcome = store
+            .advance_watermark(
+                &cid,
+                0,
+                50,
+                signed_voucher(cid, 50),
+                make_sig(9),
+                b"r".to_vec(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, AdvanceOutcome::Advanced { .. }));
+    }
+
+    #[tokio::test]
+    async fn record_mutators_update_fields() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        store.record_deposit(&cid, 5_000).await.unwrap();
+        assert_eq!(store.get(&cid).await.unwrap().unwrap().deposit, 5_000);
+
+        store.record_on_chain_settled(&cid, 1_234).await.unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().on_chain_settled,
+            1_234
+        );
+
+        let v = signed_voucher(cid, 999);
+        store.record_last_voucher(&cid, v.clone()).await.unwrap();
+        assert_eq!(store.get(&cid).await.unwrap().unwrap().last_voucher, Some(v));
+
+        let sig = make_signature(0x77);
+        store.record_close_signature(&cid, sig).await.unwrap();
+        assert_eq!(store.get(&cid).await.unwrap().unwrap().close_tx, Some(sig));
+    }
+
+    // ── Voucher cache ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn voucher_cache_insert_lookup_miss_then_hit() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        assert!(store
+            .voucher_cache_lookup(&cid, 100)
+            .await
+            .unwrap()
+            .is_none());
+
+        store
+            .voucher_cache_insert(&cid, 100, make_sig(1), b"r".to_vec())
+            .await
+            .unwrap();
+
+        let (receipt, sig) = store.voucher_cache_lookup(&cid, 100).await.unwrap().unwrap();
+        assert_eq!(receipt, b"r".to_vec());
+        assert_eq!(sig, make_sig(1));
+    }
+
+    #[tokio::test]
+    async fn voucher_cache_is_per_channel_and_per_cumulative() {
+        let store = InMemoryChannelStore::new();
+        let c1 = pk(1);
+        let c2 = pk(2);
+        store
+            .voucher_cache_insert(&c1, 100, make_sig(1), b"c1-100".to_vec())
+            .await
+            .unwrap();
+        store
+            .voucher_cache_insert(&c2, 100, make_sig(2), b"c2-100".to_vec())
+            .await
+            .unwrap();
+        store
+            .voucher_cache_insert(&c1, 200, make_sig(3), b"c1-200".to_vec())
+            .await
+            .unwrap();
+
+        let (r1, _) = store.voucher_cache_lookup(&c1, 100).await.unwrap().unwrap();
+        let (r2, _) = store.voucher_cache_lookup(&c2, 100).await.unwrap().unwrap();
+        let (r3, _) = store.voucher_cache_lookup(&c1, 200).await.unwrap().unwrap();
+        assert_eq!(r1, b"c1-100".to_vec());
+        assert_eq!(r2, b"c2-100".to_vec());
+        assert_eq!(r3, b"c1-200".to_vec());
+    }
+
+    // ── list_by_status, delete ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_by_status_filters_correctly() {
+        let store = InMemoryChannelStore::new();
+        let open1 = pk(1);
+        let open2 = pk(2);
+        let closing = pk(3);
+        let pending = pk(4);
+        store.insert(record(open1, 1_000)).await.unwrap();
+        store.insert(record(open2, 1_000)).await.unwrap();
+        store.insert(record(closing, 1_000)).await.unwrap();
+        store.insert(record(pending, 1_000)).await.unwrap();
+
+        store.mark_closing(&closing).await.unwrap();
+        store.mark_close_attempting(&pending).await.unwrap();
+        store
+            .mark_closed_pending(&pending, make_signature(1))
+            .await
+            .unwrap();
+
+        let mut opens = store
+            .list_by_status(&[ChannelStatus::Open])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.channel_id)
+            .collect::<Vec<_>>();
+        opens.sort();
+        assert_eq!(opens, vec![open1, open2]);
+
+        let multi = store
+            .list_by_status(&[ChannelStatus::Closing, ChannelStatus::ClosedPending])
+            .await
+            .unwrap();
+        assert_eq!(multi.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_record() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.delete(&cid).await.unwrap();
+        assert!(store.get(&cid).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_missing_returns_not_found() {
+        let store = InMemoryChannelStore::new();
+        let err = store.delete(&pk(1)).await.unwrap_err();
+        assert!(matches!(err, StoreError::NotFound(_)));
+    }
+
+    // ── Illegal transitions ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn illegal_state_transition_closed_finalized_to_open_fails() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_close_attempting(&cid).await.unwrap();
+        store
+            .mark_closed_pending(&cid, make_signature(1))
+            .await
+            .unwrap();
+        store.mark_closed_finalized(&cid).await.unwrap();
+
+        let err = store.mark_close_rollback(&cid).await.unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::IllegalTransition {
+                from: ChannelStatus::ClosedFinalized,
+                to: ChannelStatus::Open,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_attempting_to_finalized_is_legal_recovery_edge() {
+        // The tombstone-only retry path in `finish_post_tombstone` skips
+        // `mark_closed_pending` when there is no recorded `close_tx`, so
+        // `CloseAttempting -> ClosedFinalized` has to round-trip.
+        // Writing a placeholder signature into `close_tx` would defeat
+        // the `inspect_closed_pending` evidence gate.
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_close_attempting(&cid).await.unwrap();
+
+        store.mark_closed_finalized(&cid).await.unwrap();
+
+        let post = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(post.status, ChannelStatus::ClosedFinalized);
+        assert!(
+            post.close_tx.is_none(),
+            "close_tx must stay None on the no-evidence path"
+        );
+    }
+
+    #[tokio::test]
+    async fn topup_during_concurrent_voucher_preserves_watermark() {
+        // Regression: a targeted mutator like `record_deposit` running
+        // alongside `advance_watermark` shouldn't clobber the watermark.
+        let store = Arc::new(InMemoryChannelStore::new());
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        let s1 = store.clone();
+        let s2 = store.clone();
+        let h1 = tokio::spawn(async move {
+            s1.advance_watermark(
+                &cid,
+                0,
+                700,
+                signed_voucher(cid, 700),
+                make_sig(1),
+                b"v".to_vec(),
+            )
+            .await
+            .unwrap()
+        });
+        let h2 = tokio::spawn(async move { s2.record_deposit(&cid, 5_000).await.unwrap() });
+        let _ = h1.await.unwrap();
+        h2.await.unwrap();
+
+        let r = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(r.accepted_cumulative, 700);
+        assert_eq!(r.deposit, 5_000);
+    }
+
+    #[tokio::test]
+    async fn closing_to_open_rollback_uses_recovery_mutator() {
+        // Trait-level mark_close_rollback only takes CloseAttempting to
+        // Open. A Closing record needs the recovery mutator. Cover
+        // both: recovery mutator succeeds, regular mutator rejects with
+        // IllegalTransition.
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_closing(&cid).await.unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Closing
+        );
+
+        // mark_close_rollback rejects Closing.
+        let err = store.mark_close_rollback(&cid).await.unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::IllegalTransition {
+                from: ChannelStatus::Closing,
+                to: ChannelStatus::Open,
+                ..
+            }
+        ));
+
+        // Recovery mutator drives Closing back to Open cleanly.
+        store
+            .mark_recovery_rollback_from_closing(&cid)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rollback_open_is_idempotent_noop() {
+        // Recovery accepts Closing -> Open and the Open self-edge (an
+        // earlier pass already rolled back). Other from-states stay
+        // IllegalTransition.
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+
+        store
+            .mark_recovery_rollback_from_closing(&cid)
+            .await
+            .expect("Open -> Open recovery rollback is a no-op");
+        assert_eq!(
+            store.get(&cid).await.unwrap().unwrap().status,
+            ChannelStatus::Open
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_rollback_rejects_finalized_states() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_close_attempting(&cid).await.unwrap();
+        store
+            .mark_closed_pending(&cid, make_signature(1))
+            .await
+            .unwrap();
+        store.mark_closed_finalized(&cid).await.unwrap();
+
+        let err = store
+            .mark_recovery_rollback_from_closing(&cid)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::IllegalTransition {
+                from: ChannelStatus::ClosedFinalized,
+                to: ChannelStatus::Open,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_closed_finalized_idempotent() {
+        let store = InMemoryChannelStore::new();
+        let cid = pk(1);
+        store.insert(record(cid, 1_000)).await.unwrap();
+        store.mark_close_attempting(&cid).await.unwrap();
+        store
+            .mark_closed_pending(&cid, make_signature(1))
+            .await
+            .unwrap();
+        store.mark_closed_finalized(&cid).await.unwrap();
+        // The self-edge on Finalized is legal and should be a no-op.
+        store.mark_closed_finalized(&cid).await.unwrap();
     }
 }

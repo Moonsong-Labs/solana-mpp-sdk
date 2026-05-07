@@ -8,9 +8,11 @@
 //! `Channel.distribution_hash` and re-computed by `distribute` on chain.
 //!
 //! Validation (`Σ bps <= 10_000`, dedup, `count <= 32`, recipient != PDA) is
-//! the program's job. Both functions here are pure byte mechanics so
-//! callers can compute hashes for inspection or negative tests without
-//! pre-validating the input.
+//! the program's job. The SDK enforces a tighter `MAX_SPLITS = 8` cap at
+//! handler entry to keep the close-time tx set under the 1232-byte packet
+//! limit. Both functions here are pure byte mechanics so callers can
+//! compute hashes for inspection or negative tests without pre-validating
+//! the input.
 
 use solana_pubkey::Pubkey;
 

@@ -292,7 +292,7 @@ fn settle_and_finalize_without_voucher_locks_current_settled() {
 
 #[test]
 fn settle_and_finalize_from_closing_state_finalizes_mid_grace() {
-    // Branch A of the cooperative-close protocol: open, settle, then
+    // Apply-voucher cooperative-close path: open, settle, then
     // request_close to enter Closing, then settle_and_finalize mid-grace
     // to transition Closing -> Finalized. Exercises the deadline-arithmetic
     // path inside settle_and_finalize that the Open-state tests don't reach,

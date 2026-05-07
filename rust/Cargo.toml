@@ -9,7 +9,7 @@ repository = "https://github.com/solana-foundation/mpp-sdk"
 
 [features]
 default = ["server", "client"]
-server = ["dep:tokio"]
+server = []
 client = ["dep:reqwest"]
 gcp_kms = ["solana-keychain/gcp_kms"]
 # Pull-mode session support via the multi-delegator program. Not supported in v1.
@@ -68,8 +68,20 @@ payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payme
 	"fetch",
 ] }
 
-# Async
-tokio = { version = "1", features = ["full"], optional = true }
+# Async runtime. Hard dep (not gated): solana-rpc-client already pulls tokio
+# transitively, the in-memory channel store uses `tokio::sync::RwLock`, and
+# both server and client paths are async. Features pinned to what the SDK
+# uses, instead of `full`: `sync` (RwLock + Mutex), `time` (sleep / interval),
+# `rt-multi-thread` (multi_thread test flavor + interop_server Runtime),
+# `macros` (#[tokio::main] / #[tokio::test]). `net` is only used by the
+# payment_link_server example, so it lives in [dev-dependencies] and stays
+# out of the library's public feature surface.
+tokio = { version = "1", features = [
+	"sync",
+	"time",
+	"rt-multi-thread",
+	"macros",
+] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"], optional = true }
@@ -100,11 +112,36 @@ tracing = "0.1"
 # Errors
 thiserror = "2"
 
+# HTTP types: `http::StatusCode` is what production servers expect to thread
+# through their handler stack, and the crate is already in every meaningful
+# server dep graph (axum / hyper / reqwest all pull it). Keeping it as a
+# direct dep means SessionError::http_status() returns a type the operator
+# can hand straight to their HTTP layer without re-mapping.
+http = "1"
+
+# Async trait sugar (used by ChannelStore so impls don't have to hand-roll
+# the Pin<Box<dyn Future + Send + '_>> dance for every method).
+async-trait = "0.1"
+
+# Lock-free concurrent map for the challenge cache. The cache is hot on
+# every challenge factory call and on every action handler entry; pulling
+# DashMap avoids serialising those across a global RwLock.
+dashmap = "6"
+
+# Combinators used by the recovery loop to fan out per-channel inspection
+# work. Pulled in here so the dep landscape is settled before recovery
+# wiring lands in a follow-up.
+futures = "0.3"
+
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
+
+# `net` is only needed by the payment_link_server example's TcpListener.
+# Cargo unions these features with the [dependencies] entry above for test
+# and example builds, so library consumers don't pick up `net`.
+tokio = { version = "1", features = ["net"] }
 
 # Dev-only: `solana-sdk` 3.x provides `Keypair`, `Transaction`, and other
 # umbrella re-exports used by the L1 integration tests. Pinned at 3.0
@@ -153,3 +190,23 @@ required-features = ["server", "client"]
 [[test]]
 name = "charge_integration"
 required-features = ["server", "client"]
+
+[[test]]
+name = "session_l1_open_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_topup_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_close_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_voucher_handler"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_recover"
+required-features = ["server"]

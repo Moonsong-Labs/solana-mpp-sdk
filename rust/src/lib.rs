@@ -44,12 +44,16 @@ pub mod server;
 
 // ── Re-exports ──
 
-pub use error::{Error, Result};
+pub use error::{
+    Error, OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, Result, RpcError,
+    SessionError,
+};
 
 // Core protocol types
 pub use protocol::core::{
     base64url_decode, base64url_encode, compute_challenge_id, Base64UrlJson, ChallengeEcho,
-    IntentName, MethodName, PaymentChallenge, PaymentCredential, Receipt, ReceiptStatus,
+    IntentName, MethodName, MppErrorCode, PaymentChallenge, PaymentCredential, Receipt,
+    ReceiptStatus,
 };
 
 // Header parsing/formatting
@@ -72,7 +76,24 @@ pub use protocol::solana::{
 };
 
 // Store types
-pub use store::{ChannelState, ChannelStore, MemoryChannelStore, MemoryStore, Store, StoreError};
+pub use store::{
+    AdvanceOutcome, ChannelRecord, ChannelStatus, ChannelStore, InMemoryChannelStore, MemoryStore,
+    Store, StoreError,
+};
+
+// Renamed from `RpcClient` so a glob import of this crate doesn't collide
+// with `solana_client::nonblocking::rpc_client::RpcClient` at the use site.
+pub use program::payment_channels::rpc::RpcClient as MppRpcClient;
+
+// Session intent server surface. The `session(cfg)` factory is the
+// only supported entry point; `SessionMethod` is constructed via
+// `SessionBuilder::recover()` so startup recovery is a hard
+// prerequisite for serving requests.
+#[cfg(feature = "server")]
+pub use server::session::{
+    session, FeePayer, Network, OpenChallengeOptions, PayeeSigner, Pricing, RecoveryOptions,
+    SessionBuilder, SessionConfig, SessionMethod,
+};
 
 // Re-export crates callers need to use with the charge builder.
 pub use solana_keychain;

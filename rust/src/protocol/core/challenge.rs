@@ -302,14 +302,27 @@ impl PaymentCredential {
 }
 
 /// Payment receipt from server (parsed from Payment-Receipt header).
+///
+/// `accepted_cumulative` and `spent` are populated for session voucher
+/// receipts (rendered as decimal strings on the wire). `tx_hash` and
+/// `refunded` are populated for session close receipts. Charge receipts
+/// leave all four `None` and the fields are omitted from the JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Receipt {
     pub status: ReceiptStatus,
     pub method: MethodName,
     pub timestamp: String,
     pub reference: String,
-    #[serde(rename = "challengeId")]
     pub challenge_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub accepted_cumulative: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub spent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tx_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub refunded: Option<String>,
 }
 
 impl Receipt {
@@ -325,7 +338,28 @@ impl Receipt {
             timestamp: now_iso8601(),
             reference: reference.into(),
             challenge_id: challenge_id.into(),
+            accepted_cumulative: None,
+            spent: None,
+            tx_hash: None,
+            refunded: None,
         }
+    }
+
+    /// Attach session voucher metering fields. `accepted` is the new
+    /// watermark, `spent` is `accepted - prior` (the delta consumed by
+    /// this voucher).
+    pub fn with_voucher_amounts(mut self, accepted: u64, spent: u64) -> Self {
+        self.accepted_cumulative = Some(accepted.to_string());
+        self.spent = Some(spent.to_string());
+        self
+    }
+
+    /// Attach session close fields. `tx_hash` is the close tx signature,
+    /// `refunded` is `deposit - settled` (units returned to the payer).
+    pub fn with_close_amounts(mut self, tx_hash: impl Into<String>, refunded: u64) -> Self {
+        self.tx_hash = Some(tx_hash.into());
+        self.refunded = Some(refunded.to_string());
+        self
     }
 
     pub fn is_success(&self) -> bool {

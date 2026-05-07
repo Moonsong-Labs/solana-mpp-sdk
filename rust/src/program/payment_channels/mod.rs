@@ -18,9 +18,14 @@ pub mod state;    // Channel PDA derivation + typed ChannelView
 
 // SDK-owned orchestration and RPC helpers.
 pub mod ix;
+pub mod rpc;
 pub mod verify;
 
 // SDK-owned splits canonicalization. Mirrors upstream's preimage layout
 // and blake3 digest path so the SDK can compute distribution_hash values
 // that match what the on-chain `distribute` ix expects.
 pub mod splits;
+
+// Canonical open / top-up tx ix lists. Shared between client (build)
+// and server (validate) so the bytes line up at validation time.
+pub mod canonical_tx;
