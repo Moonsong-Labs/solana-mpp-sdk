@@ -264,7 +264,13 @@ fn check_transition(
             | (Open, ClosedFinalized)
             | (CloseAttempting, ClosedPending)
             | (CloseAttempting, Open)
+            // Recovery edge: CloseAttempting / Closing without a
+            // recorded close_tx jumps straight to Finalized on a
+            // tombstoned chain rather than fabricating a placeholder
+            // signature in the ClosedPending intermediate.
+            | (CloseAttempting, ClosedFinalized)
             | (Closing, ClosedPending)
+            | (Closing, ClosedFinalized)
             | (ClosedPending, ClosedFinalized)
             | (ClosedFinalized, ClosedFinalized)
     );
@@ -1255,21 +1261,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn illegal_state_transition_close_attempting_to_finalized_skipping_pending_fails() {
+    async fn close_attempting_to_finalized_is_legal_recovery_edge() {
+        // The tombstone-only retry path in `finish_post_tombstone` skips
+        // `mark_closed_pending` when there is no recorded `close_tx`, so
+        // `CloseAttempting -> ClosedFinalized` has to round-trip.
+        // Writing a placeholder signature into `close_tx` would defeat
+        // the `inspect_closed_pending` evidence gate.
         let store = InMemoryChannelStore::new();
         let cid = pk(1);
         store.insert(record(cid, 1_000)).await.unwrap();
         store.mark_close_attempting(&cid).await.unwrap();
 
-        let err = store.mark_closed_finalized(&cid).await.unwrap_err();
-        assert!(matches!(
-            err,
-            StoreError::IllegalTransition {
-                from: ChannelStatus::CloseAttempting,
-                to: ChannelStatus::ClosedFinalized,
-                ..
-            }
-        ));
+        store.mark_closed_finalized(&cid).await.unwrap();
+
+        let post = store.get(&cid).await.unwrap().unwrap();
+        assert_eq!(post.status, ChannelStatus::ClosedFinalized);
+        assert!(
+            post.close_tx.is_none(),
+            "close_tx must stay None on the no-evidence path"
+        );
     }
 
     #[tokio::test]

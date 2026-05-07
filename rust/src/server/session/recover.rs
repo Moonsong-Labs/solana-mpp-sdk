@@ -687,13 +687,12 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_open_with_tombstone_and_no_unsettled_revenue_yields_finalize() {
-        // BUG #13 regression: a tombstoned PDA with settled revenue and
-        // no unsettled delta is a legitimate close that bypassed our
-        // CloseAttempting path. Recovery promotes the record to
-        // ClosedFinalized so it stops sitting Open. Mock RPC can't
-        // synthesise a tombstone payload, so this just pins the apply
-        // side: Finalize against an Open record drives Open to
-        // ClosedFinalized.
+        // A tombstoned PDA with settled revenue and no unsettled delta
+        // is a legitimate close that bypassed the CloseAttempting path.
+        // Recovery promotes the record to ClosedFinalized so it stops
+        // sitting Open. Mock RPC can't synthesise a tombstone payload,
+        // so this pins the apply side only: Finalize against an Open
+        // record drives Open to ClosedFinalized.
         let cid = pk(0x14);
         let store = InMemoryChannelStore::new();
         let mut record = base_record(cid, ChannelStatus::Open);
@@ -720,8 +719,8 @@ mod tests {
 
     #[tokio::test]
     async fn inspect_open_with_tombstone_and_zero_settled_yields_drop_orphan() {
-        // The other BUG #13 branch: opened then tombstoned with nothing
-        // settled (rare but possible). Record has nothing useful; drop it.
+        // Sister case: opened then tombstoned with nothing settled (rare
+        // but possible). Record has nothing useful; drop it.
         let cid = pk(0x15);
         let store = InMemoryChannelStore::new();
         let record = base_record(cid, ChannelStatus::Open);

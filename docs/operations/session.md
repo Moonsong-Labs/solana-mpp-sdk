@@ -201,3 +201,19 @@ monitoring and operator playbooks around these.
   does not detect or back off on RPC throttle responses. Operators with
   constrained RPC quotas should reduce `parallelism` to keep the inspect
   burst inside the quota.
+- Apply-voucher close that fails before chain confirms can leave a
+  rolled-back `Open` record with `accepted_cumulative` and `last_voucher`
+  advanced past `on_chain_settled`. The next legitimate close that
+  carries a voucher with cumulative greater than or equal to the cached
+  one re-runs apply-voucher and converges on chain. A subsequent
+  no-voucher (lock-settled) close commits `on_chain_settled`, stranding
+  the off-chain delta. Operators monitoring revenue should diff
+  `accepted_cumulative` against the on-chain settled at close time and
+  flag any non-zero gap; client policy that always re-issues the latest
+  voucher on close avoids the stranding case.
+- Settle tx accepted but confirm-poll times out can leave the chain in
+  `Finalized` while the store rolled back to `Open`. The next inspect
+  pass surfaces this as a `VerifyOpenMismatch` HardFail (status
+  disagreement). Operators reconcile manually via the chain history of
+  the failed close attempt and run `--allow-unsettled-on-startup` to
+  let the v1 recovery layer mark the record finalized.

@@ -177,7 +177,7 @@ use std::sync::Arc;
 use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
 use solana_mpp::{
     session, solana_keychain::{MemorySigner, SolanaSigner}, ChannelStore, FeePayer,
-    InMemoryChannelStore, Network, PayeeSigner, Pricing, RpcClient, SessionConfig,
+    InMemoryChannelStore, MppRpcClient, Network, PayeeSigner, Pricing, SessionConfig,
 };
 
 let mut cfg = SessionConfig::new_with_defaults(
@@ -198,7 +198,7 @@ cfg.fee_payer = Some(FeePayer { signer: fee_payer });
 cfg.payee_signer = Some(PayeeSigner { signer: payee_signer });
 
 let store: Arc<dyn ChannelStore> = Arc::new(InMemoryChannelStore::new());
-let rpc: Arc<dyn RpcClient> = Arc::new(SolanaRpcClient::new(rpc_url));
+let rpc: Arc<dyn MppRpcClient> = Arc::new(SolanaRpcClient::new(rpc_url));
 
 let method = session(cfg)
     .with_store(store)

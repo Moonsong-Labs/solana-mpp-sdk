@@ -992,29 +992,27 @@ async fn finish_post_tombstone(
     // confirm writes before crashing, and the pre-close watermark
     // otherwise. Operators who need the exact post-close settled have
     // to read it off the on-chain history of `record.close_tx`.
-    let close_sig = match record.close_tx {
-        Some(sig) => sig,
-        None => {
-            let placeholder = Signature::default();
+    match (record.status, record.close_tx) {
+        (ChannelStatus::CloseAttempting | ChannelStatus::Closing, Some(sig)) => {
+            store.mark_closed_pending(&record.channel_id, sig).await?;
+        }
+        (ChannelStatus::CloseAttempting | ChannelStatus::Closing, None) => {
+            // No recorded signature for the tombstoning tx. Skip the
+            // ClosedPending intermediate rather than fabricate a
+            // placeholder: writing Signature::default() would defeat
+            // the inspect_closed_pending close_tx evidence gate on a
+            // later recovery pass. The chain truth is sufficient to
+            // promote directly through the recovery edge added to
+            // `check_transition`.
             tracing::warn!(
                 channel_id = %record.channel_id,
-                signature = %placeholder,
-                "tombstone-only retry: original close_tx not persisted; recording zero signature placeholder",
+                "tombstone-only retry: original close_tx not persisted; promoting to ClosedFinalized without signature evidence",
             );
-            placeholder
         }
-    };
-
-    match record.status {
-        ChannelStatus::CloseAttempting | ChannelStatus::Closing => {
-            store
-                .mark_closed_pending(&record.channel_id, close_sig)
-                .await?;
-        }
-        ChannelStatus::ClosedPending | ChannelStatus::ClosedFinalized => {
+        (ChannelStatus::ClosedPending | ChannelStatus::ClosedFinalized, _) => {
             // Already past the broadcast; nothing to do here.
         }
-        ChannelStatus::Open => {
+        (ChannelStatus::Open, _) => {
             return Err(SessionError::InternalError(format!(
                 "channel {} retry-close called against Open record",
                 record.channel_id
