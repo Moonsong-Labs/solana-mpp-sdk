@@ -81,11 +81,9 @@ pub use store::{
     Store, StoreError,
 };
 
-// Async RPC trait the session lifecycle talks to. Operators pass an
-// `Arc<dyn RpcClient>` to `SessionBuilder::with_rpc`; the blanket impl
-// for `solana_client::nonblocking::rpc_client::RpcClient` covers the
-// common case.
-pub use program::payment_channels::rpc::RpcClient;
+// Renamed from `RpcClient` so a glob import of this crate doesn't collide
+// with `solana_client::nonblocking::rpc_client::RpcClient` at the use site.
+pub use program::payment_channels::rpc::RpcClient as MppRpcClient;
 
 // Session intent server surface. The `session(cfg)` factory is the
 // only supported entry point; `SessionMethod` is constructed via

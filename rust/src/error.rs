@@ -247,7 +247,7 @@ pub enum SessionError {
     #[error("ata preflight failed for recipient {recipient}: {cause}")]
     AtaPreflightFailed { recipient: Pubkey, cause: String },
 
-    #[error("on-chain state mismatch on field {field}: expected {expected}, got {got}")]
+    #[error(fmt = fmt_on_chain_state_mismatch)]
     OnChainStateMismatch {
         field: &'static str,
         expected: String,
@@ -344,6 +344,35 @@ pub enum SessionError {
 impl From<solana_client::client_error::ClientError> for SessionError {
     fn from(e: solana_client::client_error::ClientError) -> Self {
         SessionError::RpcUnavailable(RpcError::from(e))
+    }
+}
+
+/// Fields whose `expected` / `got` values are dropped from the rendered
+/// error. Identifier mismatches would otherwise let a probing client learn
+/// whether a channel id exists or who owns it. Field name still renders so
+/// logs stay actionable.
+const REDACTED_MISMATCH_FIELDS: &[&str] = &[
+    "channelId",
+    "channel",
+    "payer",
+    "payee",
+    "authorizedSigner",
+    "mint",
+];
+
+fn fmt_on_chain_state_mismatch(
+    field: &&'static str,
+    expected: &String,
+    got: &String,
+    f: &mut std::fmt::Formatter<'_>,
+) -> std::fmt::Result {
+    if REDACTED_MISMATCH_FIELDS.contains(field) {
+        write!(f, "on-chain state mismatch on field {field}")
+    } else {
+        write!(
+            f,
+            "on-chain state mismatch on field {field}: expected {expected}, got {got}"
+        )
     }
 }
 
@@ -484,6 +513,50 @@ mod tests {
         };
         assert_eq!(err.http_status(), StatusCode::CONFLICT);
         assert_eq!(err.code(), MppErrorCode::OnChainStateMismatch);
+    }
+
+    #[test]
+    fn on_chain_state_mismatch_redacts_identifier_payloads() {
+        let secret_pubkey = "5jX1111111111111111111111111111111111111111";
+        let other_pubkey = "11111111111111111111111111111111";
+        for field in [
+            "channelId",
+            "channel",
+            "payer",
+            "payee",
+            "authorizedSigner",
+            "mint",
+        ] {
+            let err = SessionError::OnChainStateMismatch {
+                field,
+                expected: secret_pubkey.into(),
+                got: other_pubkey.into(),
+            };
+            let rendered = err.to_string();
+            assert!(rendered.contains(field), "field name dropped: {rendered}");
+            assert!(
+                !rendered.contains(secret_pubkey),
+                "expected pubkey leaked for {field}: {rendered}"
+            );
+            assert!(
+                !rendered.contains(other_pubkey),
+                "got pubkey leaked for {field}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn on_chain_state_mismatch_keeps_payload_for_non_privacy_fields() {
+        for field in ["deposit", "settled", "status", "gracePeriod", "closureStartedAt"] {
+            let err = SessionError::OnChainStateMismatch {
+                field,
+                expected: "1000".into(),
+                got: "999".into(),
+            };
+            let rendered = err.to_string();
+            assert!(rendered.contains("1000"), "{field}: {rendered}");
+            assert!(rendered.contains("999"), "{field}: {rendered}");
+        }
     }
 
     #[test]

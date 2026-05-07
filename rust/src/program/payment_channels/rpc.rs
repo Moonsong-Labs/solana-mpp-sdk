@@ -20,8 +20,11 @@ use solana_transaction::Transaction;
 
 /// What the lifecycle handlers, recovery loop, and verify helpers ask
 /// of an RPC.
+///
+/// `'static` so `Arc<dyn RpcClient>` can be cloned into spawned tasks
+/// (recovery, sweeper) without borrow plumbing.
 #[async_trait]
-pub trait RpcClient: Send + Sync {
+pub trait RpcClient: Send + Sync + 'static {
     /// Fetch one account at the caller's commitment + encoding. The
     /// SDK only ever asks for `Base64` so the `data.decode()` on the
     /// response stays on the fast path.
