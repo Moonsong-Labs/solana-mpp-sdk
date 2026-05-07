@@ -21,6 +21,7 @@ pub mod ix;
 pub mod open;
 pub mod recover;
 pub mod topup;
+pub(crate) mod tx_shape;
 pub mod voucher;
 
 use std::sync::Arc;
