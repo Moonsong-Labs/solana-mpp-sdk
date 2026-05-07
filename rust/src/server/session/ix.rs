@@ -45,12 +45,11 @@ use payment_channels_client::types::{
 use solana_ed25519_program::new_ed25519_instruction_with_signature;
 
 use crate::error::SessionError;
+use crate::program::payment_channels::canonical_tx::create_ata_idempotent_ix;
 use crate::program::payment_channels::splits::TREASURY_OWNER;
 use crate::program::payment_channels::voucher::build_signed_payload;
 use crate::protocol::intents::session::{SignedVoucher, Split};
-use crate::server::session::open::{
-    ata_address, ata_program_id, pk_to_addr, spl_token_id,
-};
+use crate::server::session::open::{ata_address, pk_to_addr, spl_token_id};
 use crate::store::ChannelRecord;
 
 /// Compute budget for the settle_and_finalize tx. The apply-voucher
@@ -313,33 +312,6 @@ fn create_idempotent_ata_ixs(record: &ChannelRecord, fee_payer: &Pubkey) -> Vec<
         ));
     }
     ixs
-}
-
-/// Build a `CreateIdempotent` ix in v3 `Pubkey` terms. The published
-/// `spl-associated-token-account-client` 2.x crate takes and returns
-/// v2 `Pubkey`; we emit the same byte layout directly so the call site
-/// stays in v3 without a per-call bridge. Discriminator `1` is
-/// `CreateIdempotent` per upstream's
-/// `program/spl-associated-token-account/src/instruction.rs`.
-fn create_ata_idempotent_ix(
-    funding: &Pubkey,
-    wallet: &Pubkey,
-    mint: &Pubkey,
-    token_program: &Pubkey,
-) -> Instruction {
-    let ata = ata_address(wallet, mint, token_program);
-    Instruction {
-        program_id: ata_program_id(),
-        accounts: vec![
-            AccountMeta::new(*funding, true),
-            AccountMeta::new(ata, false),
-            AccountMeta::new_readonly(*wallet, false),
-            AccountMeta::new_readonly(*mint, false),
-            AccountMeta::new_readonly(solana_sdk_ids::system_program::ID, false),
-            AccountMeta::new_readonly(*token_program, false),
-        ],
-        data: vec![1],
-    }
 }
 
 /// ComputeBudget prelude (limit and price). Each builder picks its own

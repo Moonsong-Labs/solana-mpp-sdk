@@ -2,27 +2,36 @@
 //! challenge, co-signs as fee payer, broadcasts, and persists the
 //! channel record.
 //!
-//! Validation rebuilds the canonical `open` ix from the server's view
-//! of the args (salt, deposit, splits, grace period) and checks the
-//! submitted tx carries exactly that one ix, byte-for-byte, with
-//! account-meta flags and signature-vec length matching the message
-//! header. Anything else trips a typed `MaliciousTx`, `BadFeePayerSlot`,
-//! or `BlockhashMismatch` rejection before we hit the RPC.
+//! Validation rebuilds the canonical multi-ix tx the server would emit
+//! (compute-budget prelude, `CreateIdempotent` ATAs for payee, payer,
+//! and each split recipient, then the payment-channels `open` ix) and
+//! byte-compares the submitted tx slot-by-slot. The channel vault ATA
+//! is intentionally NOT in the prelude: upstream's `open` ix creates it
+//! itself non-idempotently, and a preceding `CreateIdempotent` would
+//! race with that and trip `IllegalOwner`. Any reorder, insert, or
+//! tamper trips a typed `MaliciousTx`, `BadFeePayerSlot`, or
+//! `BlockhashMismatch` rejection before we hit the RPC.
 
-use solana_address::Address;
 use solana_hash::Hash;
-use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 
-use payment_channels_client::instructions::OpenBuilder;
-use payment_channels_client::programs::PAYMENT_CHANNELS_ID;
-use payment_channels_client::types::{DistributionEntry, DistributionRecipients, OpenArgs};
-
 use crate::error::SessionError;
+use crate::program::payment_channels::canonical_tx::{
+    self, build_canonical_open_ixs, DEFAULT_COMPUTE_UNIT_LIMIT, DEFAULT_COMPUTE_UNIT_PRICE,
+    MAX_SPLITS,
+};
 use crate::program::payment_channels::state::find_channel_pda;
 use crate::protocol::intents::session::{OpenPayload, Split};
 use crate::server::session::SessionConfig;
+
+// Re-exports so callers that already import from this module
+// (`session::ix`, `session::topup`, `session::tx_shape`, downstream
+// tests) keep resolving without hopping the canonical path.
+pub use canonical_tx::{
+    addr_to_pk, ata_address, ata_program_id, build_canonical_open_ix, pk_to_addr, spl_token_id,
+    CanonicalOpenInputs,
+};
 
 /// Validated view of a client-submitted open tx. Carries the raw
 /// `Transaction` plus the typed values pulled out of the open ix args.
@@ -36,135 +45,6 @@ pub(crate) struct DecodedOpenTx {
     pub grace_period: u32,
     pub canonical_bump: u8,
     pub channel_id: Pubkey,
-}
-
-/// Inputs for rebuilding the canonical open ix.
-pub struct CanonicalOpenInputs<'a> {
-    pub payer: Pubkey,
-    pub payee: Pubkey,
-    pub mint: Pubkey,
-    pub authorized_signer: Pubkey,
-    pub salt: u64,
-    pub deposit: u64,
-    pub grace_period: u32,
-    pub program_id: Pubkey,
-    pub splits: &'a [Split],
-}
-
-/// Convert typed `Split`s to the upstream `DistributionRecipients`
-/// `OpenBuilder` wants. Trailing slots beyond `splits.len()` are
-/// zero-filled out to the fixed 32-entry wire shape.
-pub(crate) fn splits_to_recipients(splits: &[Split]) -> DistributionRecipients {
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let mut entries: [DistributionEntry; 32] = std::array::from_fn(|_| zero_entry.clone());
-    for (i, s) in splits.iter().take(32).enumerate() {
-        entries[i] = DistributionEntry::from(s);
-    }
-    DistributionRecipients {
-        count: splits.len().min(32) as u8,
-        entries,
-    }
-}
-
-pub(crate) fn pk_to_addr(pk: &Pubkey) -> Address {
-    Address::new_from_array(pk.to_bytes())
-}
-
-pub(crate) fn addr_to_pk(addr: &Address) -> Pubkey {
-    Pubkey::new_from_array(addr.to_bytes())
-}
-
-/// Bridge a 32-byte program-id constant from 2.x `Pubkey` (what
-/// `spl_token` and `spl_associated_token_account_client` re-export)
-/// into the SDK's 3.x `Pubkey`. No-op byte-wise.
-fn id_v2_to_v3(bytes: [u8; 32]) -> Pubkey {
-    Pubkey::new_from_array(bytes)
-}
-
-pub fn spl_token_id() -> Pubkey {
-    id_v2_to_v3(spl_token::id().to_bytes())
-}
-
-pub(crate) fn ata_program_id() -> Pubkey {
-    id_v2_to_v3(spl_associated_token_account_client::program::ID.to_bytes())
-}
-
-/// Derive the ATA for `(wallet, mint, token_program)`. Mirrors
-/// `spl_associated_token_account_client::address::get_associated_token_address_with_program_id`
-/// but stays in v3 `Pubkey` to skip the dual-version crate hop.
-pub fn ata_address(wallet: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubkey {
-    let (pda, _) = Pubkey::find_program_address(
-        &[
-            wallet.as_ref(),
-            token_program_id.as_ref(),
-            mint.as_ref(),
-        ],
-        &ata_program_id(),
-    );
-    pda
-}
-
-/// Build the canonical `open` ix matching what an honest client emits
-/// via `OpenBuilder`.
-pub fn build_canonical_open_ix(inputs: &CanonicalOpenInputs<'_>) -> Instruction {
-    // Event authority PDA, single seed `b"event_authority"`. Upstream
-    // declares it in `program/payment_channels/src/event_engine.rs`
-    // but the Codama client doesn't re-export it.
-    let (event_authority_pk, _) =
-        Pubkey::find_program_address(&[b"event_authority"], &inputs.program_id);
-
-    let token_program_pk = spl_token_id();
-    let token_program = pk_to_addr(&token_program_pk);
-    let ata_program = pk_to_addr(&ata_program_id());
-
-    let payer_addr = pk_to_addr(&inputs.payer);
-    let payee_addr = pk_to_addr(&inputs.payee);
-    let mint_addr = pk_to_addr(&inputs.mint);
-    let auth_addr = pk_to_addr(&inputs.authorized_signer);
-
-    let (channel_pda, _bump) = find_channel_pda(
-        &inputs.payer,
-        &inputs.payee,
-        &inputs.mint,
-        &inputs.authorized_signer,
-        inputs.salt,
-        &inputs.program_id,
-    );
-    let channel_addr = pk_to_addr(&channel_pda);
-
-    // ATAs derive against classic SPL Token in v1; using a different
-    // token program here would yield a different ATA.
-    let payer_token_account_pk = ata_address(&inputs.payer, &inputs.mint, &token_program_pk);
-    let channel_token_account_pk = ata_address(&channel_pda, &inputs.mint, &token_program_pk);
-    let payer_token_account_addr = pk_to_addr(&payer_token_account_pk);
-    let channel_token_account_addr = pk_to_addr(&channel_token_account_pk);
-
-    let open_args = OpenArgs {
-        salt: inputs.salt,
-        deposit: inputs.deposit,
-        grace_period: inputs.grace_period,
-        recipients: splits_to_recipients(inputs.splits),
-    };
-
-    OpenBuilder::new()
-        .payer(payer_addr)
-        .payee(payee_addr)
-        .mint(mint_addr)
-        .authorized_signer(auth_addr)
-        .channel(channel_addr)
-        .payer_token_account(payer_token_account_addr)
-        .channel_token_account(channel_token_account_addr)
-        .token_program(token_program)
-        .system_program(pk_to_addr(&solana_sdk_ids::system_program::ID))
-        .rent(pk_to_addr(&solana_sdk_ids::sysvar::rent::ID))
-        .associated_token_program(ata_program)
-        .event_authority(pk_to_addr(&event_authority_pk))
-        .self_program(PAYMENT_CHANNELS_ID)
-        .open_args(open_args)
-        .instruction()
 }
 
 struct ParsedOpenPayload {
@@ -218,15 +98,26 @@ fn parse_open_payload(payload: &OpenPayload) -> Result<ParsedOpenPayload, Sessio
     })
 }
 
-/// Validate a client-submitted open tx against the canonical bytes the
-/// server would emit. Typed `splits` keeps the wire/typed conversion at
-/// the handler boundary so this helper stays on the byte contract.
+/// Validate a client-submitted open tx against the canonical multi-ix
+/// list the server would emit. Typed `splits` keeps the wire/typed
+/// conversion at the handler boundary so this helper stays on the byte
+/// contract.
 pub(crate) fn validate_open_tx_shape(
     payload: &OpenPayload,
     splits: &[Split],
     config: &SessionConfig,
     expected_blockhash: &Hash,
 ) -> Result<DecodedOpenTx, SessionError> {
+    if splits.len() > MAX_SPLITS {
+        return Err(SessionError::MaliciousTx {
+            reason: format!(
+                "open: splits.len() = {} exceeds the {}-recipient cap",
+                splits.len(),
+                MAX_SPLITS,
+            ),
+        });
+    }
+
     let parsed = parse_open_payload(payload)?;
 
     let fee_payer = config.fee_payer.as_ref().ok_or_else(|| {
@@ -243,21 +134,24 @@ pub(crate) fn validate_open_tx_shape(
         &config.program_id,
     );
 
-    let canonical_ix = build_canonical_open_ix(&CanonicalOpenInputs {
+    let canonical_ixs = build_canonical_open_ixs(&CanonicalOpenInputs {
+        program_id: config.program_id,
         payer: parsed.payer,
         payee: parsed.payee,
         mint: parsed.mint,
         authorized_signer: parsed.authorized_signer,
         salt: parsed.salt,
         deposit: parsed.deposit,
-        grace_period: config.grace_period_seconds,
-        program_id: config.program_id,
+        grace_period_seconds: config.grace_period_seconds,
         splits,
+        channel_id: canonical_pda,
+        compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+        compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
     });
 
-    let tx = crate::server::session::tx_shape::validate_canonical_single_ix_tx_shape(
+    let tx = crate::server::session::tx_shape::validate_canonical_multi_ix_tx_shape(
         &payload.transaction,
-        &canonical_ix,
+        &canonical_ixs,
         &fee_payer_pk,
         expected_blockhash,
         "open",
@@ -281,6 +175,7 @@ mod tests {
     use super::*;
     use crate::protocol::intents::session::{typed_to_wire, Split};
     use crate::server::session::Pricing;
+    use payment_channels_client::programs::PAYMENT_CHANNELS_ID;
     use solana_keychain::MemorySigner;
     use solana_message::Message;
     use solana_sdk::signature::Keypair;
@@ -317,8 +212,8 @@ mod tests {
         Vec::new()
     }
 
-    /// Payload + canonical tx pair, signed by the payer only. Fee-payer
-    /// slot stays empty per the wire format.
+    /// Payload + canonical multi-ix tx pair, signed by the payer only.
+    /// Fee-payer slot stays empty per the wire format.
     fn build_payload_and_tx(
         config: &SessionConfig,
         payer: &Keypair,
@@ -327,35 +222,26 @@ mod tests {
         deposit: u64,
         blockhash: Hash,
     ) -> (OpenPayload, Transaction) {
-        let splits = empty_splits();
-        let canonical_ix = build_canonical_open_ix(&CanonicalOpenInputs {
-            payer: payer.pubkey(),
-            payee: config.payee,
-            mint: config.mint,
+        build_payload_and_tx_with_splits(
+            config,
+            payer,
             authorized_signer,
             salt,
             deposit,
-            grace_period: config.grace_period_seconds,
-            program_id: config.program_id,
-            splits: &splits,
-        });
+            blockhash,
+            &empty_splits(),
+        )
+    }
 
-        let fee_payer_pk = config.fee_payer.as_ref().unwrap().signer.pubkey();
-        let fee_payer_addr = pk_to_addr(&fee_payer_pk);
-
-        let message = Message::new_with_blockhash(
-            &[canonical_ix],
-            Some(&fee_payer_addr),
-            &blockhash,
-        );
-
-        let mut tx = Transaction::new_unsigned(message);
-        tx.signatures = vec![
-            solana_signature::Signature::default();
-            tx.message.header.num_required_signatures as usize
-        ];
-        tx.partial_sign(&[payer], blockhash);
-
+    fn build_payload_and_tx_with_splits(
+        config: &SessionConfig,
+        payer: &Keypair,
+        authorized_signer: Pubkey,
+        salt: u64,
+        deposit: u64,
+        blockhash: Hash,
+        splits: &[Split],
+    ) -> (OpenPayload, Transaction) {
         let (channel_pda, bump) = find_channel_pda(
             &payer.pubkey(),
             &config.payee,
@@ -364,6 +250,33 @@ mod tests {
             salt,
             &config.program_id,
         );
+
+        let canonical_ixs = build_canonical_open_ixs(&CanonicalOpenInputs {
+            program_id: config.program_id,
+            payer: payer.pubkey(),
+            payee: config.payee,
+            mint: config.mint,
+            authorized_signer,
+            salt,
+            deposit,
+            grace_period_seconds: config.grace_period_seconds,
+            splits,
+            channel_id: channel_pda,
+            compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+            compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
+        });
+
+        let fee_payer_pk = config.fee_payer.as_ref().unwrap().signer.pubkey();
+        let fee_payer_addr = pk_to_addr(&fee_payer_pk);
+
+        let message = Message::new_with_blockhash(&canonical_ixs, Some(&fee_payer_addr), &blockhash);
+
+        let mut tx = Transaction::new_unsigned(message);
+        tx.signatures = vec![
+            solana_signature::Signature::default();
+            tx.message.header.num_required_signatures as usize
+        ];
+        tx.partial_sign(&[payer], blockhash);
 
         let payload = OpenPayload {
             challenge_id: "challenge-id".into(),
@@ -375,7 +288,7 @@ mod tests {
             salt: salt.to_string(),
             bump,
             deposit_amount: deposit.to_string(),
-            distribution_splits: typed_to_wire(&splits),
+            distribution_splits: typed_to_wire(splits),
             transaction: encode_tx_b64(&tx),
         };
         (payload, tx)
@@ -404,8 +317,8 @@ mod tests {
 
     #[test]
     fn extra_instruction_rejects_with_malicious_tx() {
-        // System ix appended; the count check fires before any per-ix
-        // work, so even a benign program is rejected.
+        // Append an extra ix beyond the canonical multi-ix list. Length
+        // mismatch fires before any per-ix work.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let auth_signer = Keypair::new().pubkey();
@@ -413,7 +326,9 @@ mod tests {
         let (mut payload, mut tx) =
             build_payload_and_tx(&cfg, &payer, auth_signer, 42, 1_000_000, blockhash);
 
-        let system_addr = Address::new_from_array(solana_sdk_ids::system_program::ID.to_bytes());
+        let system_addr = solana_address::Address::new_from_array(
+            solana_sdk_ids::system_program::ID.to_bytes(),
+        );
         tx.message.account_keys.push(system_addr);
         let sys_idx = (tx.message.account_keys.len() - 1) as u8;
         tx.message
@@ -428,7 +343,7 @@ mod tests {
         let err = validate_open_tx_shape(&payload, &empty_splits(), &cfg, &blockhash)
             .expect_err("extra ix must reject");
         assert!(
-            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("expected exactly 1 instruction")),
+            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("mismatch") || reason.contains("expected")),
             "{err:?}"
         );
     }
@@ -465,26 +380,6 @@ mod tests {
         let auth_signer = Keypair::new().pubkey();
         let blockhash = Hash::new_from_array([7u8; 32]);
 
-        let canonical_ix = build_canonical_open_ix(&CanonicalOpenInputs {
-            payer: payer.pubkey(),
-            payee: cfg.payee,
-            mint: cfg.mint,
-            authorized_signer: auth_signer,
-            salt: 42,
-            deposit: 1_000_000,
-            grace_period: cfg.grace_period_seconds,
-            program_id: cfg.program_id,
-            splits: &empty_splits(),
-        });
-        let attacker_fp_addr = pk_to_addr(&attacker_fee_payer.pubkey());
-        let message = Message::new_with_blockhash(&[canonical_ix], Some(&attacker_fp_addr), &blockhash);
-        let mut tx = Transaction::new_unsigned(message);
-        tx.signatures = vec![
-            solana_signature::Signature::default();
-            tx.message.header.num_required_signatures as usize
-        ];
-        tx.partial_sign(&[&payer], blockhash);
-
         let (channel_pda, bump) = find_channel_pda(
             &payer.pubkey(),
             &cfg.payee,
@@ -493,6 +388,31 @@ mod tests {
             42,
             &cfg.program_id,
         );
+
+        let canonical_ixs = build_canonical_open_ixs(&CanonicalOpenInputs {
+            program_id: cfg.program_id,
+            payer: payer.pubkey(),
+            payee: cfg.payee,
+            mint: cfg.mint,
+            authorized_signer: auth_signer,
+            salt: 42,
+            deposit: 1_000_000,
+            grace_period_seconds: cfg.grace_period_seconds,
+            splits: &empty_splits(),
+            channel_id: channel_pda,
+            compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+            compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
+        });
+        let attacker_fp_addr = pk_to_addr(&attacker_fee_payer.pubkey());
+        let message =
+            Message::new_with_blockhash(&canonical_ixs, Some(&attacker_fp_addr), &blockhash);
+        let mut tx = Transaction::new_unsigned(message);
+        tx.signatures = vec![
+            solana_signature::Signature::default();
+            tx.message.header.num_required_signatures as usize
+        ];
+        tx.partial_sign(&[&payer], blockhash);
+
         let payload = OpenPayload {
             challenge_id: "challenge-id".into(),
             channel_id: channel_pda.to_string(),
@@ -542,7 +462,7 @@ mod tests {
     #[test]
     fn tampered_open_ix_data_rejects() {
         // Flip one byte inside the open ix data; everything else stays
-        // canonical so only the byte-compare fires.
+        // canonical so only the byte-compare on the matching slot fires.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let auth_signer = Keypair::new().pubkey();
@@ -550,7 +470,6 @@ mod tests {
         let (mut payload, mut tx) =
             build_payload_and_tx(&cfg, &payer, auth_signer, 42, 1_000_000, blockhash);
 
-        // Index 1 sits inside the `OpenArgs.salt` u64.
         let pc_program_pk = addr_to_pk(&PAYMENT_CHANNELS_ID);
         for ix in tx.message.instructions.iter_mut() {
             let key = tx.message.account_keys[ix.program_id_index as usize];
@@ -564,7 +483,7 @@ mod tests {
         let err = validate_open_tx_shape(&payload, &empty_splits(), &cfg, &blockhash)
             .expect_err("tampered ix must reject");
         assert!(
-            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("does not match canonical bytes")),
+            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("mismatch")),
             "{err:?}"
         );
     }

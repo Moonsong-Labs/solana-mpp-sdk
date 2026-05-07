@@ -2,26 +2,28 @@
 //! against the advertised challenge, co-signs as fee payer,
 //! broadcasts, and bumps the persisted deposit.
 //!
-//! Validation rebuilds the canonical `top_up` ix from server-side
-//! values (channel id, additional amount) and compares it against
-//! the submitted tx byte-for-byte. Same single-ix, signer-count,
-//! signature-vec, fee-payer-slot, and blockhash gates as
-//! `process_open`. Token-2022 ATAs derive against a different program
-//! id, so v1 keeps the canonical ix on classic SPL.
+//! Validation rebuilds the canonical multi-ix top-up tx (compute-budget
+//! prelude plus the upstream `top_up` ix) and byte-compares the
+//! submitted tx slot-by-slot. Same fee-payer-slot, signer-count,
+//! signature-vec, and blockhash gates as `process_open`. Token-2022
+//! ATAs derive against a different program id, so v1 keeps the
+//! canonical ix on classic SPL.
 
 use solana_hash::Hash;
-use solana_instruction::Instruction;
 use solana_pubkey::Pubkey;
 use solana_transaction::Transaction;
 
-use payment_channels_client::instructions::TopUpBuilder;
-use payment_channels_client::types::TopUpArgs;
-
 use crate::error::SessionError;
+use crate::program::payment_channels::canonical_tx::{
+    self, build_canonical_topup_ixs, DEFAULT_COMPUTE_UNIT_LIMIT, DEFAULT_COMPUTE_UNIT_PRICE,
+};
 use crate::protocol::intents::session::TopUpPayload;
-use crate::server::session::open::{ata_address, pk_to_addr, spl_token_id};
-use crate::server::session::tx_shape::validate_canonical_single_ix_tx_shape;
+use crate::server::session::tx_shape::validate_canonical_multi_ix_tx_shape;
 use crate::server::session::SessionConfig;
+
+// Re-exports so downstream tests that import from this module keep
+// resolving without hopping the canonical path.
+pub use canonical_tx::{build_canonical_topup_ix, CanonicalTopupInputs};
 
 /// Validated top-up tx; slot 0 stays empty for the caller to fill
 /// with the fee-payer sig.
@@ -30,44 +32,8 @@ pub(crate) struct DecodedTopupTx {
     pub tx: Transaction,
 }
 
-/// Inputs for rebuilding the canonical `top_up` ix.
-pub struct CanonicalTopupInputs {
-    pub payer: Pubkey,
-    pub mint: Pubkey,
-    pub channel_id: Pubkey,
-    pub additional_amount: u64,
-}
-
-/// Build the canonical `top_up` ix matching what an honest client emits
-/// via upstream's `TopUpBuilder`.
-pub fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
-    let token_program_pk = spl_token_id();
-    let token_program = pk_to_addr(&token_program_pk);
-
-    let payer_addr = pk_to_addr(&inputs.payer);
-    let mint_addr = pk_to_addr(&inputs.mint);
-    let channel_addr = pk_to_addr(&inputs.channel_id);
-
-    // Both ATAs derive against classic SPL Token in v1.
-    let payer_token_account_pk = ata_address(&inputs.payer, &inputs.mint, &token_program_pk);
-    let channel_token_account_pk =
-        ata_address(&inputs.channel_id, &inputs.mint, &token_program_pk);
-
-    TopUpBuilder::new()
-        .payer(payer_addr)
-        .channel(channel_addr)
-        .payer_token_account(pk_to_addr(&payer_token_account_pk))
-        .channel_token_account(pk_to_addr(&channel_token_account_pk))
-        .mint(mint_addr)
-        .token_program(token_program)
-        .top_up_args(TopUpArgs {
-            amount: inputs.additional_amount,
-        })
-        .instruction()
-}
-
-/// Validate a client-submitted top-up tx against the canonical `top_up`
-/// ix the server would emit for `(channel_id, additional)`.
+/// Validate a client-submitted top-up tx against the canonical multi-ix
+/// list the server would emit for `(channel_id, additional)`.
 pub(crate) fn validate_topup_tx_shape(
     tx_b64: &str,
     config: &SessionConfig,
@@ -82,16 +48,19 @@ pub(crate) fn validate_topup_tx_shape(
     })?;
     let fee_payer_pk = fee_payer.signer.pubkey();
 
-    let canonical_ix = build_canonical_topup_ix(&CanonicalTopupInputs {
+    let canonical_ixs = build_canonical_topup_ixs(&CanonicalTopupInputs {
+        program_id: config.program_id,
         payer: *expected_payer,
-        mint: *expected_mint,
         channel_id: *expected_channel_id,
-        additional_amount: expected_additional,
+        mint: *expected_mint,
+        amount: expected_additional,
+        compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+        compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
     });
 
-    let tx = validate_canonical_single_ix_tx_shape(
+    let tx = validate_canonical_multi_ix_tx_shape(
         tx_b64,
-        &canonical_ix,
+        &canonical_ixs,
         &fee_payer_pk,
         expected_blockhash,
         "topup",
@@ -184,8 +153,8 @@ mod tests {
         (cfg, fee_payer_pk)
     }
 
-    /// Canonical top-up tx signed by the payer; slot 0 stays empty
-    /// for the server's fee-payer sig.
+    /// Canonical multi-ix top-up tx signed by the payer; slot 0 stays
+    /// empty for the server's fee-payer sig.
     fn build_topup_payload_and_tx(
         config: &SessionConfig,
         payer: &Keypair,
@@ -193,18 +162,21 @@ mod tests {
         additional: u64,
         blockhash: Hash,
     ) -> (TopUpPayload, Transaction) {
-        let canonical_ix = build_canonical_topup_ix(&CanonicalTopupInputs {
+        let canonical_ixs = build_canonical_topup_ixs(&CanonicalTopupInputs {
+            program_id: config.program_id,
             payer: payer.pubkey(),
-            mint: config.mint,
             channel_id,
-            additional_amount: additional,
+            mint: config.mint,
+            amount: additional,
+            compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+            compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
         });
 
         let fee_payer_pk = config.fee_payer.as_ref().unwrap().signer.pubkey();
         let fee_payer_addr = pk_to_addr(&fee_payer_pk);
 
         let message =
-            Message::new_with_blockhash(&[canonical_ix], Some(&fee_payer_addr), &blockhash);
+            Message::new_with_blockhash(&canonical_ixs, Some(&fee_payer_addr), &blockhash);
         let mut tx = Transaction::new_unsigned(message);
         tx.signatures = vec![
             solana_signature::Signature::default();
@@ -256,8 +228,8 @@ mod tests {
 
     #[test]
     fn extra_instruction_rejects_with_malicious_tx() {
-        // System ix appended; the count check fires before any per-ix
-        // work, so even a benign program is rejected.
+        // Append an extra ix beyond the canonical multi-ix list; the
+        // length check fires before any per-ix work.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let cid = dummy_channel_id();
@@ -289,7 +261,7 @@ mod tests {
         )
         .expect_err("extra ix must reject");
         assert!(
-            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("expected exactly 1 instruction")),
+            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("mismatch") || reason.contains("expected")),
             "{err:?}"
         );
     }
@@ -333,15 +305,18 @@ mod tests {
         let cid = dummy_channel_id();
         let blockhash = Hash::new_from_array([7u8; 32]);
 
-        let canonical_ix = build_canonical_topup_ix(&CanonicalTopupInputs {
+        let canonical_ixs = build_canonical_topup_ixs(&CanonicalTopupInputs {
+            program_id: cfg.program_id,
             payer: payer.pubkey(),
-            mint: cfg.mint,
             channel_id: cid,
-            additional_amount: 500_000,
+            mint: cfg.mint,
+            amount: 500_000,
+            compute_unit_price: DEFAULT_COMPUTE_UNIT_PRICE,
+            compute_unit_limit: DEFAULT_COMPUTE_UNIT_LIMIT,
         });
         let attacker_addr = pk_to_addr(&attacker_fee_payer.pubkey());
         let message =
-            Message::new_with_blockhash(&[canonical_ix], Some(&attacker_addr), &blockhash);
+            Message::new_with_blockhash(&canonical_ixs, Some(&attacker_addr), &blockhash);
         let mut tx = Transaction::new_unsigned(message);
         tx.signatures = vec![
             solana_signature::Signature::default();
@@ -406,8 +381,10 @@ mod tests {
 
     #[test]
     fn tampered_topup_ix_data_rejects() {
-        // Index 1 sits inside the `TopUpArgs.amount` u64 (byte 0 is
-        // the discriminator).
+        // Flip a byte inside the payment-channels `top_up` ix data
+        // (index 1 sits inside the `TopUpArgs.amount` u64; byte 0 is
+        // the discriminator). Only the matching slot's byte-compare
+        // fires.
         let (cfg, _) = config_with_fresh_fee_payer();
         let payer = Keypair::new();
         let cid = dummy_channel_id();
@@ -436,7 +413,7 @@ mod tests {
         )
         .expect_err("tampered topup ix must reject");
         assert!(
-            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("does not match canonical bytes")),
+            matches!(err, SessionError::MaliciousTx { ref reason } if reason.contains("mismatch")),
             "{err:?}"
         );
     }
