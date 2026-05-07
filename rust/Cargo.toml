@@ -138,6 +138,12 @@ dashmap = "6"
 # wiring lands in a follow-up.
 futures = "0.3"
 
+# Random salt for auto-open. Already pulled transitively via ed25519-dalek
+# and the solana stack; declared direct because the fetch loop calls
+# `rand::random::<u64>()` on every auto-open to keep PDA derivations
+# unique across close+reopen cycles.
+rand = "0.8"
+
 [dev-dependencies]
 axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }

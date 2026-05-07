@@ -142,6 +142,21 @@ impl ActiveSession {
         self.current_deposit = new_deposit;
     }
 
+    /// Roll back the `signed_cumulative` watermark.
+    ///
+    /// The fetch loop uses this to undo a `sign_increment` advance when
+    /// the server rejects the voucher with a refresh-eligible code
+    /// (challenge unbound, blockhash mismatch, etc.). Without it, a
+    /// retry would call `sign_increment(amount)` against the
+    /// already-advanced watermark and double-charge.
+    ///
+    /// `pub(crate)` because it bypasses the monotonicity check in
+    /// `sign_voucher`. Only the fetch loop captures the prior value
+    /// before signing and can put it back safely.
+    pub(crate) fn set_signed_cumulative(&mut self, value: u64) {
+        self.signed_cumulative = value;
+    }
+
     /// Sign a voucher at an absolute cumulative.
     ///
     /// Order of checks (matters: callers want to know which invariant
@@ -616,6 +631,31 @@ mod tests {
             .expect_err("accepted > signed rejected");
         assert!(matches!(err, ClientError::ProtocolViolation(_)));
         assert_eq!(s.accepted_cumulative(), 0);
+    }
+
+    /// Rollback path the fetch loop relies on: after `sign_increment`
+    /// advances the watermark, a server rejection has to walk it back
+    /// or the retry charges twice.
+    #[tokio::test]
+    async fn set_signed_cumulative_rolls_back_for_retry() {
+        let (mut s, _) = fresh_session(10_000);
+        s.sign_voucher(100, None).await.expect("first voucher");
+
+        let prior = s.signed_cumulative();
+        assert_eq!(prior, 100);
+        s.sign_increment(50, None).await.expect("retry candidate signs");
+        assert_eq!(s.signed_cumulative(), 150);
+
+        s.set_signed_cumulative(prior);
+        assert_eq!(s.signed_cumulative(), 100);
+
+        // Re-sign at the original target after rolling back.
+        let v = s
+            .sign_increment(50, None)
+            .await
+            .expect("post-rollback sign at the same target succeeds");
+        assert_eq!(v.voucher.cumulative_amount, "150");
+        assert_eq!(s.signed_cumulative(), 150);
     }
 
     /// A voucher receipt without `acceptedCumulative` is malformed.

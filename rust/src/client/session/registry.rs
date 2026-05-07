@@ -169,6 +169,31 @@ impl SessionRegistry {
         Ok(cell)
     }
 
+    /// Find the cell whose `OpenedChannel` holds `channel_id` and
+    /// return it alongside its `(payee, mint)` key, so the close path
+    /// can `forget` without re-traversing the map. Linear scan, fine
+    /// for the handful of open channels a client holds at once.
+    /// Snapshots the keys first so the dashmap entry guard never spans
+    /// the per-cell `lock().await`.
+    pub async fn lookup_by_channel_id(
+        &self,
+        channel_id: &Pubkey,
+    ) -> Option<((Pubkey, Pubkey), SessionCell)> {
+        let snapshot: Vec<((Pubkey, Pubkey), SessionCell)> = self
+            .sessions
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        for (key, cell) in snapshot {
+            let guard = cell.lock().await;
+            if guard.0.channel_id == *channel_id {
+                drop(guard);
+                return Some((key, cell));
+            }
+        }
+        None
+    }
+
     /// Removes the cached session for `(payee, mint)`.
     ///
     /// Used by the high-level fetch flow when a channel transitions

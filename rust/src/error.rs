@@ -722,4 +722,5 @@ pub enum PolicyErrorCode {
     MaxDepositExceeded,
     MaxCumulativeExceeded,
     MinVoucherDeltaNotMet,
+    AutoOpenDisabled,
 }

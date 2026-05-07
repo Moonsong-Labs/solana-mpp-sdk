@@ -17,6 +17,7 @@ use crate::client::session::SessionReceipt;
 /// HTTP response with the body pre-drained, plus the typed receipt and
 /// the channel id that paid for it. Cheap to clone-by-reference; the
 /// body itself is an `Arc`-backed `Bytes` so accessor calls don't copy.
+#[derive(Debug)]
 pub struct PaidResponse {
     status: StatusCode,
     headers: HeaderMap,
