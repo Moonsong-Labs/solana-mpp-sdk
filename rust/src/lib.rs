@@ -99,8 +99,8 @@ pub use server::session::{
 // reach into `client::session::` paths.
 #[cfg(feature = "client")]
 pub use client::session::{
-    ActiveSession, OpenTxBuild, OpenedChannel, SessionCell, SessionClient, SessionReceipt,
-    SessionRegistry,
+    select_session_challenge, ActiveSession, ClientPolicy, OpenTxBuild, OpenedChannel,
+    ResolvedPolicy, SessionCell, SessionClient, SessionReceipt, SessionRegistry,
 };
 
 // Re-export crates callers need to use with the charge builder.
