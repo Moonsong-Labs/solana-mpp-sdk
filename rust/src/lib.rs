@@ -98,7 +98,7 @@ pub use server::session::{
 // Session intent client surface. Re-exported so callers don't have to
 // reach into `client::session::` paths.
 #[cfg(feature = "client")]
-pub use client::session::{ActiveSession, SessionReceipt};
+pub use client::session::{ActiveSession, OpenTxBuild, SessionClient, SessionReceipt};
 
 // Re-export crates callers need to use with the charge builder.
 pub use solana_keychain;
