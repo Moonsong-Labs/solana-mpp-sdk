@@ -56,7 +56,7 @@ The interop matrix tests every client against every server. A shared Python test
 | Language | Coverage | Tests |
 |----------|----------|-------|
 | TypeScript | ![TS](https://img.shields.io/badge/coverage-67_tests-blue) | `just ts-test` |
-| Rust | ![Rust](https://img.shields.io/badge/coverage-271_tests-blue) | `just rs-test` |
+| Rust | ![Rust](https://img.shields.io/badge/coverage-653_tests-blue) | `just rs-test` |
 | Go | ![Go](https://img.shields.io/badge/coverage-84%25-green) | `just go-test` |
 | Python | ![Python](https://img.shields.io/badge/coverage-87%25-green) | `just py-test` |
 | Lua | ![Lua](https://img.shields.io/badge/coverage-41_tests-blue) | `just lua-test` |

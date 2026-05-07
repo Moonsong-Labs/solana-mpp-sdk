@@ -237,12 +237,6 @@ impl SessionClient {
 
     /// Submit the upstream `finalize` ix from `Closing`. Permissionless
     /// post-grace transition to `Finalized`. Confirms before returning.
-    ///
-    /// Note: at the pinned upstream rev `finalize` returns
-    /// `PaymentChannelsError::NotImplemented` from the cluster; the
-    /// builder is wired up but live calls fail. The escape route is
-    /// kept here for forward compatibility and for L1 oracles to drive
-    /// the path once upstream lands the implementation.
     pub async fn finalize(&self, channel_id: &Pubkey) -> Result<Signature, ClientError> {
         let _view = self
             .fetch_view_and_check_status(channel_id, &[ChannelStatus::Closing], "finalize")
@@ -259,9 +253,6 @@ impl SessionClient {
     /// Submit the upstream `withdraw_payer` ix from `Finalized`. Pulls
     /// the unsettled remainder back to the payer's funding ATA.
     /// Confirms before returning.
-    ///
-    /// Same upstream-stub caveat as `finalize` at the pinned rev: the
-    /// builder ships, the live ix returns `NotImplemented`.
     pub async fn withdraw_payer(&self, channel_id: &Pubkey) -> Result<Signature, ClientError> {
         let view = self
             .fetch_view_and_check_status(
