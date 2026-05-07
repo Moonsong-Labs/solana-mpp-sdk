@@ -1,5 +1,7 @@
 set shell := ["bash", "-uc"]
 
+REPO_ROOT := `git rev-parse --show-toplevel`
+
 default:
     @just --list
 
@@ -146,3 +148,80 @@ fmt: ts-fmt rs-fmt go-fmt py-fmt
 
 # Pre-commit checks
 pre-commit: ts-audit ts-fmt ts-typecheck ts-test rs-fmt rs-lint rs-test go-fmt go-test-cover lua-test-cover py-lint py-test-cover
+
+# ── Payment-channels program binary ──
+
+# Build the program .so at the SHA Cargo.lock pins and verify its sha256
+fetch-program-binary:
+    ./scripts/fetch-program-binary.sh
+
+# One-time maintainer action: build + record the canonical .so hash
+fetch-program-binary-bootstrap:
+    ./scripts/fetch-program-binary.sh --bootstrap
+
+# Verify the built .so matches the committed hash (no rebuild)
+verify-binary-hash:
+    @test -s {{REPO_ROOT}}/rust/src/program/payment_channels/program_binary.sha256 || \
+        (echo "ERROR: program_binary.sha256 is empty; run 'just fetch-program-binary-bootstrap'" && exit 1)
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    @cd {{REPO_ROOT}}/rust/tests/fixtures && \
+        shasum -a 256 -c {{REPO_ROOT}}/rust/src/program/payment_channels/program_binary.sha256
+
+# Run the ed25519 precompile oracle. No program .so fetch required; the test
+# exercises Solana's native ed25519 precompile inside litesvm.
+l1-oracle-ed25519:
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_ed25519_oracle -- --nocapture
+
+# Run the open-ix + PDA oracle. Requires the pinned program .so to be fetched
+# into rust/tests/fixtures. Submits an SDK-built `open` against the loaded
+# program and asserts the resulting Channel PDA records the canonical bump.
+l1-oracle-open:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_open_oracle -- --nocapture
+
+# Run the top_up oracle. Requires the pinned program .so. Opens a channel
+# via the upstream `OpenBuilder`, submits a `top_up` ix via `TopUpBuilder`,
+# and asserts the SDK-decoded `ChannelView` shows the deposit advancing by
+# exactly the top-up amount with status / version / settled untouched.
+l1-oracle-topup:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_topup_oracle -- --nocapture
+
+# Run the distribute oracle. Requires the pinned program .so. Opens a
+# channel via OpenBuilder with two bps recipients, settles one voucher
+# via SettleBuilder + ed25519 precompile, then submits a DistributeBuilder
+# tx and asserts each recipient ATA holds its floor share.
+l1-oracle-distribute:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_distribute_oracle -- --nocapture
+
+# Run the request_close oracle. Requires the pinned program .so. Opens a
+# channel via OpenBuilder, submits a `request_close` ix via
+# RequestCloseBuilder, and asserts the SDK-decoded `ChannelView` shows
+# status=Closing with closure_started_at set and other fields untouched.
+l1-oracle-request-close:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_request_close_oracle -- --nocapture
+
+# Run the settle_and_finalize oracle. Requires the pinned program .so.
+# Two test cases exercise both `has_voucher` shapes of the cooperative-
+# close branch: with-voucher applies a fresh voucher then transitions to
+# Finalized, without-voucher locks the prior settled value.
+l1-oracle-settle-finalize:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_settle_finalize_oracle -- --nocapture
+
+# Run the end-to-end tombstone oracle. Requires the pinned program .so.
+# Drives the full close lifecycle (open + settle + settle_and_finalize +
+# distribute) and asserts the post-distribute PDA is exactly [2u8] with
+# program ownership preserved.
+l1-oracle-tombstone:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --no-default-features --test session_l1_tombstone_oracle -- --nocapture

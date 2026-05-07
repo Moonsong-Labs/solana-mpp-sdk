@@ -2,6 +2,7 @@
 name = "solana-mpp"
 version = "0.6.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Solana payment method for the Machine Payments Protocol"
 license = "MIT"
 repository = "https://github.com/solana-foundation/mpp-sdk"
@@ -11,22 +12,61 @@ default = ["server", "client"]
 server = ["dep:tokio"]
 client = ["dep:reqwest"]
 gcp_kms = ["solana-keychain/gcp_kms"]
+# Pull-mode session support via the multi-delegator program. Not supported in v1.
+# The code compiles under this flag but is untested and undocumented.
+pull-mode = []
 
 [dependencies]
 # Signing — solana-keychain with sdk-v3 (fix/deps branch pins solana-signature <3.3)
-solana-keychain = { git = "https://github.com/solana-foundation/solana-keychain", rev = "abf75944", default-features = false, features = ["memory", "sdk-v3"] }
+solana-keychain = { git = "https://github.com/solana-foundation/solana-keychain", rev = "abf75944", default-features = false, features = [
+	"memory",
+	"sdk-v3",
+] }
 
 # Solana — atomic crates only
 solana-hash = { version = "3.1", default-features = false }
 solana-instruction = { version = "3.1", default-features = false }
 solana-message = { version = "3.0", default-features = false }
 solana-pubkey = { version = "3.0", default-features = false }
+solana-address = { version = "2", default-features = false, features = [
+	"borsh",
+] }
 solana-commitment-config = { version = "3.0", default-features = false }
 solana-rpc-client = { version = "3.1", default-features = false }
-solana-signature = { version = "3.1", default-features = false, features = ["default"] }
+solana-signature = { version = "3.1", default-features = false, features = [
+	"default",
+] }
 solana-system-interface = { version = "2.0", default-features = false }
 solana-transaction = { version = "3.0", default-features = false }
 solana-transaction-status = { version = "3.1", default-features = false }
+
+# Added for the payment-channels session module. These crates are used only by
+# that module. `rust/src/client/charge.rs` still hand-rolls its own blocking
+# RPC client, ComputeBudget ixs (lines 182-201, 501-527), and program IDs
+# (lines 182-193); aligning it with these new deps is deferred as tech debt.
+solana-client = { version = "3.1", default-features = false }                       # nonblocking::rpc_client::RpcClient, rpc_config::RpcAccountInfoConfig
+solana-account-decoder-client-types = { version = "3.1", default-features = false } # UiAccount + UiAccountEncoding for get_ui_account_with_config (replaces deprecated get_account_with_config)
+solana-sdk-ids = { version = "3.1", default-features = false }                      # ed25519_program, sysvar::instructions
+solana-ed25519-program = { version = "3.0", default-features = false }              # canonical builder for the ed25519 precompile instruction (extracted out of solana-sdk on the 3.x track)
+solana-compute-budget-interface = { version = "3.0", default-features = false }     # ComputeBudgetInstruction builder (highest published 3.x is 3.0.0)
+spl-token = { version = "8", default-features = false }                             # classic SPL Token Program ID (v1: Token-2022 rejected at process_open)
+spl-token-2022 = { version = "8" }                                                  # Token-2022 program ID, imported ONLY so the open-ix mint-owner check can reject Token-2022 mints in v1. Defaults required: v8 fails to compile with default-features = false (confidential_mint_burn references zk-ops-gated fn unconditionally).
+spl-associated-token-account-client = { version = "2", default-features = false }   # create_associated_token_account_idempotent (highest published is 2.0.0)
+
+# Upstream Codama-generated client for payment_channels. Pinned by rev; Cargo.lock
+# records the resolved revision. The `fetch` feature enables the optional
+# solana-client RPC helpers that `fetch_channel` / `fetch_maybe_channel` depend
+# on; leave it on by default.
+#
+# NOTE (rustc floor): pinning to this upstream rev raises the SDK
+# workspace's effective rustc floor to 1.89 transitively. The new
+# dependency graph (notably `solana-address` 2.6.0 and `solana-pubkey`
+# 4.2.0 pulled by `payment_channels_client`) declares
+# `rust-version = "1.89"`, so older toolchains refuse to resolve the
+# graph. If CI pins an older toolchain, bump it alongside this dep.
+payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "5032612e290b78620148fb564c81a6fc033bd5b4", features = [
+	"fetch",
+] }
 
 # Async
 tokio = { version = "1", features = ["full"], optional = true }
@@ -41,12 +81,15 @@ serde_json_canonicalizer = "0.3"
 bs58 = "0.5"
 base64 = "0.22"
 bincode = "1"
+borsh = { version = "1", default-features = false, features = ["derive"] }
 
 # Crypto (HMAC challenge IDs + distribution hash + voucher verification)
 hmac = "0.12"
 sha2 = "0.10"
 blake3 = "1"
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc"] }
+ed25519-dalek = { version = "2", default-features = false, features = [
+	"alloc",
+] }
 
 # Time (expiration, timestamps)
 time = { version = "0.3", features = ["formatting", "parsing"] }
@@ -62,3 +105,51 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
+
+# Dev-only: `solana-sdk` 3.x provides `Keypair`, `Transaction`, and other
+# umbrella re-exports used by the L1 integration tests. Pinned at 3.0
+# (highest published 3.x on crates.io) rather than the 3.1 atomic-crate
+# track to keep the umbrella release tip aligned. The `full` feature gates
+# the `signature::Keypair` / `transaction::Transaction` re-exports the
+# tests use; without it those modules vanish behind `cfg(feature = "full")`.
+solana-sdk = { version = "3.0", default-features = false, features = ["full"] }
+# `ed25519-dalek` is already declared in [dependencies] above (used by the
+# voucher verification path), so it is not re-declared here.
+
+# L1 integration oracle. Loads the program binary into an in-process SVM to
+# exercise SDK-built transactions end-to-end. Upstream's program tests pin
+# `litesvm = "0.11"` and `litesvm-token = "0.11"` in
+# `program/payment_channels/Cargo.toml`; we match those pins so toolchain
+# drift on these deps is bounded by upstream's own choice. The `precompiles`
+# feature on `litesvm` registers the native ed25519 precompile so the
+# precompile-layout oracle can submit a precompile-only tx without loading the
+# program binary.
+litesvm = { version = "0.11", features = ["precompiles"] }
+litesvm-token = "0.11"
+
+# `spl-associated-token-account-client` 2.0 takes/returns `solana_pubkey::Pubkey`
+# at the 2.x major (semver-pinned in its Cargo.toml). Our prod deps pull
+# `solana-pubkey` 3.x; the 2.x line is already in the lockfile transitively, but
+# we need the type in scope at the call site to bridge through bytes.
+solana-pubkey-v2 = { package = "solana-pubkey", version = "2", default-features = false }
+
+# Targets that depend on feature-gated modules. Declared
+# explicitly so `cargo test --no-default-features` skips them instead of
+# failing to compile the bin / example / test stubs that reference
+# `solana_mpp::{client,server}` and the `reqwest` / `tokio` deps gated
+# behind the corresponding features.
+[[bin]]
+name = "interop_client"
+required-features = ["client"]
+
+[[bin]]
+name = "interop_server"
+required-features = ["server"]
+
+[[example]]
+name = "payment_link_server"
+required-features = ["server", "client"]
+
+[[test]]
+name = "charge_integration"
+required-features = ["server", "client"]

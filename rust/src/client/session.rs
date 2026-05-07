@@ -1,3 +1,8 @@
+#![allow(dead_code, unused_imports, unused_variables)]
+// Draft module: kept in tree as reference for the eventual rewrite, but
+// excluded from every build via the always-false `cfg(any())` gate below.
+#![cfg(any())]
+
 //! Client-side session intent implementation.
 //!
 //! Tracks an open payment channel and signs cumulative vouchers for each

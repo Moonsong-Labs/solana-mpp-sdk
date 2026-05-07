@@ -1,3 +1,8 @@
+#![allow(dead_code, unused_imports, unused_variables)]
+// Draft module: kept in tree as reference for the eventual rewrite, but
+// excluded from every build via the always-false `cfg(any())` gate below.
+#![cfg(any())]
+
 //! Server-side session intent — challenge issuance, voucher verification,
 //! and channel lifecycle management.
 //!
