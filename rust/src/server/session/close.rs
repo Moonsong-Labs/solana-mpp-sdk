@@ -17,14 +17,14 @@
 //!    `Finalized` when distribute runs and the FINALIZED branch
 //!    tombstones the PDA.
 //! 3. distribute: `[ComputeBudget, distribute]`. Single ix carries the
-//!    full `DistributionRecipients` reveal; confirmed and tombstone-checked
-//!    after the fact.
+//!    full recipients reveal; confirmed and tombstone-checked after the
+//!    fact.
 //!
-//! Three txs is forced by upstream's
-//! `DistributionRecipients { count: u8, entries: [DistributionEntry; 32] }`
-//! shape. Borsh serializes the full 32-entry array regardless of `count`,
-//! so distribute alone is ~1600 bytes and cannot share a tx with anything
-//! else and stay under Solana's 1232-byte packet limit.
+//! Three txs is a sizing decision: even with upstream's
+//! `Vec<DistributionEntry>` recipients (length-prefixed, only active
+//! entries serialized), folding distribute or the cold-start ATA
+//! preflight into the settle tx would push the message past Solana's
+//! 1232-byte packet limit at the SDK's `MAX_SPLITS` cardinality.
 //!
 //! All txs are server-built. There's no client-supplied tx to validate
 //! against (unlike open / topup), and the server already trusts the

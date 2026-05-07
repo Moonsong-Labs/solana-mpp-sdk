@@ -21,9 +21,7 @@ use solana_pubkey::Pubkey;
 
 use payment_channels_client::instructions::{OpenBuilder, TopUpBuilder};
 use payment_channels_client::programs::PAYMENT_CHANNELS_ID;
-use payment_channels_client::types::{
-    DistributionEntry, DistributionRecipients, OpenArgs, TopUpArgs,
-};
+use payment_channels_client::types::{DistributionEntry, OpenArgs, TopUpArgs};
 
 use crate::program::payment_channels::state::find_channel_pda;
 use crate::protocol::intents::session::Split;
@@ -235,31 +233,20 @@ pub fn build_canonical_topup_ix(inputs: &CanonicalTopupInputs) -> Instruction {
 
 // ── Local helpers (shared with server/session handlers via re-export) ─
 
-/// Maximum number of distribution splits expressible on chain. Mirrors
-/// the upstream `DistributionRecipients [DistributionEntry; 32]` array
-/// shape; anything beyond this cannot be expressed in the wire format.
-/// `validate_open_tx_shape` rejects with a typed error before the
-/// canonical builder runs; the truncation in `splits_to_recipients` is
-/// belt-and-braces in case a future caller skips the gate.
-pub const MAX_SPLITS: usize = 32;
+/// SDK-side cap on distribution splits. The on-chain program accepts
+/// up to 32 recipients, but the cold-start ATA preflight tx and the
+/// distribute tx both exceed Solana's 1232-byte packet limit before
+/// reaching 32 recipients. 8 keeps all four close txs (preflight,
+/// apply-voucher settle, lock-settled settle, distribute) under the
+/// limit with a margin. `validate_open_tx_shape` rejects opens above
+/// the cap so an operator can't accept an open they can't later close.
+pub const MAX_SPLITS: usize = 8;
 
-/// Convert typed `Split`s to the upstream `DistributionRecipients`
-/// `OpenBuilder` wants. Trailing slots beyond `splits.len()` are
-/// zero-filled out to the fixed `MAX_SPLITS`-entry wire shape.
-pub fn splits_to_recipients(splits: &[Split]) -> DistributionRecipients {
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let mut entries: [DistributionEntry; MAX_SPLITS] =
-        std::array::from_fn(|_| zero_entry.clone());
-    for (i, s) in splits.iter().take(MAX_SPLITS).enumerate() {
-        entries[i] = DistributionEntry::from(s);
-    }
-    DistributionRecipients {
-        count: splits.len().min(MAX_SPLITS) as u8,
-        entries,
-    }
+/// Convert typed `Split`s to the `Vec<DistributionEntry>` upstream's
+/// builders expect. Pure mapping; the cap is enforced earlier in
+/// `validate_open_tx_shape`.
+pub fn splits_to_recipients(splits: &[Split]) -> Vec<DistributionEntry> {
+    splits.iter().map(DistributionEntry::from).collect()
 }
 
 pub fn pk_to_addr(pk: &Pubkey) -> Address {

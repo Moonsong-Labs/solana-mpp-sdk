@@ -24,8 +24,7 @@ use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::{DistributeBuilder, OpenBuilder, SettleBuilder};
 use payment_channels_client::types::{
-    ChannelStatus, DistributeArgs, DistributionEntry, DistributionRecipients, OpenArgs,
-    SettleArgs, VoucherArgs,
+    ChannelStatus, DistributeArgs, DistributionEntry, OpenArgs, SettleArgs, VoucherArgs,
 };
 use solana_address::Address;
 use solana_message::Message;
@@ -196,24 +195,17 @@ fn run_distribute_oracle(f: DistributeFixture) {
         .to_bytes(),
     );
 
-    // Build OpenArgs. count == 2 active recipients; entries 2..32 are
-    // zero-padded and not validated by the on-chain validator.
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| match i {
-        0 => DistributionEntry {
+    // Two active recipients.
+    let recipients = vec![
+        DistributionEntry {
             recipient: recip_a,
             bps: f.recip_a_bps,
         },
-        1 => DistributionEntry {
+        DistributionEntry {
             recipient: recip_b,
             bps: f.recip_b_bps,
         },
-        _ => zero_entry.clone(),
-    });
-    let recipients = DistributionRecipients { count: 2, entries };
+    ];
     let open_args = OpenArgs {
         salt: f.salt,
         deposit: f.deposit,
@@ -303,9 +295,9 @@ fn run_distribute_oracle(f: DistributeFixture) {
     );
 
     // Distribute from Open state. Recipient ATAs attach as remaining
-    // accounts in the same order as args.recipients.entries[..count];
-    // upstream's distribute::process zips entries with remaining accounts,
-    // so the order is load-bearing.
+    // accounts in the same order as args.recipients; upstream's
+    // distribute::process zips them with remaining accounts, so the
+    // order is load-bearing.
     let distribute_ix = DistributeBuilder::new()
         .channel(channel_pda)
         .payer(payer.pubkey())

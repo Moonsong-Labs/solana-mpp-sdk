@@ -14,7 +14,7 @@ use common::{program_id_address, program_id_mpp, program_so_path, to_mpp};
 use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::OpenBuilder;
-use payment_channels_client::types::{DistributionEntry, DistributionRecipients, OpenArgs};
+use payment_channels_client::types::{DistributionEntry, OpenArgs};
 use solana_address::Address;
 use solana_message::Message;
 use solana_mpp::program::payment_channels::state::find_channel_pda;
@@ -94,32 +94,20 @@ fn sdk_built_open_tx_lands_against_loaded_program() {
         .to_bytes(),
     );
 
-    // Single recipient: the payee at 10_000 bps (full pool). This is the
-    // bps-form equivalent of the prior amount-equals-deposit setup; payee
-    // remainder is zero. Upstream rejects bps == 0 entries when count >= 1
-    // covers them, so the zero-padded tail still uses bps == 0 (entries
-    // 1..32 are not validated when count == 1).
+    // Single recipient: the payee at 10_000 bps (full pool). Bps-form
+    // equivalent of the prior amount-equals-deposit setup; payee
+    // remainder is zero.
     let deposit: u64 = 1_000_000;
     let grace_period: u32 = 60;
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
-        if i == 0 {
-            DistributionEntry {
-                recipient: payee,
-                bps: 10_000,
-            }
-        } else {
-            zero_entry.clone()
-        }
-    });
+    let recipients = vec![DistributionEntry {
+        recipient: payee,
+        bps: 10_000,
+    }];
     let open_args = OpenArgs {
         salt,
         deposit,
         grace_period,
-        recipients: DistributionRecipients { count: 1, entries },
+        recipients,
     };
 
     // The event_authority PDA is derived from a single literal seed; note

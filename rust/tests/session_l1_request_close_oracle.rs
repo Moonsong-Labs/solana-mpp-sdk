@@ -13,9 +13,7 @@ use common::{program_id_address, program_id_mpp, program_so_path, to_mpp};
 use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::{OpenBuilder, RequestCloseBuilder};
-use payment_channels_client::types::{
-    ChannelStatus, DistributionEntry, DistributionRecipients, OpenArgs,
-};
+use payment_channels_client::types::{ChannelStatus, OpenArgs};
 use solana_address::Address;
 use solana_message::Message;
 use solana_mpp::program::payment_channels::state::{find_channel_pda, ChannelView};
@@ -61,15 +59,10 @@ fn request_close_transitions_channel_to_closing_with_timestamp() {
     .send()
     .expect("mint to payer ATA");
 
-    // Vanilla payer-payee channel: count=0, payee gets implicit 100% on
-    // distribute. request_close does not depend on the splits shape, so a
-    // count=0 channel is the minimum-fixture form.
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|_| zero_entry.clone());
-    let recipients = DistributionRecipients { count: 0, entries };
+    // Vanilla payer-payee channel: empty recipients, payee gets implicit
+    // 100% on distribute. request_close does not depend on the splits
+    // shape, so an empty-recipients channel is the minimum-fixture form.
+    let recipients = Vec::new();
 
     let salt: u64 = 42;
     let deposit: u64 = 1_000_000;

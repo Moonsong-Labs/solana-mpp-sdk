@@ -23,8 +23,7 @@ use payment_channels_client::instructions::{
     OpenBuilder, RequestCloseBuilder, SettleAndFinalizeBuilder, SettleBuilder,
 };
 use payment_channels_client::types::{
-    ChannelStatus, DistributionEntry, DistributionRecipients, OpenArgs, SettleAndFinalizeArgs,
-    SettleArgs, VoucherArgs,
+    ChannelStatus, OpenArgs, SettleAndFinalizeArgs, SettleArgs, VoucherArgs,
 };
 use solana_address::Address;
 use solana_message::Message;
@@ -83,12 +82,10 @@ fn open_channel(
     .send()
     .expect("mint to payer ATA");
 
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|_| zero_entry.clone());
-    let recipients = DistributionRecipients { count: 0, entries };
+    // Vanilla payer-payee channel: empty recipients, payee gets implicit
+    // 100% on distribute. settle / finalize do not depend on the splits
+    // shape.
+    let recipients = Vec::new();
 
     let deposit: u64 = 1_000_000;
     let grace_period: u32 = 60;

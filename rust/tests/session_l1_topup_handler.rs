@@ -19,7 +19,7 @@ use common::{program_id_address, program_id_mpp, program_so_path, to_mpp};
 use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::OpenBuilder;
-use payment_channels_client::types::{DistributionEntry, DistributionRecipients, OpenArgs};
+use payment_channels_client::types::{DistributionEntry, OpenArgs};
 use solana_address::Address;
 use solana_message::Message;
 use solana_message::Message as MppMessage;
@@ -118,25 +118,15 @@ async fn prepare_topup(
         .to_bytes(),
     );
 
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
-        if i == 0 {
-            DistributionEntry {
-                recipient: payee,
-                bps: 10_000,
-            }
-        } else {
-            zero_entry.clone()
-        }
-    });
+    let recipients = vec![DistributionEntry {
+        recipient: payee,
+        bps: 10_000,
+    }];
     let open_args = OpenArgs {
         salt,
         deposit: initial_deposit,
         grace_period: 60,
-        recipients: DistributionRecipients { count: 1, entries },
+        recipients,
     };
     let (event_authority_mpp, _) =
         MppPubkey::find_program_address(&[b"event_authority"], &program_id_mpp());
