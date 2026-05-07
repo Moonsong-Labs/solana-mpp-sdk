@@ -368,7 +368,7 @@ fn run_distribute_oracle(f: DistributeFixture) {
     assert_eq!(
         post_distribute_view.status(),
         ChannelStatus::Open as u8,
-        "channel stays Open after distribute (Finalized path is stubbed upstream)"
+        "channel stays Open after Open-path distribute; Finalized branch is covered by session_l1_tombstone_oracle.rs"
     );
     assert_eq!(
         post_distribute_view.settled(),

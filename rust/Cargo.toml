@@ -119,6 +119,11 @@ thiserror = "2"
 # can hand straight to their HTTP layer without re-mapping.
 http = "1"
 
+# Cheap-to-clone byte buffer used for pre-buffered HTTP response bodies in
+# `PaidResponse`. Already pulled in transitively via `http` and `reqwest`;
+# declaring it directly so the public type signature is stable.
+bytes = "1"
+
 # Async trait sugar (used by ChannelStore so impls don't have to hand-roll
 # the Pin<Box<dyn Future + Send + '_>> dance for every method).
 async-trait = "0.1"
@@ -132,6 +137,12 @@ dashmap = "6"
 # work. Pulled in here so the dep landscape is settled before recovery
 # wiring lands in a follow-up.
 futures = "0.3"
+
+# Random salt for auto-open. Already pulled transitively via ed25519-dalek
+# and the solana stack; declared direct because the fetch loop calls
+# `rand::random::<u64>()` on every auto-open to keep PDA derivations
+# unique across close+reopen cycles.
+rand = "0.8"
 
 [dev-dependencies]
 axum = "0.8"
