@@ -1,6 +1,6 @@
 //! L0 byte fixtures for splits canonicalization.
 //!
-//! Pins the preimage layout (`count(1) || entries(n × 34)` where each
+//! Pins the preimage layout (`count(u32 LE) || entries(n * 34)` where each
 //! entry is `recipient(32) || bps(u16 LE)`) and the blake3 digest against
 //! hand-computed values. Drift in upstream's preimage shape or the SDK's
 //! blake3 dep surfaces here without rebuilding the program `.so`.
@@ -16,11 +16,11 @@ use solana_mpp::program::payment_channels::splits::{
 };
 
 #[test]
-fn empty_distribution_preimage_is_count_byte_only() {
+fn empty_distribution_preimage_is_count_prefix_only() {
     let preimage = canonical_preimage(&[]);
-    assert_eq!(preimage, vec![0u8]);
+    assert_eq!(preimage, 0u32.to_le_bytes().to_vec());
 
-    let expected_hash: [u8; 32] = *blake3::hash(&[0u8]).as_bytes();
+    let expected_hash: [u8; 32] = *blake3::hash(&0u32.to_le_bytes()).as_bytes();
     assert_eq!(distribution_hash(&[]), expected_hash);
 }
 
@@ -32,12 +32,12 @@ fn single_entry_pins_layout_and_hash() {
     };
     let preimage = canonical_preimage(std::slice::from_ref(&entry));
 
-    let mut expected = Vec::with_capacity(35);
-    expected.push(1u8);                       // count
-    expected.extend_from_slice(&[0x11; 32]);  // recipient
-    expected.extend_from_slice(&1234u16.to_le_bytes()); // bps LE
+    let mut expected = Vec::with_capacity(4 + 34);
+    expected.extend_from_slice(&1u32.to_le_bytes());     // count
+    expected.extend_from_slice(&[0x11; 32]);             // recipient
+    expected.extend_from_slice(&1234u16.to_le_bytes());  // bps LE
     assert_eq!(preimage, expected);
-    assert_eq!(preimage.len(), 1 + 34);
+    assert_eq!(preimage.len(), 4 + 34);
 
     let expected_hash: [u8; 32] = *blake3::hash(&expected).as_bytes();
     assert_eq!(distribution_hash(&[entry]), expected_hash);
@@ -61,14 +61,14 @@ fn three_entries_pin_layout_and_hash() {
     ];
     let preimage = canonical_preimage(&entries);
 
-    let mut expected = Vec::with_capacity(1 + 3 * 34);
-    expected.push(3u8);
+    let mut expected = Vec::with_capacity(4 + 3 * 34);
+    expected.extend_from_slice(&3u32.to_le_bytes());
     for (recipient_byte, bps) in [(0x22u8, 5000u16), (0x33, 3000), (0x44, 1500)] {
         expected.extend_from_slice(&[recipient_byte; 32]);
         expected.extend_from_slice(&bps.to_le_bytes());
     }
     assert_eq!(preimage, expected);
-    assert_eq!(preimage.len(), 1 + 3 * 34);
+    assert_eq!(preimage.len(), 4 + 3 * 34);
 
     let expected_hash: [u8; 32] = *blake3::hash(&expected).as_bytes();
     assert_eq!(distribution_hash(&entries), expected_hash);
@@ -109,11 +109,11 @@ fn max_count_32_entries_pin_layout_and_hash() {
         .collect();
     let preimage = canonical_preimage(&entries);
 
-    // Total length: count(1) + 32 * (recipient(32) + bps(2)) = 1089.
-    assert_eq!(preimage.len(), 1 + 32 * 34);
-    assert_eq!(preimage[0], 32);
+    // Total length: count(4) + 32 * (recipient(32) + bps(2)) = 1092.
+    assert_eq!(preimage.len(), 4 + 32 * 34);
+    assert_eq!(&preimage[..4], &32u32.to_le_bytes());
     for i in 0..32 {
-        let offset = 1 + i * 34;
+        let offset = 4 + i * 34;
         let expected_recipient = [(i as u8 + 1); 32];
         assert_eq!(&preimage[offset..offset + 32], &expected_recipient[..]);
         let expected_bps = ((i as u16) + 1).to_le_bytes();
