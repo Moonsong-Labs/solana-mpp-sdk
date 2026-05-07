@@ -1,8 +1,8 @@
 # Session intent runbook
 
-This file is for operators running an MPP session-intent server. It covers
-how startup recovery behaves, what the failure modes look like in logs, and
-when to flip the unsettled-revenue escape hatch.
+For operators running an MPP session-intent server. Covers startup
+recovery behaviour, the failure modes you'll see in logs, and when to flip
+the unsettled-revenue escape hatch.
 
 ## Crash recovery overview
 
@@ -29,7 +29,7 @@ Each record produces one of:
   `Closing` (the payer ran `request_close` directly).
 - `Finalize` for a `ClosedPending` record whose PDA is now tombstoned or
   absent.
-- `HardFail(...)` for the four failure shapes covered in the next section.
+- `HardFail(...)` for the failure shapes covered in the next section.
 - `NoOp` for `ClosedFinalized` records and other terminal-or-synced
   states.
 
@@ -38,10 +38,10 @@ Phase 2 (apply) only runs if the inspect pass produced no hard failures
 outcome sequentially and either mutates the store or, for `RetryClose`,
 re-runs the close broadcast.
 
-Splitting it that way is what keeps recovery auditable: a crash
-partway through phase 2 can't leave the store half-mutated against an
-inspect report the operator never saw, because the inspect report
-either completed or already failed loudly.
+The two-phase split keeps recovery auditable: a crash partway through
+phase 2 cannot leave the store half-mutated against an inspect report
+the operator never saw, because the inspect report either completed or
+already failed loudly.
 
 Atomicity, where you have it:
 
@@ -75,29 +75,48 @@ Each `RecoveryFailure` carries a `channel_id` and a typed
   recorded but never settled. Inspect the recorded `last_voucher` and
   on-chain `Channel.settled` from the close tx history before deciding
   what to do.
-- `RpcFailure { message }`: the inspect pass could not reach the cluster
-  for this channel. The message is the underlying RPC error rendered
-  through Display. Usually transient; restart the server once the cluster
-  is reachable and recovery will retry.
+- `RpcFailure(RpcError)`: the inspect pass could not reach the cluster
+  for this channel. The wrapped `RpcError` carries the underlying
+  transport failure. Usually transient; restart the server once the
+  cluster is reachable and recovery will retry.
 - `StateInversion { stored, on_chain }`: the store's view of the
   channel and the chain's view contradict each other in a shape recovery
   cannot reconcile (for example, `Closing` in store with the PDA absent
-  on-chain, or `CloseAttempting` against an absent PDA). This usually
-  means the store has been edited out of band, or two server instances
-  shared a store without coordinating. Investigate before continuing.
-  Note: a store-`Closing` against on-chain `Open` is treated as a soft
-  rollback (probable fork-rollback of `request_close`) and downgrades
-  the store to `Open`; it does not surface here.
+  on-chain, or `CloseAttempting` against an absent PDA). Identifier
+  fields (account keys, program IDs) are redacted from the rendered
+  message to keep it safe to log; full detail is in the structured
+  `RecoveryFailureKind`. Usual causes: the store was edited out of band,
+  or two server instances shared a store without coordinating.
+  Investigate before continuing. A store-`Closing` against on-chain
+  `Open` is the one shape that does NOT surface here: it is treated as
+  a soft rollback (probable fork-rollback of `request_close`) and
+  downgrades the store back to `Open`.
 - `VerifyOpenMismatch { field }`: an `Open` record's `verify_open` failed
   on a specific field (`deposit`, `payer`, `mint`, `distributionHash`,
-  etc.). Most often this fires when the program ID in the record points
-  at a different program than the one the chain has the channel under,
-  or when splits in the store drifted from the splits the channel was
+  etc.). Identifier mismatches surface as the field name only; the
+  expected and observed values are not embedded in the variant. Most
+  often this fires when the program ID in the record points at a
+  different program than the one the chain has the channel under, or
+  when splits in the store drifted from the splits the channel was
   opened with.
+- `MissingCloseEvidence`: a `ClosedPending` record with no recorded
+  `close_tx` signature. Without that evidence,
+  `verify_finalized_or_absent` cannot tell a finalized channel apart
+  from one that never existed, so recovery refuses to promote the
+  record to `ClosedFinalized`. The all-zeros placeholder signature
+  documented under "Partially-broadcast close" below sidesteps this:
+  any recorded signature, even the placeholder, lets the verify call
+  proceed. This variant fires only when the record's `close_tx` field
+  is structurally absent.
+- `VerifyOpenInternal { message }`: `verify_open` returned a non-RPC
+  failure during inspection (decode error, wrong account length, wrong
+  discriminator, unexpected encoding). Distinct from `RpcFailure` so
+  operators can tell a transport outage apart from a structural
+  mismatch in the PDA data.
 
-Recovery hard-fails by default. The operator's startup logs include one
-`tracing::error!` per failure plus the RecoveryBatchFailed surface; resolve
-each one before bringing the server up.
+Recovery hard-fails by default. Startup logs include one
+`tracing::error!` per failure plus the RecoveryBatchFailed surface.
+Resolve each one before bringing the server up.
 
 ## The `--allow-unsettled-on-startup` flag
 
@@ -108,20 +127,21 @@ proceeds and the server starts.
 
 This is the post-disaster-recovery escape hatch. Use it only when:
 
-1. The unsettled revenue has been investigated by hand (read the
+1. The unsettled revenue has been investigated by hand: read the
    on-chain close tx, read the recorded `last_voucher`, decide whether
    the difference is recoverable through manual settlement or has to be
-   written off).
+   written off.
 2. The decision is documented somewhere durable (audit log, ticket).
 3. You want the server to come up despite the open question, because
    blocking startup costs more than serving with the warning attached.
 
 The flag is operator-supplied through whatever surface wires
 `RecoveryOptions` (env var, CLI arg, config file). It does not
-downgrade any other failure kind: an `RpcFailure`, `StateInversion`, or
-`VerifyOpenMismatch` mixed into the same batch still surfaces as
-`RecoveryBatchFailed`. Restart with `allow_unsettled_on_startup = false`
-once the unsettled question is closed.
+downgrade any other failure kind: an `RpcFailure`, `StateInversion`,
+`VerifyOpenMismatch`, `VerifyOpenInternal`, or `MissingCloseEvidence`
+mixed into the same batch still surfaces as `RecoveryBatchFailed`.
+Restart with `allow_unsettled_on_startup = false` once the unsettled
+question is closed.
 
 Keep `mpp_session_unsettled_revenue_lamports` on a dashboard or grep
 target so the warning doesn't fade into background noise.
@@ -132,9 +152,9 @@ target so the warning doesn't fade into background noise.
 
 The store has some `Open` records, the cluster confirms each one, every
 record produces `Resume`, and phase 2 is a sequence of no-ops. The server
-comes up and starts serving. A successful recovery emits
-`tracing::info!` lines for every mutation, but `Resume` outcomes are
-silent so a clean recovery is mostly empty in the logs.
+comes up and starts serving. Successful recovery emits one
+`tracing::info!` per mutation, but `Resume` outcomes are silent, so a
+clean recovery is mostly empty in the logs.
 
 ### Partially-broadcast close after a crash
 
@@ -166,8 +186,8 @@ challenge and start over.
 
 ## Known limitations (v1)
 
-These are deferred to v2 and are not handled by the v1 recovery layer.
-Operators should be aware of them and wire monitoring accordingly.
+Deferred to v2 and not handled by the v1 recovery layer. Wire
+monitoring and operator playbooks around these.
 
 - No exponential backoff or max-retry counter. If the RPC layer is
   flapping or the cluster is slow, repeated startup attempts will keep
@@ -176,8 +196,8 @@ Operators should be aware of them and wire monitoring accordingly.
   recovery failures in the startup logs and intervene (cool the host,
   pause restarts, route to a different RPC) rather than relying on the
   recovery layer to back off on its own.
-- No 429/503 throttle handling. The parallel inspect pass uses a fixed
-  `parallelism: 8` (configurable via `RecoveryOptions::parallelism`)
-  and does not detect or back off on RPC throttle responses. Operators
-  with constrained RPC quotas should reduce `parallelism` to keep the
-  inspect burst inside the quota.
+- No 429/503 throttle handling. The parallel inspect pass defaults to
+  `parallelism: 8`, configurable via `RecoveryOptions::parallelism`, and
+  does not detect or back off on RPC throttle responses. Operators with
+  constrained RPC quotas should reduce `parallelism` to keep the inspect
+  burst inside the quota.

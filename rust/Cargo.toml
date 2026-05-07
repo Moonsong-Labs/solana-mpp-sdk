@@ -70,8 +70,18 @@ payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payme
 
 # Async runtime. Hard dep (not gated): solana-rpc-client already pulls tokio
 # transitively, the in-memory channel store uses `tokio::sync::RwLock`, and
-# both server and client paths are async.
-tokio = { version = "1", features = ["full"] }
+# both server and client paths are async. Features pinned to what the SDK
+# uses, instead of `full`: `sync` (RwLock + Mutex), `time` (sleep / interval),
+# `rt-multi-thread` (multi_thread test flavor + interop_server Runtime),
+# `macros` (#[tokio::main] / #[tokio::test]), `net` (payment_link_server
+# binds a TcpListener).
+tokio = { version = "1", features = [
+	"sync",
+	"time",
+	"rt-multi-thread",
+	"macros",
+	"net",
+] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"], optional = true }
@@ -124,7 +134,6 @@ dashmap = "6"
 futures = "0.3"
 
 [dev-dependencies]
-# Tokio is already a hard dep above (with `full`); no dev-deps entry needed.
 axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"

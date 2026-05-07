@@ -155,8 +155,9 @@ jobs:
       - name: Configure git for private cargo deps
         run: |
           git config --global url."https://x-access-token:${{ secrets.PAYMENT_CHANNELS_PAT }}@github.com/Moonsong-Labs/".insteadOf "https://github.com/Moonsong-Labs/"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.89"
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: actions/cache@v5
