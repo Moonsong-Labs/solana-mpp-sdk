@@ -304,11 +304,18 @@ async fn inspect_closed_pending(
             channel_id: record.channel_id,
             kind: RecoveryFailureKind::RpcFailure(RpcError::from(e)),
         }),
-        // Anything else (mid-grace Closing, wrong discriminator byte,
-        // weird encoding) means the chain hasn't confirmed finalization
-        // yet. Leave the record alone and let the next recovery pass
-        // pick it up.
-        Err(_) => RecoveryOutcome::NoOp {
+        // Anything else (mid-grace Closing, wrong discriminator,
+        // unexpected encoding) means the chain hasn't confirmed
+        // finalization yet. Leave the record for the next pass rather
+        // than HardFail; the corruption variants are rare enough that
+        // a recheck is cheaper than wedging the batch.
+        Err(VerifyError::NotFound)
+        | Err(VerifyError::Tombstoned)
+        | Err(VerifyError::WrongLength { .. })
+        | Err(VerifyError::WrongDiscriminator { .. })
+        | Err(VerifyError::Mismatch(_))
+        | Err(VerifyError::UnexpectedEncoding { .. })
+        | Err(VerifyError::Decode(_)) => RecoveryOutcome::NoOp {
             channel_id: record.channel_id,
         },
     }
@@ -831,42 +838,44 @@ mod tests {
 
     #[tokio::test]
     async fn closed_pending_without_close_tx_does_not_promote_to_finalized() {
+        // End-to-end through inspect_all + apply_outcomes: a
+        // ClosedPending record with close_tx=None must surface as
+        // RecoveryBatchFailed and stay ClosedPending, never promote
+        // to Finalized.
         let cid = pk(0x62);
         let store = InMemoryChannelStore::new();
-        let mut record = base_record(cid, ChannelStatus::Open);
-        store.insert(record.clone()).await.unwrap();
-        // `mark_closed_pending` insists on a signature, so feed it a
-        // placeholder and then clear `close_tx` back to None on the
-        // record under test. Mimics a corrupted store rather than the
-        // documented happy path.
-        store.mark_close_attempting(&cid).await.unwrap();
-        let placeholder_sig = solana_signature::Signature::default();
-        store
-            .mark_closed_pending(&cid, placeholder_sig)
-            .await
-            .unwrap();
-        record.status = ChannelStatus::ClosedPending;
+        let mut record = base_record(cid, ChannelStatus::ClosedPending);
         record.close_tx = None;
+        store.insert(record).await.unwrap();
 
         let rpc = mock_rpc_failing();
         let method = build_test_method(&store, &rpc);
+        let config = base_config();
 
-        let err = apply_outcomes(
-            vec![RecoveryOutcome::HardFail(RecoveryFailure {
-                channel_id: cid,
-                kind: RecoveryFailureKind::MissingCloseEvidence,
-            })],
-            &store,
-            &rpc,
-            &method,
-            false,
-        )
-        .await
-        .expect_err("missing close evidence must surface");
+        let outcomes = inspect_all(&store, rpc.as_ref(), &config, 1)
+            .await
+            .expect("inspect_all succeeds");
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            matches!(
+                &outcomes[0],
+                RecoveryOutcome::HardFail(RecoveryFailure {
+                    channel_id,
+                    kind: RecoveryFailureKind::MissingCloseEvidence,
+                }) if *channel_id == cid,
+            ),
+            "expected MissingCloseEvidence HardFail from inspect_all, got {:?}",
+            outcomes[0],
+        );
+
+        let err = apply_outcomes(outcomes, &store, &rpc, &method, false)
+            .await
+            .expect_err("missing close evidence must surface");
 
         match err {
             SessionError::RecoveryBatchFailed { failures } => {
                 assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].channel_id, cid);
                 assert!(matches!(
                     failures[0].kind,
                     RecoveryFailureKind::MissingCloseEvidence
