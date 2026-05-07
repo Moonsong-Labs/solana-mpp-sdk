@@ -639,3 +639,83 @@ mod tests {
         assert_eq!(err.code(), MppErrorCode::RecoveryBatchFailed);
     }
 }
+
+// ── Session intent client error surface ───────────────────────────────────
+
+/// Errors produced by the session client surface (`ActiveSession`,
+/// `SessionClient`, `MppSessionClient`).
+///
+/// Kept separate from server-side `SessionError` so the two halves can
+/// evolve independently. Covers HTTP / 402 protocol violations, the four
+/// client-side voucher invariants (monotonicity, deposit cap, arithmetic
+/// overflow, expiry sanity), policy and state-machine guards used by the
+/// high-level fetch flow, and pass-through wrappers for RPC and signer
+/// failures.
+///
+/// `#[non_exhaustive]` so additional variants can land without bumping
+/// the public-API contract.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ClientError {
+    #[error("HTTP error: status={0}, code={1:?}")]
+    Http(StatusCode, Option<MppErrorCode>),
+
+    #[error("protocol violation: {0}")]
+    ProtocolViolation(String),
+
+    #[error("policy violation: {0:?}")]
+    PolicyViolation(PolicyErrorCode),
+
+    // callers should redact server-controlled strings before constructing this variant
+    #[error("on-chain operation failed: signature={0}, reason={1}")]
+    OnChainFailed(Signature, String),
+
+    #[error("voucher monotonicity violation: attempted {attempted}, last signed {last_signed}")]
+    VoucherMonotonicityViolation { attempted: u64, last_signed: u64 },
+
+    #[error("voucher exceeds deposit: cumulative {cumulative}, deposit {deposit}")]
+    VoucherExceedsDeposit { cumulative: u64, deposit: u64 },
+
+    #[error("voucher arithmetic overflow")]
+    VoucherArithmeticOverflow,
+
+    #[error("invalid expires_at: {0}")]
+    InvalidExpiresAt(String),
+
+    #[error("bad escape route for state: status={current_status:?}, op={operation}")]
+    BadEscapeRouteForState {
+        current_status: ChannelStatus,
+        operation: &'static str,
+    },
+
+    #[error("splits unavailable for channel")]
+    SplitsUnavailable,
+
+    #[error("active session missing for channel {0}")]
+    ActiveSessionMissing(Pubkey),
+
+    #[error("server policy too lax: field={field}, server={server}, client_limit={client_limit}")]
+    ServerPolicyTooLax {
+        field: &'static str,
+        server: u64,
+        client_limit: u64,
+    },
+
+    #[error("RPC error: {0}")]
+    Rpc(String),
+
+    #[error("signer error: {0}")]
+    Signer(String),
+}
+
+/// Wire-form policy violation tag carried by `ClientError::PolicyViolation`.
+///
+/// Constructed by the high-level fetch path when a 402 challenge advertises
+/// terms the configured `ClientPolicy` rejects (e.g. minimum deposit above
+/// the client's cap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyErrorCode {
+    MaxDepositExceeded,
+    MaxCumulativeExceeded,
+    MinVoucherDeltaNotMet,
+}

@@ -45,8 +45,8 @@ pub mod server;
 // ── Re-exports ──
 
 pub use error::{
-    Error, OnChainChannelStatus, RecoveryFailure, RecoveryFailureKind, Result, RpcError,
-    SessionError,
+    ClientError, Error, OnChainChannelStatus, PolicyErrorCode, RecoveryFailure,
+    RecoveryFailureKind, Result, RpcError, SessionError,
 };
 
 // Core protocol types
@@ -94,6 +94,11 @@ pub use server::session::{
     session, FeePayer, Network, OpenChallengeOptions, PayeeSigner, Pricing, RecoveryOptions,
     SessionBuilder, SessionConfig, SessionMethod,
 };
+
+// Session intent client surface. Re-exported so callers don't have to
+// reach into `client::session::` paths.
+#[cfg(feature = "client")]
+pub use client::session::{ActiveSession, SessionReceipt};
 
 // Re-export crates callers need to use with the charge builder.
 pub use solana_keychain;
