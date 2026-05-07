@@ -212,6 +212,12 @@ pub enum SessionError {
     #[error("challenge id has already been used")]
     ChallengeAlreadyUsed,
 
+    /// `insert` raced another factory call at the same id. Benign in
+    /// practice: the HMAC id is deterministic over the request body
+    /// and blockhash, so a polling client can produce it.
+    #[error("a challenge with this id has already been issued")]
+    ChallengeAlreadyIssued,
+
     #[error("challenge intent does not match the request")]
     ChallengeIntentMismatch,
 
@@ -349,6 +355,7 @@ impl SessionError {
             SessionError::ChallengeUnbound => C::ChallengeUnbound,
             SessionError::ChallengeInFlight => C::ChallengeInFlight,
             SessionError::ChallengeAlreadyUsed => C::ChallengeAlreadyUsed,
+            SessionError::ChallengeAlreadyIssued => C::ChallengeAlreadyIssued,
             SessionError::ChallengeIntentMismatch => C::ChallengeIntentMismatch,
             SessionError::ChallengeFieldMismatch { .. } => C::ChallengeFieldMismatch,
             SessionError::ChallengeExpired { .. } => C::ChallengeExpired,

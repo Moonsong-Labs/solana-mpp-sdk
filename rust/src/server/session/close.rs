@@ -591,10 +591,17 @@ async fn run_inner(
         }
     };
 
-    // Cluster accepted the distribute tx. Burn the challenge before
-    // polling so a confirm-poll timeout can't re-enable a retry under
-    // the same id.
-    cache.commit(&payload.challenge_id)?;
+    // Cluster accepted the distribute tx. Bookkeeping past this point can't
+    // fail the request; cache eviction or a sweep race here is logged, not
+    // surfaced.
+    if let Err(e) = cache.commit(&payload.challenge_id) {
+        tracing::warn!(
+            channel_id = %channel_id,
+            signature = %tx_sig,
+            error = %e,
+            "challenge commit failed after distribute broadcast",
+        );
+    }
 
     // Confirm-poll the distribute tx. Any failure past this point leaves
     // the record in CloseAttempting; the recovery layer reads chain state

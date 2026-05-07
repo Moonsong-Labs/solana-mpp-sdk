@@ -9,9 +9,13 @@
 //! 2. Intent binding. Each record carries a typed [`ChallengeIntent`];
 //!    reserving with the wrong discriminant gets
 //!    `ChallengeIntentMismatch`.
-//! 3. Bounded lifetime. Anything older than `2 * challenge_ttl_seconds`
-//!    gets swept out regardless of state, so a leaked Pending can't
-//!    wedge the cache.
+//! 3. Bounded lifetime. The sweeper drops Available and Consumed
+//!    entries older than `2 * challenge_ttl_seconds`. Pending entries
+//!    survive until [`PENDING_HARD_CEILING_SECONDS`] so a slow
+//!    broadcast can't lose its reservation to a sweep landing between
+//!    `send_transaction` returning Ok and the post-broadcast commit.
+//!    The hard ceiling still reclaims a Pending record from a handler
+//!    that never returns.
 //!
 //! Storage is a [`dashmap::DashMap`]. The `Available -> Pending`
 //! transition runs inside `entry().and_modify`, so the check-and-set
@@ -28,6 +32,13 @@ use solana_pubkey::Pubkey;
 
 use crate::error::SessionError;
 use crate::protocol::intents::session::Split;
+
+/// Hard ceiling on Pending lifetime. Above the standard sweep window
+/// so a slow broadcast keeps its reservation, well below anything a
+/// leaked handler would need to choke the cache. The SDK's
+/// `broadcast_confirm_timeout` defaults to 30s, so 30 minutes is room
+/// to spare.
+pub const PENDING_HARD_CEILING_SECONDS: i64 = 30 * 60;
 
 /// Why a challenge was issued. Handlers check intent on entry so a
 /// cross-action submission (e.g. a `TopUp` challenge presented to
@@ -141,15 +152,17 @@ impl ChallengeCache {
         self.ttl_seconds
     }
 
-    /// Register a fresh challenge. Rejects if `id` is already in the
-    /// cache; that's either an HMAC id collision (vanishingly
-    /// unlikely) or a double-insert.
+    /// Register a fresh challenge. Returns
+    /// [`SessionError::ChallengeAlreadyIssued`] if `id` is already in
+    /// the cache. The HMAC id is deterministic over realm, method,
+    /// intent, and the encoded body, so two factory calls against an
+    /// unchanged body and blockhash produce the same id; the typed
+    /// error lets a polling operator distinguish that benign collision
+    /// from a real double-insert.
     pub fn insert(&self, id: String, record: ChallengeRecord) -> Result<(), SessionError> {
         use dashmap::mapref::entry::Entry;
         match self.inner.entry(id) {
-            Entry::Occupied(_) => Err(SessionError::InternalError(
-                "duplicate challenge id".to_string(),
-            )),
+            Entry::Occupied(_) => Err(SessionError::ChallengeAlreadyIssued),
             Entry::Vacant(slot) => {
                 slot.insert(record);
                 Ok(())
@@ -267,18 +280,30 @@ impl ChallengeCache {
         }
     }
 
-    /// Drop every entry older than `ttl_seconds` against `now`. The
-    /// sweeper passes `2 * challenge_ttl_seconds` so entries get a
-    /// grace window past their issue TTL and a slow handler doesn't
-    /// race the sweep on its own Pending record.
+    /// Drop entries past their cache lifetime. `Available` and
+    /// `Consumed` records age out once `now - issued_at` exceeds
+    /// `ttl_seconds` (the sweeper passes `2 * challenge_ttl_seconds`).
+    /// `Pending` records are spared until
+    /// [`PENDING_HARD_CEILING_SECONDS`] so a slow broadcast can't lose
+    /// its reservation to a sweep landing between `send_transaction`
+    /// returning Ok and the post-broadcast `commit`; the hard ceiling
+    /// still reclaims a Pending record from a handler that never
+    /// returns.
     pub fn evict_expired(&self, ttl_seconds: u32, now: i64) {
         let ttl = ttl_seconds as i64;
-        self.inner
-            .retain(|_, record| now.saturating_sub(record.issued_at) <= ttl);
+        self.inner.retain(|_, record| {
+            let age = now.saturating_sub(record.issued_at);
+            match record.state {
+                ChallengeState::Pending => age <= PENDING_HARD_CEILING_SECONDS,
+                ChallengeState::Available | ChallengeState::Consumed => age <= ttl,
+            }
+        });
     }
 
-    /// Clone the record at `id` if present (test-only helper).
-    pub fn get(&self, id: &str) -> Option<ChallengeRecord> {
+    /// Clone the record at `id` if present. Test-only; production
+    /// callers go through `reserve` / `commit` / `release`.
+    #[cfg(test)]
+    pub(crate) fn get(&self, id: &str) -> Option<ChallengeRecord> {
         self.inner.get(id).map(|r| r.clone())
     }
 
@@ -506,5 +531,85 @@ mod tests {
         }
         assert_eq!(wins, 1, "exactly one reservation must win");
         assert_eq!(in_flight, 31, "every losing reservation is in-flight");
+    }
+
+    #[test]
+    fn evict_spares_pending_past_ttl_window() {
+        // Without the Pending exemption a sweep landing mid-broadcast
+        // would evict the record and turn the post-broadcast commit
+        // into `ChallengeUnbound`, even though the cluster accepted
+        // the tx.
+        let cache = ChallengeCache::new(60);
+        cache
+            .insert("slow".into(), record(open_intent(), 0))
+            .unwrap();
+        cache
+            .reserve_at("slow", ChallengeIntentDiscriminant::Open, 0)
+            .expect("reserve flips state to Pending");
+
+        cache.evict_expired(120, 200);
+
+        let snap = cache
+            .get("slow")
+            .expect("Pending record must survive a sweep at 200s with ttl 60");
+        assert_eq!(snap.state, ChallengeState::Pending);
+
+        cache
+            .commit("slow")
+            .expect("commit must not surface ChallengeUnbound after a Pending-spared sweep");
+        let after = cache.get("slow").expect("record stays after commit");
+        assert_eq!(after.state, ChallengeState::Consumed);
+    }
+
+    #[test]
+    fn evict_reclaims_pending_past_hard_ceiling() {
+        let cache = ChallengeCache::new(60);
+        cache
+            .insert("leaked".into(), record(open_intent(), 0))
+            .unwrap();
+        cache
+            .reserve_at("leaked", ChallengeIntentDiscriminant::Open, 0)
+            .expect("reserve flips state to Pending");
+
+        let past_ceiling = PENDING_HARD_CEILING_SECONDS + 1;
+        cache.evict_expired(120, past_ceiling);
+
+        assert!(
+            cache.get("leaked").is_none(),
+            "Pending record past the hard ceiling must be reclaimed",
+        );
+    }
+
+    #[test]
+    fn evict_drops_consumed_at_normal_ttl() {
+        let cache = ChallengeCache::new(60);
+        cache
+            .insert("done".into(), record(open_intent(), 0))
+            .unwrap();
+        cache
+            .reserve_at("done", ChallengeIntentDiscriminant::Open, 0)
+            .expect("reserve");
+        cache.commit("done").expect("commit");
+
+        cache.evict_expired(120, 200);
+        assert!(
+            cache.get("done").is_none(),
+            "Consumed record must evict on the normal ttl window"
+        );
+    }
+
+    #[test]
+    fn duplicate_insert_returns_typed_already_issued() {
+        let cache = ChallengeCache::new(60);
+        cache
+            .insert("dup".into(), record(open_intent(), 0))
+            .unwrap();
+        let err = cache
+            .insert("dup".into(), record(open_intent(), 0))
+            .expect_err("second insert on the same id must reject");
+        assert!(
+            matches!(err, SessionError::ChallengeAlreadyIssued),
+            "expected ChallengeAlreadyIssued, got {err:?}"
+        );
     }
 }

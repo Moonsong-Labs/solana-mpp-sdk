@@ -22,6 +22,9 @@ pub enum MppErrorCode {
     ChallengeUnbound,
     ChallengeInFlight,
     ChallengeAlreadyUsed,
+    /// Wire-form for a duplicate challenge factory call against the
+    /// same HMAC id; see `SessionError::ChallengeAlreadyIssued`.
+    ChallengeAlreadyIssued,
     ChallengeIntentMismatch,
     ChallengeFieldMismatch,
     ChallengeExpired,

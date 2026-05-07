@@ -614,11 +614,23 @@ impl SessionMethod {
             }
         };
 
-        // Commit before the confirm poll. A 30s timeout doesn't mean the
-        // tx failed, just that we haven't seen Confirmed yet; releasing
-        // would let the client re-broadcast a duplicate while the
-        // original lands. Recovery reconciles unconfirmed signatures.
-        self.cache.commit(&payload.challenge_id)?;
+        // Commit before the confirm poll. A 30s timeout doesn't mean
+        // the tx failed, just that we haven't seen Confirmed yet;
+        // releasing would let the client re-broadcast a duplicate
+        // while the original lands. Recovery reconciles unconfirmed
+        // signatures.
+        //
+        // The tx is already on chain, so a commit failure here is
+        // bookkeeping, not a reason to fail the request. Log it and
+        // keep going.
+        if let Err(e) = self.cache.commit(&payload.challenge_id) {
+            tracing::warn!(
+                signature = %tx_sig,
+                challenge_id = %payload.challenge_id,
+                error = %e,
+                "challenge commit failed after open broadcast; tx already accepted, continuing to confirm",
+            );
+        }
 
         // Confirm + verify + persist. Errors propagate with the
         // challenge already consumed.
@@ -980,8 +992,17 @@ impl SessionMethod {
             }
         };
 
-        // Commit before the confirm poll, same ordering as `process_open`.
-        self.cache.commit(&payload.challenge_id)?;
+        // Same ordering and rationale as `process_open`: the tx is
+        // already on chain, so a commit failure is bookkeeping, not a
+        // request error.
+        if let Err(e) = self.cache.commit(&payload.challenge_id) {
+            tracing::warn!(
+                signature = %tx_sig,
+                challenge_id = %payload.challenge_id,
+                error = %e,
+                "challenge commit failed after topup broadcast; tx already accepted, continuing to confirm",
+            );
+        }
 
         self.finalize_topup(payload, prepared, tx_sig).await
     }
@@ -1291,9 +1312,12 @@ impl SessionBuilder {
 }
 
 fn spawn_sweeper(cache: ChallengeCache, ttl_seconds: u32) -> JoinHandle<()> {
-    // Tick every `ttl_seconds` and reclaim entries older than
-    // `2 * ttl` so a Pending record gets a grace window before being
-    // evicted out from under a slow handler.
+    // Tick every `ttl_seconds` and reclaim Available / Consumed
+    // entries older than `2 * ttl`. Pending entries get a longer
+    // grace window (see `ChallengeCache::evict_expired`) so a slow
+    // broadcast doesn't race its own reservation. Worst-case lifetime
+    // for Available / Consumed is `2 * ttl + period`: a sweep landing
+    // just after issue won't see the entry until the next tick.
     let period = ttl_seconds.max(1) as u64;
     let evict_age = ttl_seconds.saturating_mul(2);
 
@@ -1303,7 +1327,27 @@ fn spawn_sweeper(cache: ChallengeCache, ttl_seconds: u32) -> JoinHandle<()> {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            cache.evict_expired(evict_age, now_unix_seconds());
+            // Without `catch_unwind` a panic inside `retain` (DashMap
+            // shard poisoning, allocator OOM) would silently kill the
+            // sweeper task and leak entries forever. `AssertUnwindSafe`
+            // is fine: the cache handle is dropped and re-borrowed
+            // each tick and we don't carry mutable state across the
+            // boundary.
+            let cache_ref = &cache;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cache_ref.evict_expired(evict_age, now_unix_seconds())
+            }));
+            if let Err(panic) = outcome {
+                let msg = panic
+                    .downcast_ref::<&'static str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic>".to_string());
+                tracing::error!(
+                    sweeper_panic = %msg,
+                    "challenge sweeper iteration panicked; continuing the next tick",
+                );
+            }
         }
     })
 }
