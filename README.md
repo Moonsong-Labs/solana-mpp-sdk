@@ -279,6 +279,8 @@ solana-test-validator --reset \
   --bpf-program <PAYMENT_CHANNELS_ID> rust/tests/fixtures/payment_channels.so
 ```
 
+If port 8000 (gossip) is already in use, reassign with `--gossip-port 18000 --dynamic-port-range 18001-18030` and keep `--rpc-port 8899` so the demo still finds the validator at `http://127.0.0.1:8899`.
+
 In another terminal, from `rust/`:
 
 ```bash
