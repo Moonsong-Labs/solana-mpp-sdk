@@ -217,6 +217,51 @@ let receipt   = method.process_close(&close_payload).await?;
 `fee_payer` is required: v1 is server-submit, so the operator pays SOL fees on every channel transaction. `payee_signer` is required for `process_close`: the program's `settle_and_finalize` enforces that the merchant transaction signer matches `Channel.payee`, set at open time to the `payee` field on `SessionConfig`. The SDK never persists key material; both signers are facades over your existing custody.
 </details>
 
+### Client (session)
+
+The `MppSessionClient` wraps the auto-open / auto-topup / voucher-sign flow behind a single `fetch(url)` call. One client per `(signer, rpc, program, policy)` tuple; the registry inside it holds per-`(payee, mint)` mutexes so concurrent fetches against unrelated merchants don't serialise on each other.
+
+<details>
+<summary>Rust</summary>
+
+```rust,ignore
+use std::sync::Arc;
+use solana_client::nonblocking::rpc_client::RpcClient as SolanaRpcClient;
+use solana_mpp::{
+    solana_keychain::{MemorySigner, SolanaSigner},
+    ClientConfig, ClientPolicy, HttpOptions, MppRpcClient, MppSessionClient,
+};
+use solana_pubkey::Pubkey;
+
+let signer: Arc<dyn SolanaSigner> = Arc::new(MemorySigner::from_bytes(&keypair_bytes)?);
+let rpc: Arc<dyn MppRpcClient> = Arc::new(SolanaRpcClient::new(rpc_url));
+
+let client = MppSessionClient::new(ClientConfig {
+    rpc,
+    signer,
+    program: program_id,
+    policy: ClientPolicy::default(),
+    http_options: HttpOptions::default(),
+    server_base_url: "https://api.example.com".into(),
+})?;
+
+// Auto-opens a channel on first fetch, signs vouchers on subsequent ones,
+// and tops up when the deposit cap would be exceeded (if `policy.auto_topup` is on).
+let response = client.fetch("https://api.example.com/api/expensive").await?;
+println!("status {}, body {}", response.status(), response.text()?);
+println!("paid for channel {}", response.channel_id());
+
+// Close cooperatively when done. Drops the registry entry; the merchant's
+// settle_and_finalize lands on-chain server-side.
+let close = client.close(&response.channel_id()).await?;
+println!("close receipt: refunded={:?}", close.refunded);
+```
+
+`fetch` runs the full `402` decision tree: GET the resource, parse `WWW-Authenticate: Payment`, pick the `solana session` challenge, look up `(payee, mint)` in the in-process single-flight registry, and either sign a voucher (cache hit), submit a topup (cap exceeded, `policy.auto_topup`), or open a new channel (cache miss). One retry on stale-blockhash and stale-challenge errors before the error propagates.
+
+`PaidResponse` pre-buffers the body so `bytes()`, `text()`, `json::<T>()`, `status()`, `headers()`, `channel_id()`, `accepted_cumulative()`, `spent()`, and `receipt()` are all sync and cheap to call repeatedly.
+</details>
+
 ### Payment Links
 
 Set `html: true` on `solana.charge()` and any endpoint becomes a shareable payment link. Browsers see a payment page; API clients get the standard `402` flow.
