@@ -35,8 +35,7 @@ use payment_channels_client::instructions::{
     DistributeBuilder, OpenBuilder, SettleAndFinalizeBuilder, SettleBuilder,
 };
 use payment_channels_client::types::{
-    DistributeArgs, DistributionEntry, DistributionRecipients, OpenArgs,
-    SettleAndFinalizeArgs, SettleArgs, VoucherArgs,
+    DistributeArgs, DistributionEntry, OpenArgs, SettleAndFinalizeArgs, SettleArgs, VoucherArgs,
 };
 use solana_address::Address;
 use solana_message::Message;
@@ -91,20 +90,16 @@ fn finalized_distribute_tombstones_pda_to_one_byte_with_expected_discriminator()
     .send()
     .expect("mint to payer ATA");
 
-    // Vanilla payer-payee shape: count=0, payee receives the full pool
-    // implicitly on distribute. Treasury ATA is required by the
-    // distribute ix even when count=0 (residual sweep target).
+    // Vanilla payer-payee shape: empty recipients, payee receives the
+    // full pool implicitly on distribute. Treasury ATA is required by
+    // the distribute ix even when recipients is empty (residual sweep
+    // target).
     let payee_token_account = create_ata(&mut svm, &payer, &mint, &payee, &token_program_id);
     let treasury_owner = Address::new_from_array(TREASURY_OWNER.to_bytes());
     let treasury_token_account =
         create_ata(&mut svm, &payer, &mint, &treasury_owner, &token_program_id);
 
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|_| zero_entry.clone());
-    let recipients = DistributionRecipients { count: 0, entries };
+    let recipients: Vec<DistributionEntry> = Vec::new();
 
     let salt: u64 = 99;
     let deposit: u64 = 1_000_000;
@@ -376,22 +371,16 @@ fn finalized_distribute_with_recipients_sweeps_within_pool_residual_to_treasury(
 
     let recip_a_bps: u16 = 3000;
     let recip_b_bps: u16 = 3000;
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| match i {
-        0 => DistributionEntry {
+    let recipients = vec![
+        DistributionEntry {
             recipient: recip_a,
             bps: recip_a_bps,
         },
-        1 => DistributionEntry {
+        DistributionEntry {
             recipient: recip_b,
             bps: recip_b_bps,
         },
-        _ => zero_entry.clone(),
-    });
-    let recipients = DistributionRecipients { count: 2, entries };
+    ];
 
     let salt: u64 = 100;
     let deposit: u64 = 2_000_000;

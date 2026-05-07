@@ -18,7 +18,7 @@ use litesvm::LiteSVM;
 use litesvm_token::{CreateAssociatedTokenAccount, CreateMint, MintTo};
 use payment_channels_client::instructions::{OpenBuilder, TopUpBuilder};
 use payment_channels_client::types::{
-    ChannelStatus, DistributionEntry, DistributionRecipients, OpenArgs, TopUpArgs,
+    ChannelStatus, DistributionEntry, OpenArgs, TopUpArgs,
 };
 use solana_address::Address;
 use solana_message::Message;
@@ -94,25 +94,15 @@ fn sdk_built_top_up_advances_channel_deposit() {
     // Single recipient: the payee at 10_000 bps. Topup test only exercises
     // the topup ix; the open leg's distribution shape is irrelevant beyond
     // satisfying upstream's open-time validation.
-    let zero_entry = DistributionEntry {
-        recipient: Address::new_from_array([0u8; 32]),
-        bps: 0,
-    };
-    let entries: [DistributionEntry; 32] = std::array::from_fn(|i| {
-        if i == 0 {
-            DistributionEntry {
-                recipient: payee,
-                bps: 10_000,
-            }
-        } else {
-            zero_entry.clone()
-        }
-    });
+    let recipients = vec![DistributionEntry {
+        recipient: payee,
+        bps: 10_000,
+    }];
     let open_args = OpenArgs {
         salt,
         deposit: initial_deposit,
         grace_period,
-        recipients: DistributionRecipients { count: 1, entries },
+        recipients,
     };
 
     let (event_authority_mpp, _event_authority_bump) =

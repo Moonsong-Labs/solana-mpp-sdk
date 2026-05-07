@@ -1,8 +1,8 @@
 //! Splits canonicalization for the payment-channels distribute byte
 //! contract.
 //!
-//! Mirrors upstream's `DistributionRecipients::preimage_hash` byte layout:
-//! `count(1 byte) || entries(n × 34)` where each entry is
+//! Mirrors upstream's `DistributionPreimage` byte layout:
+//! `count(u32 LE) || entries(n * 34)` where each entry is
 //! `recipient(32 bytes) || bps(u16 little-endian, 2 bytes)`. The blake3
 //! digest of that preimage is the value stored in
 //! `Channel.distribution_hash` and re-computed by `distribute` on chain.
@@ -14,7 +14,7 @@
 
 use solana_pubkey::Pubkey;
 
-pub use payment_channels_client::types::{DistributionEntry, DistributionRecipients};
+pub use payment_channels_client::types::DistributionEntry;
 
 /// Treasury owner for distribute residual sweeps on the `Finalized`
 /// branch. Hand-declared because the upstream client crate does not
@@ -37,12 +37,13 @@ pub const TREASURY_OWNER: Pubkey = Pubkey::new_from_array([
 
 /// Canonical preimage for a list of active distribution entries.
 ///
-/// Layout: `count(u8) || entries[..count] (each: recipient(32) || bps(u16 LE))`.
-/// `entries.len()` must fit in `u8` (caller guarantees this; the on-chain
-/// validator caps at 32). Output length is `1 + 34 * entries.len()`.
+/// Layout: `count(u32 LE) || entries[..count]` where each entry is
+/// `recipient(32) || bps(u16 LE)`. Output length is `4 + 34 * entries.len()`.
+/// The on-chain validator caps `count` at 32 and rejects longer inputs;
+/// this helper is pure byte mechanics and does not enforce the cap.
 pub fn canonical_preimage(entries: &[DistributionEntry]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 34 * entries.len());
-    out.push(entries.len() as u8);
+    let mut out = Vec::with_capacity(4 + 34 * entries.len());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for entry in entries {
         out.extend_from_slice(entry.recipient.as_ref());
         out.extend_from_slice(&entry.bps.to_le_bytes());

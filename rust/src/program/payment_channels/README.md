@@ -5,12 +5,12 @@ Files in this directory are all SDK-owned: `voucher.rs`, `ed25519.rs`,
 contracts the program speaks (the 48-byte signed voucher payload, the
 160-byte ed25519 precompile instruction, and the Channel PDA derivation).
 `splits.rs` adds the splits-canonicalization layer: `canonical_preimage`
-and `distribution_hash` over upstream's `count(1) || entries(n x 34)`
+and `distribution_hash` over upstream's `count(u32 LE) || entries(n * 34)`
 layout where each entry is `recipient(32) || bps(u16 LE)`. It re-exports
-`DistributionEntry` and `DistributionRecipients` from the upstream client
-and hand-declares `TREASURY_OWNER` (the upstream client crate does not
-re-export the constant); the value is locked to upstream's bytes by an L0
-fixture test. The Codama-generated Rust client lives upstream as the
+`DistributionEntry` from the upstream client and hand-declares
+`TREASURY_OWNER` (the upstream client crate does not re-export the
+constant); the value is locked to upstream's bytes by an L0 fixture test.
+The Codama-generated Rust client lives upstream as the
 `payment_channels_client` crate and is pulled in as a git dependency (see
 `rust/Cargo.toml`), not vendored here.
 

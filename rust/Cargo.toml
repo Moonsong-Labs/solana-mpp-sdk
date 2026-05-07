@@ -64,7 +64,7 @@ spl-associated-token-account-client = { version = "2", default-features = false 
 # 4.2.0 pulled by `payment_channels_client`) declares
 # `rust-version = "1.89"`, so older toolchains refuse to resolve the
 # graph. If CI pins an older toolchain, bump it alongside this dep.
-payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "f03ca9fcfdbeeb1089ecf07a4b757e9156784e44", features = [
+payment_channels_client = { git = "https://github.com/Moonsong-Labs/solana-payment-channels.git", rev = "5032612e290b78620148fb564c81a6fc033bd5b4", features = [
 	"fetch",
 ] }
 
