@@ -188,6 +188,12 @@ tracing-test = { version = "0.2", features = ["no-env-filter"] }
 # we need the type in scope at the call site to bridge through bytes.
 solana-pubkey-v2 = { package = "solana-pubkey", version = "2", default-features = false }
 
+# In-process HTTP mock used by the session client's close-flow unit tests.
+# Stubs `/channel/close-challenge` and `/channel/close` against a loopback
+# `MockServer` so the round-trip is exercised without standing up the full
+# `serve` helper.
+wiremock = "0.6"
+
 # Targets that depend on feature-gated modules. Declared
 # explicitly so `cargo test --no-default-features` skips them instead of
 # failing to compile the bin / example / test stubs that reference
