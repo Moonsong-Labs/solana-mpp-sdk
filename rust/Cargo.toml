@@ -175,6 +175,13 @@ solana-sdk = { version = "3.0", default-features = false, features = ["full"] }
 litesvm = { version = "0.11", features = ["precompiles"] }
 litesvm-token = "0.11"
 
+# In-process tracing subscriber that captures `tracing` output per test and
+# exposes a `logs_contain` matcher. Used by the L1 oracle that pins the
+# session lifecycle span / event schema. The `no-env-filter` feature drops
+# the default crate-name filter so events emitted by the SDK lib (targets
+# like `mpp::session`) reach the capture buffer.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
 # `spl-associated-token-account-client` 2.0 takes/returns `solana_pubkey::Pubkey`
 # at the 2.x major (semver-pinned in its Cargo.toml). Our prod deps pull
 # `solana-pubkey` 3.x; the 2.x line is already in the lockfile transitively, but
@@ -224,4 +231,8 @@ required-features = ["server"]
 
 [[test]]
 name = "session_l1_recover"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_tracing"
 required-features = ["server"]

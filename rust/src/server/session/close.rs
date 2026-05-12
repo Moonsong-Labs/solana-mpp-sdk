@@ -396,6 +396,17 @@ async fn run_inner(
         }
     };
     let action = decide_close_action(payload, chain_settled)?;
+    tracing::Span::current().record(
+        "branch",
+        match &action {
+            CloseAction::ApplyVoucher { .. } => {
+                crate::server::session::instrumentation::CLOSE_BRANCH_APPLY_VOUCHER
+            }
+            CloseAction::LockSettled => {
+                crate::server::session::instrumentation::CLOSE_BRANCH_LOCK_SETTLED
+            }
+        },
+    );
     let preflight_tx = build_ata_preflight_tx(
         &record,
         recent_blockhash,
@@ -729,6 +740,14 @@ async fn run_inner(
     });
 
     let refunded = record.deposit.saturating_sub(settled_after);
+    tracing::info!(
+        target: crate::server::session::instrumentation::TARGET,
+        channel_id = %channel_id,
+        settle_tx = %settle_sig,
+        distribute_tx = %tx_sig,
+        refunded = refunded,
+        "channel closed",
+    );
     let mut receipt = Receipt::success(
         METHOD_NAME,
         channel_id.to_string(),
