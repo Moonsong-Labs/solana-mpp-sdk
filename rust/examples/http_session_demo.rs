@@ -277,18 +277,10 @@ async fn paid_handler(State(method): State<Arc<SessionMethod>>, headers: HeaderM
         return handle_paid_with_credential(method.as_ref(), token).await;
     }
 
-    // Vary `external_id` per call so two 402s issued in the same slot
-    // don't collide on the same challenge id. The SDK's challenge cache
-    // rejects duplicate ids; with default options the encoded request
-    // body is identical across rapid calls (same blockhash, same fields),
-    // so the derived id repeats. An operator running this pattern in
-    // production should pick a stable, unique-per-request value (request
-    // id, trace id, etc.); a random u64 is plenty for the demo.
-    let opts = OpenChallengeOptions {
-        external_id: Some(format!("paid-{:016x}", rand::random::<u64>())),
-        ..OpenChallengeOptions::default()
-    };
-    match method.build_challenge_for_open(opts).await {
+    match method
+        .build_challenge_for_open(OpenChallengeOptions::default())
+        .await
+    {
         Ok(challenge) => {
             let www_auth = match format_www_authenticate(&challenge) {
                 Ok(v) => v,

@@ -1241,10 +1241,18 @@ impl SessionMethod {
         encoded: Base64UrlJson,
         description: Option<&str>,
     ) -> Result<PaymentChallenge, SessionError> {
-        // Trailing `None`s match `compute_challenge_id`'s
-        // `expires`/`digest`/`opaque` slots. Sessions don't pin an
-        // expiry into the HMAC input (cache TTL covers that) and
-        // there's no body digest or opaque echo to commit.
+        // Per-call nonce in the `opaque` slot so consecutive calls with
+        // identical encoded bodies still produce distinct ids. Without
+        // it, two 402s issued in the same Solana slot share a blockhash,
+        // hash to the same body, and the cache rejects the duplicate id
+        // with ChallengeAlreadyIssued. The nonce echoes back to the
+        // client via `PaymentChallenge.opaque` so `verify()` can
+        // re-derive the same id.
+        let nonce = rand::random::<u128>();
+        let opaque_value = serde_json::Value::String(format!("{nonce:032x}"));
+        let opaque = Base64UrlJson::from_value(&opaque_value).map_err(|e| {
+            SessionError::InternalError(format!("encode challenge opaque nonce: {e}"))
+        })?;
         let id = compute_challenge_id(
             &self.secret_key,
             &self.realm,
@@ -1253,7 +1261,7 @@ impl SessionMethod {
             encoded.raw(),
             None, // expires
             None, // digest
-            None, // opaque
+            Some(opaque.raw()),
         );
         Ok(PaymentChallenge {
             id,
@@ -1264,7 +1272,7 @@ impl SessionMethod {
             expires: None,
             description: description.map(str::to_string),
             digest: None,
-            opaque: None,
+            opaque: Some(opaque),
         })
     }
 
@@ -1652,6 +1660,31 @@ mod tests {
             secret_key: Some("test-secret-key".into()),
         };
         SessionMethod::new_for_recover(config, store, rpc).expect("construct SessionMethod")
+    }
+
+    #[tokio::test]
+    async fn build_challenge_emits_unique_ids_across_calls_with_identical_bodies() {
+        // The challenge cache rejects duplicate ids with
+        // `ChallengeAlreadyIssued`. Two 402s issued in the same Solana
+        // slot share a blockhash, so the encoded request body is byte
+        // identical; `build_challenge` injects a per-call nonce in the
+        // `opaque` slot to keep the derived ids distinct. The nonce
+        // round-trips on the wire so `PaymentChallenge::verify` can
+        // re-derive the same id.
+        let method = dummy_method();
+        let encoded =
+            Base64UrlJson::from_typed(&serde_json::json!({"some": "body"})).expect("encode body");
+        let a = method
+            .build_challenge(encoded.clone(), None)
+            .expect("first challenge");
+        let b = method
+            .build_challenge(encoded, None)
+            .expect("second challenge");
+        assert_ne!(a.id, b.id, "consecutive challenges must not share an id");
+        assert!(a.opaque.is_some(), "opaque nonce must round-trip on the wire");
+        assert!(b.opaque.is_some());
+        assert!(a.verify(&method.secret_key), "challenge id verifies against opaque");
+        assert!(b.verify(&method.secret_key));
     }
 
     #[tokio::test]
