@@ -63,6 +63,7 @@ const MAX_PAYMENT_TOKEN_LEN: usize = 16 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_tracing();
     let started = Instant::now();
     let fixture = LocalDemoFixture::boot(RPC_URL).await?;
 
@@ -94,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the state types straight.
     let paid_router = Router::new()
         .route("/paid", get(paid_handler))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(method.clone());
     let app = session_router(method.clone()).merge(paid_router);
 
@@ -197,6 +199,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// Install a tracing subscriber so the SDK's structured spans and events
+// surface on stderr. `RUST_LOG` controls the filter; default to info for
+// the SDK and the per-request `mpp::session` target so the demo prints
+// the lifecycle breadcrumbs out of the box.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("solana_mpp=info,mpp::session=info"));
+    let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+}
+
 fn build_session_config(fixture: &LocalDemoFixture) -> SessionConfig {
     let payee_pk = keypair_pubkey(&fixture.payee);
     let mint_pk = fixture.mint;
@@ -264,10 +277,18 @@ async fn paid_handler(State(method): State<Arc<SessionMethod>>, headers: HeaderM
         return handle_paid_with_credential(method.as_ref(), token).await;
     }
 
-    match method
-        .build_challenge_for_open(OpenChallengeOptions::default())
-        .await
-    {
+    // Vary `external_id` per call so two 402s issued in the same slot
+    // don't collide on the same challenge id. The SDK's challenge cache
+    // rejects duplicate ids; with default options the encoded request
+    // body is identical across rapid calls (same blockhash, same fields),
+    // so the derived id repeats. An operator running this pattern in
+    // production should pick a stable, unique-per-request value (request
+    // id, trace id, etc.); a random u64 is plenty for the demo.
+    let opts = OpenChallengeOptions {
+        external_id: Some(format!("paid-{:016x}", rand::random::<u64>())),
+        ..OpenChallengeOptions::default()
+    };
+    match method.build_challenge_for_open(opts).await {
         Ok(challenge) => {
             let www_auth = match format_www_authenticate(&challenge) {
                 Ok(v) => v,
@@ -425,6 +446,7 @@ fn format_error_receipt_header(code: MppErrorCode) -> Option<String> {
 }
 
 fn server_error(message: String) -> Response {
+    tracing::error!(target: "mpp::session", "paid handler 500: {message}");
     (StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 

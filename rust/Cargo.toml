@@ -153,6 +153,10 @@ rand = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
 
+# Lets the worked examples install an in-process tracing subscriber that
+# surfaces the SDK's structured spans and events on stderr.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
 # `net` is only needed by the payment_link_server example's TcpListener.
 # Cargo unions these features with the [dependencies] entry above for test
 # and example builds, so library consumers don't pick up `net`.
