@@ -217,3 +217,46 @@ monitoring and operator playbooks around these.
   disagreement). Operators reconcile manually via the chain history of
   the failed close attempt and run `--allow-unsettled-on-startup` to
   let the v1 recovery layer mark the record finalized.
+
+## Tracing schema
+
+The session lifecycle emits structured spans and per-request events for
+observability tuning. Spans live on the SDK's default target
+(`solana_mpp::server::session`); per-request events ride the `mpp::session`
+target so a subscriber can filter them as a group.
+
+### Spans
+
+| Name | Level | Fields | Wraps |
+|---|---|---|---|
+| `session.process_open` | INFO | `channel_id`, `payer`, `authorized_signer` (base58) | `SessionMethod::process_open` |
+| `session.verify_voucher` | DEBUG | `channel_id`, `cumulative_amount` | `SessionMethod::verify_voucher` |
+| `session.process_topup` | INFO | `channel_id`, `additional_amount` | `SessionMethod::process_topup` |
+| `session.process_close` | INFO | `channel_id`, `branch` (`apply_voucher` or `lock_settled`, recorded once the handler picks the path) | `SessionMethod::process_close` |
+| `session.recover` | INFO | `record_count` (recorded after the inspect pass returns) | `SessionBuilder::recover` |
+
+### Events (target `mpp::session`)
+
+| Event | Level | Fields | Fires at |
+|---|---|---|---|
+| `channel opened` | INFO | `channel_id`, `open_tx`, `deposit` | `finalize_open` success tail |
+| `voucher accepted` | INFO | `channel_id`, `accepted_cumulative`, `spent` | `run_verify_voucher` success tail (fires on both `Advanced` and `Conflict` CAS arms, hoisted before the match so the loser still logs its acceptance) |
+| `channel closed` | INFO | `channel_id`, `settle_tx`, `distribute_tx`, `refunded` | close success tail (fires on both the apply-voucher and lock-settled branches after the settle and distribute txs commit) |
+
+### Subscriber tuning
+
+`session.verify_voucher` runs at DEBUG because it fires on every metered
+request and would flood a default-INFO subscriber. The `voucher accepted`
+event inside it is at INFO on the `mpp::session` target, so a subscriber
+filtered at INFO globally still sees the event, but loses the surrounding
+span breadcrumb (`channel_id`, `cumulative_amount`) that the span field
+set would have attached. Set DEBUG on `solana_mpp::server::session` (or
+globally) to keep the breadcrumb.
+
+### Existing operator-alarm channels
+
+The lifecycle code also emits `tracing::warn!` and `tracing::error!` lines
+on the SDK's default target for operator-alarms (recovery failure, RPC
+rate-limit, unsettled revenue, challenge cache corruption). Those predate
+the structured schema above and are documented inline at their call sites;
+this section covers only the structured INFO/DEBUG spans and events.

@@ -307,6 +307,37 @@ summary
   ...
 ```
 
+### Run the HTTP session demo
+
+`rust/examples/http_session_demo.rs` proves the full HTTP wiring stack end-to-end. It boots the same `LocalDemoFixture` against a real validator, spawns the SDK's session server (axum router with the four channel-management routes plus a `/paid` metered example route) on an ephemeral port, builds an `MppSessionClient` against it, and drives the lifecycle as an HTTP client. The first paid GET lands a 402, the client auto-opens a channel, retries with a voucher, and the same path serves the remaining requests. Then `MppSessionClient::close(channel_id)` POSTs `/channel/close-challenge` followed by `/channel/close` to settle and tombstone.
+
+Prereqs are the same as the local demo: program binary fixture in `rust/tests/fixtures/`, a running validator on `127.0.0.1:8899`. From `rust/`:
+
+```bash
+RUSTFLAGS="-D warnings" cargo run --example http_session_demo --features="server,client"
+```
+
+Expected output (truncated):
+
+```
+session server listening on http://127.0.0.1:XXXXX
+request 1: status 200 body N bytes cumulative 1000 spent 1000
+request 2: status 200 body N bytes cumulative 2000 spent 1000
+request 3: status 200 body N bytes cumulative 3000 spent 1000
+request 4: status 200 body N bytes cumulative 4000 spent 1000
+
+summary
+  channel              ChAn1d...
+  total fetch requests 4
+  signed cumulative    4000
+  payee ata balance    ...
+  refunded             ...
+  close tx             ...
+  elapsed              ...s
+```
+
+The port is ephemeral; the actual bound URL prints at startup. The serve task drains in-flight requests and returns when the demo signals shutdown after `close` completes.
+
 ### Payment Links
 
 Set `html: true` on `solana.charge()` and any endpoint becomes a shareable payment link. Browsers see a payment page; API clients get the standard `402` flow.
