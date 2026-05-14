@@ -21,9 +21,12 @@ pub(crate) mod instrumentation;
 pub mod ix;
 pub mod open;
 pub mod recover;
+pub mod serve;
 pub mod topup;
 pub(crate) mod tx_shape;
 pub mod voucher;
+
+pub use serve::{router, serve, serve_with_shutdown, ServeError};
 
 use std::sync::Arc;
 use std::time::Duration;

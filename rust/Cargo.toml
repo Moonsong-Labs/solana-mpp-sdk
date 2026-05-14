@@ -9,7 +9,7 @@ repository = "https://github.com/solana-foundation/mpp-sdk"
 
 [features]
 default = ["server", "client"]
-server = []
+server = ["dep:axum", "dep:tower-http"]
 client = ["dep:reqwest"]
 gcp_kms = ["solana-keychain/gcp_kms"]
 # Pull-mode session support via the multi-delegator program. Not supported in v1.
@@ -86,6 +86,11 @@ tokio = { version = "1", features = [
 # HTTP client
 reqwest = { version = "0.12", features = ["json"], optional = true }
 
+# HTTP server. The `serve` helper in `server::session` wires the close-flow
+# routes through axum, with tower-http's TraceLayer on top. Server-only.
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["trace"], optional = true }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -145,7 +150,6 @@ futures = "0.3"
 rand = "0.8"
 
 [dev-dependencies]
-axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
 

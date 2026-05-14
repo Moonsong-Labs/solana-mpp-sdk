@@ -91,8 +91,9 @@ pub use program::payment_channels::rpc::RpcClient as MppRpcClient;
 // prerequisite for serving requests.
 #[cfg(feature = "server")]
 pub use server::session::{
-    session, FeePayer, Network, OpenChallengeOptions, PayeeSigner, Pricing, RecoveryOptions,
-    SessionBuilder, SessionConfig, SessionMethod,
+    router, serve, serve_with_shutdown, session, FeePayer, Network, OpenChallengeOptions,
+    PayeeSigner, Pricing, RecoveryOptions, ServeError, SessionBuilder, SessionConfig,
+    SessionMethod,
 };
 
 // Session intent client surface. Re-exported so callers don't have to
