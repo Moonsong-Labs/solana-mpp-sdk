@@ -262,6 +262,82 @@ println!("close receipt: refunded={:?}", close.refunded);
 `PaidResponse` pre-buffers the body so `bytes()`, `text()`, `json::<T>()`, `status()`, `headers()`, `channel_id()`, `accepted_cumulative()`, `spent()`, and `receipt()` are all sync and cheap to call repeatedly.
 </details>
 
+### Run the local session demo
+
+`rust/examples/local_session_demo.rs` walks the full session lifecycle (open, voucher loop, topup, close) end-to-end against a real validator. The server-side `SessionMethod` and the client-side `SessionClient` both live in the same binary and call each other directly; on-chain traffic still rides real RPC.
+
+First, fetch the program binary fixture:
+
+```bash
+just fetch-program-binary
+```
+
+In one terminal, start a validator with the program loaded. The program id is the upstream `payment_channels_client::programs::PAYMENT_CHANNELS_ID`:
+
+```bash
+solana-test-validator --reset \
+  --bpf-program <PAYMENT_CHANNELS_ID> rust/tests/fixtures/payment_channels.so
+```
+
+If port 8000 (gossip) is already in use, reassign with `--gossip-port 18000 --dynamic-port-range 18001-18030` and keep `--rpc-port 8899` so the demo still finds the validator at `http://127.0.0.1:8899`.
+
+In another terminal, from `rust/`:
+
+```bash
+RUSTFLAGS="-D warnings" cargo run --example local_session_demo --features="server,client"
+```
+
+Expected output (truncated):
+
+```
+setting up local fixture (rpc=http://127.0.0.1:8899)
+airdropped 10 SOL to payer ABC123...
+created mint XYZ789... (decimals 6)
+opened channel ChAn1d... with deposit 10000000
+voucher #1 accepted at cumulative 100000
+voucher #2 accepted at cumulative 200000
+voucher #3 accepted at cumulative 300000
+topped up channel ChAn1d...: deposit 10000000 to 10500000
+voucher #1 accepted at cumulative 350000
+closed channel ChAn1d...; settled 400000; tombstone confirmed
+
+summary
+  channel              ChAn1d...
+  signed cumulative    400000
+  ...
+```
+
+### Run the HTTP session demo
+
+`rust/examples/http_session_demo.rs` proves the full HTTP wiring stack end-to-end. It boots the same `LocalDemoFixture` against a real validator, spawns the SDK's session server (axum router with the four channel-management routes plus a `/paid` metered example route) on an ephemeral port, builds an `MppSessionClient` against it, and drives the lifecycle as an HTTP client. The first paid GET lands a 402, the client auto-opens a channel, retries with a voucher, and the same path serves the remaining requests. Then `MppSessionClient::close(channel_id)` POSTs `/channel/close-challenge` followed by `/channel/close` to settle and tombstone.
+
+Prereqs are the same as the local demo: program binary fixture in `rust/tests/fixtures/`, a running validator on `127.0.0.1:8899`. From `rust/`:
+
+```bash
+RUSTFLAGS="-D warnings" cargo run --example http_session_demo --features="server,client"
+```
+
+Expected output (truncated):
+
+```
+session server listening on http://127.0.0.1:XXXXX
+request 1: status 200 body N bytes cumulative 1000 spent 1000
+request 2: status 200 body N bytes cumulative 2000 spent 1000
+request 3: status 200 body N bytes cumulative 3000 spent 1000
+request 4: status 200 body N bytes cumulative 4000 spent 1000
+
+summary
+  channel              ChAn1d...
+  total fetch requests 4
+  signed cumulative    4000
+  payee ata balance    ...
+  refunded             ...
+  close tx             ...
+  elapsed              ...s
+```
+
+The port is ephemeral; the actual bound URL prints at startup. The serve task drains in-flight requests and returns when the demo signals shutdown after `close` completes.
+
 ### Payment Links
 
 Set `html: true` on `solana.charge()` and any endpoint becomes a shareable payment link. Browsers see a payment page; API clients get the standard `402` flow.

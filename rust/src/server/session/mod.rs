@@ -17,12 +17,16 @@
 
 pub mod challenge;
 pub mod close;
+pub(crate) mod instrumentation;
 pub mod ix;
 pub mod open;
 pub mod recover;
+pub mod serve;
 pub mod topup;
 pub(crate) mod tx_shape;
 pub mod voucher;
+
+pub use serve::{router, serve, serve_with_shutdown, ServeError};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -578,6 +582,15 @@ impl SessionMethod {
     /// against a tx that's still landing. After Consumed, any later
     /// error (timeout, verify failure) bubbles up with the challenge
     /// already burned and recovery handles signature reconciliation.
+    #[tracing::instrument(
+        name = "session.process_open",
+        skip_all,
+        fields(
+            channel_id = %payload.channel_id,
+            payer = %payload.payer,
+            authorized_signer = %payload.authorized_signer,
+        )
+    )]
     pub async fn process_open(&self, payload: &OpenPayload) -> Result<Receipt, SessionError> {
         // Reserve under `Open` intent.
         let cached = self
@@ -886,6 +899,14 @@ impl SessionMethod {
         };
         self.store.insert(record).await?;
 
+        tracing::info!(
+            target: crate::server::session::instrumentation::TARGET,
+            channel_id = %channel_id,
+            open_tx = %tx_sig,
+            deposit = deposit,
+            "channel opened",
+        );
+
         Ok(Receipt {
             status: crate::protocol::core::ReceiptStatus::Success,
             method: MethodName::from(METHOD_NAME),
@@ -906,6 +927,15 @@ impl SessionMethod {
     /// per-channel race. CAS losers get the winner's cached receipt
     /// bytes back, so two callers at the same cumulative see the same
     /// receipt the network committed to.
+    #[tracing::instrument(
+        name = "session.verify_voucher",
+        level = "debug",
+        skip_all,
+        fields(
+            channel_id = %signed.voucher.channel_id,
+            cumulative_amount = %signed.voucher.cumulative_amount,
+        )
+    )]
     pub async fn verify_voucher(
         &self,
         signed: &crate::protocol::intents::session::SignedVoucher,
@@ -924,6 +954,14 @@ impl SessionMethod {
     /// `Open` on failure or advances to `ClosedPending` on confirm. An
     /// async lift to `ClosedFinalized` runs in the background; the
     /// response goes out at Confirmed.
+    #[tracing::instrument(
+        name = "session.process_close",
+        skip_all,
+        fields(
+            channel_id = %payload.channel_id,
+            branch = tracing::field::Empty,
+        )
+    )]
     pub async fn process_close(
         &self,
         payload: &crate::protocol::intents::session::ClosePayload,
@@ -960,6 +998,14 @@ impl SessionMethod {
     /// actually shows. A chain value above the operator's
     /// `max_deposit` raises `MaxDepositExceeded` with `additional: 0`
     /// to surface that the cap was already breached by another actor.
+    #[tracing::instrument(
+        name = "session.process_topup",
+        skip_all,
+        fields(
+            channel_id = %payload.channel_id,
+            additional_amount = %payload.additional_amount,
+        )
+    )]
     pub async fn process_topup(&self, payload: &TopUpPayload) -> Result<Receipt, SessionError> {
         let cached = self
             .cache
@@ -1195,10 +1241,18 @@ impl SessionMethod {
         encoded: Base64UrlJson,
         description: Option<&str>,
     ) -> Result<PaymentChallenge, SessionError> {
-        // Trailing `None`s match `compute_challenge_id`'s
-        // `expires`/`digest`/`opaque` slots. Sessions don't pin an
-        // expiry into the HMAC input (cache TTL covers that) and
-        // there's no body digest or opaque echo to commit.
+        // Per-call nonce in the `opaque` slot so consecutive calls with
+        // identical encoded bodies still produce distinct ids. Without
+        // it, two 402s issued in the same Solana slot share a blockhash,
+        // hash to the same body, and the cache rejects the duplicate id
+        // with ChallengeAlreadyIssued. The nonce echoes back to the
+        // client via `PaymentChallenge.opaque` so `verify()` can
+        // re-derive the same id.
+        let nonce = rand::random::<u128>();
+        let opaque_value = serde_json::Value::String(format!("{nonce:032x}"));
+        let opaque = Base64UrlJson::from_value(&opaque_value).map_err(|e| {
+            SessionError::InternalError(format!("encode challenge opaque nonce: {e}"))
+        })?;
         let id = compute_challenge_id(
             &self.secret_key,
             &self.realm,
@@ -1207,7 +1261,7 @@ impl SessionMethod {
             encoded.raw(),
             None, // expires
             None, // digest
-            None, // opaque
+            Some(opaque.raw()),
         );
         Ok(PaymentChallenge {
             id,
@@ -1218,7 +1272,7 @@ impl SessionMethod {
             expires: None,
             description: description.map(str::to_string),
             digest: None,
-            opaque: None,
+            opaque: Some(opaque),
         })
     }
 
@@ -1280,35 +1334,46 @@ impl SessionBuilder {
     /// up front instead of finding the store half-mutated after a
     /// crash mid-apply.
     pub async fn recover(self) -> Result<SessionMethod, SessionError> {
-        let store = self.store.ok_or_else(|| {
-            SessionError::InternalError("session builder missing store; call with_store".into())
-        })?;
-        let rpc = self.rpc.ok_or_else(|| {
-            SessionError::InternalError("session builder missing rpc; call with_rpc".into())
-        })?;
-        let recovery = self.recovery;
+        use tracing::Instrument;
 
-        let method =
-            SessionMethod::new_for_recover(self.config, Arc::clone(&store), Arc::clone(&rpc))?;
+        let span = tracing::info_span!(
+            "session.recover",
+            record_count = tracing::field::Empty,
+        );
+        async move {
+            let store = self.store.ok_or_else(|| {
+                SessionError::InternalError("session builder missing store; call with_store".into())
+            })?;
+            let rpc = self.rpc.ok_or_else(|| {
+                SessionError::InternalError("session builder missing rpc; call with_rpc".into())
+            })?;
+            let recovery = self.recovery;
 
-        let outcomes = recover::inspect_all(
-            store.as_ref(),
-            rpc.as_ref(),
-            method.config(),
-            recovery.parallelism,
-        )
-        .await?;
+            let method =
+                SessionMethod::new_for_recover(self.config, Arc::clone(&store), Arc::clone(&rpc))?;
 
-        recover::apply_outcomes(
-            outcomes,
-            store.as_ref(),
-            &rpc,
-            &method,
-            recovery.allow_unsettled_on_startup,
-        )
-        .await?;
+            let outcomes = recover::inspect_all(
+                store.as_ref(),
+                rpc.as_ref(),
+                method.config(),
+                recovery.parallelism,
+            )
+            .await?;
+            tracing::Span::current().record("record_count", outcomes.len());
 
-        Ok(method)
+            recover::apply_outcomes(
+                outcomes,
+                store.as_ref(),
+                &rpc,
+                &method,
+                recovery.allow_unsettled_on_startup,
+            )
+            .await?;
+
+            Ok(method)
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -1595,6 +1660,31 @@ mod tests {
             secret_key: Some("test-secret-key".into()),
         };
         SessionMethod::new_for_recover(config, store, rpc).expect("construct SessionMethod")
+    }
+
+    #[tokio::test]
+    async fn build_challenge_emits_unique_ids_across_calls_with_identical_bodies() {
+        // The challenge cache rejects duplicate ids with
+        // `ChallengeAlreadyIssued`. Two 402s issued in the same Solana
+        // slot share a blockhash, so the encoded request body is byte
+        // identical; `build_challenge` injects a per-call nonce in the
+        // `opaque` slot to keep the derived ids distinct. The nonce
+        // round-trips on the wire so `PaymentChallenge::verify` can
+        // re-derive the same id.
+        let method = dummy_method();
+        let encoded =
+            Base64UrlJson::from_typed(&serde_json::json!({"some": "body"})).expect("encode body");
+        let a = method
+            .build_challenge(encoded.clone(), None)
+            .expect("first challenge");
+        let b = method
+            .build_challenge(encoded, None)
+            .expect("second challenge");
+        assert_ne!(a.id, b.id, "consecutive challenges must not share an id");
+        assert!(a.opaque.is_some(), "opaque nonce must round-trip on the wire");
+        assert!(b.opaque.is_some());
+        assert!(a.verify(&method.secret_key), "challenge id verifies against opaque");
+        assert!(b.verify(&method.secret_key));
     }
 
     #[tokio::test]

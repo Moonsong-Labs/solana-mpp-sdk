@@ -255,7 +255,7 @@ pub(crate) async fn run_verify_voucher(
     // other reads back the cached winner bytes (`Conflict`). A
     // deserialize failure on the conflict branch is a state bug
     // (corrupted cache or schema drift), not a client error.
-    match store
+    let outcome = store
         .advance_watermark(
             &channel_id,
             record.accepted_cumulative,
@@ -264,8 +264,20 @@ pub(crate) async fn run_verify_voucher(
             sig_bytes,
             receipt_bytes,
         )
-        .await?
-    {
+        .await?;
+
+    // Both CAS arms accepted the same `cumulative_amount`. Emit once
+    // before the match so the loser still logs its acceptance even
+    // though it returns the winner's cached receipt to the caller.
+    tracing::info!(
+        target: crate::server::session::instrumentation::TARGET,
+        channel_id = %channel_id,
+        accepted_cumulative = cumulative_amount,
+        spent = spent,
+        "voucher accepted",
+    );
+
+    match outcome {
         AdvanceOutcome::Advanced { prior: _ } => Ok(receipt),
         AdvanceOutcome::Conflict {
             current: _,

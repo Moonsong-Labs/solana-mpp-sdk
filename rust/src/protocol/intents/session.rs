@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ── Voucher ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VoucherData {
     pub channel_id: String,            // base58 Channel PDA
     pub cumulative_amount: String,     // u64 decimal
@@ -33,7 +33,7 @@ pub enum SigType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SignedVoucher {
     pub voucher: VoucherData,
     pub signer: String,                // base58 Ed25519 public key
@@ -271,7 +271,7 @@ pub enum SessionAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OpenPayload {
     pub challenge_id: String,
     pub channel_id: String,
@@ -292,7 +292,7 @@ pub struct OpenPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TopUpPayload {
     // The topup flow binds the on-chain `top_up` to the challenge issued in the
     // prior 402, so a topup not preceded by a fresh challenge is rejected.
@@ -303,7 +303,7 @@ pub struct TopUpPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClosePayload {
     pub challenge_id: String,
     pub channel_id: String,
@@ -418,5 +418,33 @@ mod tests {
         let typed = wire_to_typed(&splits, |m| m).expect("decode");
         let back = typed_to_wire(&typed);
         assert_eq!(back, splits);
+    }
+
+    /// Belt-and-braces against route confusion: `OpenPayload`-shaped JSON
+    /// must not decode as a `ClosePayload` even though both share
+    /// `challengeId` and `channelId`. `deny_unknown_fields` is what makes
+    /// the extra `payer` / `mint` / `transaction` fields hard-fail the
+    /// deserialize, so a client can't smuggle an open payload through
+    /// `/channel/close` and have the handler treat the extras as noise.
+    #[test]
+    fn open_payload_json_does_not_decode_as_close_payload() {
+        let open = serde_json::json!({
+            "challengeId": "ch-1",
+            "channelId": "cid-1",
+            "payer": "pa",
+            "payee": "pe",
+            "mint": "mi",
+            "authorizedSigner": "as",
+            "salt": "1",
+            "bump": 255,
+            "depositAmount": "1000",
+            "distributionSplits": [],
+            "transaction": "tx",
+        });
+        let result: Result<ClosePayload, _> = serde_json::from_value(open);
+        assert!(
+            result.is_err(),
+            "ClosePayload should reject OpenPayload-shaped JSON; got {result:?}"
+        );
     }
 }

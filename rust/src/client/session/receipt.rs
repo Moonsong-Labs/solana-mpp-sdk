@@ -33,7 +33,12 @@ const MAX_RECEIPT_HEADER_LEN: usize = 64 * 1024;
 pub struct SessionReceipt {
     /// Method name, e.g. "solana".
     pub method: String,
-    /// Intent name, e.g. "session".
+    /// Intent name, e.g. "session". Close and voucher receipts omit
+    /// this field on the wire; only session envelopes with an explicit
+    /// intent supply one. Defaults to empty so a missing field doesn't
+    /// fail the parse; callers that care can check
+    /// `receipt.intent.is_empty()`.
+    #[serde(default)]
     pub intent: String,
     /// Channel id the receipt is bound to, base58. Mirrors the
     /// `reference` field on the wire-form receipt.

@@ -9,7 +9,7 @@ repository = "https://github.com/solana-foundation/mpp-sdk"
 
 [features]
 default = ["server", "client"]
-server = []
+server = ["dep:axum", "dep:tower-http"]
 client = ["dep:reqwest"]
 gcp_kms = ["solana-keychain/gcp_kms"]
 # Pull-mode session support via the multi-delegator program. Not supported in v1.
@@ -86,6 +86,11 @@ tokio = { version = "1", features = [
 # HTTP client
 reqwest = { version = "0.12", features = ["json"], optional = true }
 
+# HTTP server. The `serve` helper in `server::session` wires the close-flow
+# routes through axum, with tower-http's TraceLayer on top. Server-only.
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["trace"], optional = true }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -145,9 +150,12 @@ futures = "0.3"
 rand = "0.8"
 
 [dev-dependencies]
-axum = "0.8"
 surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "3dcb436" }
 serial_test = "3"
+
+# Lets the worked examples install an in-process tracing subscriber that
+# surfaces the SDK's structured spans and events on stderr.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # `net` is only needed by the payment_link_server example's TcpListener.
 # Cargo unions these features with the [dependencies] entry above for test
@@ -175,11 +183,24 @@ solana-sdk = { version = "3.0", default-features = false, features = ["full"] }
 litesvm = { version = "0.11", features = ["precompiles"] }
 litesvm-token = "0.11"
 
+# In-process tracing subscriber that captures `tracing` output per test and
+# exposes a `logs_contain` matcher. Used by the L1 oracle that pins the
+# session lifecycle span / event schema. The `no-env-filter` feature drops
+# the default crate-name filter so events emitted by the SDK lib (targets
+# like `mpp::session`) reach the capture buffer.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
+
 # `spl-associated-token-account-client` 2.0 takes/returns `solana_pubkey::Pubkey`
 # at the 2.x major (semver-pinned in its Cargo.toml). Our prod deps pull
 # `solana-pubkey` 3.x; the 2.x line is already in the lockfile transitively, but
 # we need the type in scope at the call site to bridge through bytes.
 solana-pubkey-v2 = { package = "solana-pubkey", version = "2", default-features = false }
+
+# In-process HTTP mock used by the session client's close-flow unit tests.
+# Stubs `/channel/close-challenge` and `/channel/close` against a loopback
+# `MockServer` so the round-trip is exercised without standing up the full
+# `serve` helper.
+wiremock = "0.6"
 
 # Targets that depend on feature-gated modules. Declared
 # explicitly so `cargo test --no-default-features` skips them instead of
@@ -196,6 +217,18 @@ required-features = ["server"]
 
 [[example]]
 name = "payment_link_server"
+required-features = ["server", "client"]
+
+[[example]]
+name = "local_session_demo"
+required-features = ["server", "client"]
+
+[[example]]
+name = "session_server"
+required-features = ["server"]
+
+[[example]]
+name = "http_session_demo"
 required-features = ["server", "client"]
 
 [[test]]
@@ -220,4 +253,8 @@ required-features = ["server"]
 
 [[test]]
 name = "session_l1_recover"
+required-features = ["server"]
+
+[[test]]
+name = "session_l1_tracing"
 required-features = ["server"]

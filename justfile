@@ -273,3 +273,10 @@ l1-oracle-client:
     @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
         (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
     cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_client_roundtrip -- --nocapture
+
+# Run the lifecycle tracing oracle. Pins the span and event schema the
+# session handlers emit; a failure here means operator observability drifted.
+l1-oracle-tracing:
+    @test -f {{REPO_ROOT}}/rust/tests/fixtures/payment_channels.so || \
+        (echo "ERROR: payment_channels.so missing; run 'just fetch-program-binary' first" && exit 1)
+    cd {{REPO_ROOT}}/rust && cargo test --tests --all-features --test session_l1_tracing -- --nocapture

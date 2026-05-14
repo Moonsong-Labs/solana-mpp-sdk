@@ -41,7 +41,8 @@ use crate::protocol::core::{
     base64url_encode, parse_www_authenticate_all, MppErrorCode, PaymentChallenge,
 };
 use crate::protocol::intents::session::{
-    MethodDetails, OpenPayload, SessionAction, SessionRequest, TopUpPayload,
+    ClosePayload, MethodDetails, OpenPayload, SessionAction, SessionRequest, SignedVoucher,
+    TopUpPayload,
 };
 
 /// Default response-body cap. Sized for a session GET that returns a
@@ -93,6 +94,14 @@ pub struct ClientConfig {
 /// merchant-submitted `settle_and_finalize` (and bundled `distribute` when
 /// applicable), and the optional `refunded` amount paid back to the payer
 /// when distribution ran.
+///
+/// A successful 2xx response with no `Payment-Receipt` header still
+/// resolves as `Ok`. The on-chain close has likely landed in that case
+/// (the server returned 2xx after submitting `settle_and_finalize`), so
+/// keeping the cell would point future fetches at a dead channel.
+/// `tx_hash`, `refunded`, and `accepted_cumulative` are `None` and
+/// `raw.status` reads `"unknown"`; callers that need a receipt can re-derive
+/// it from chain state.
 #[derive(Debug, Clone)]
 pub struct CloseReceipt {
     pub channel_id: Pubkey,
@@ -531,40 +540,270 @@ impl MppSessionClient {
             .await
     }
 
-    /// Cooperative close. Drops the cached `(payee, mint)` entry so
-    /// the next `fetch` mints a fresh channel. Returns a synthetic
-    /// `CloseReceipt` for now; the actual `POST /channel/close`
-    /// round-trip lands with the surfpool integration.
+    /// Cooperative close. POSTs `/channel/close-challenge` to obtain a
+    /// fresh close-intent challenge, signs a final voucher when the
+    /// active session has off-chain spend to commit, POSTs
+    /// `/channel/close` with the resulting `ClosePayload`, and forgets
+    /// the registry entry so the next `fetch` mints a fresh channel.
+    ///
+    /// The cell's mutex is held for the full duration. Concurrent
+    /// `fetch` calls against the same cell wait until close returns;
+    /// no more vouchers should be signed against a closing cell anyway,
+    /// and serialising removes a window where a parallel `fetch` could
+    /// advance the watermark between the close challenge and the close
+    /// POST.
+    ///
+    /// Failure semantics:
+    /// * Transport failure or non-2xx response leaves the cell in place
+    ///   so the caller can retry; the watermark is rewound to the
+    ///   pre-sign value when a voucher was signed.
+    /// * 2xx response (with or without a `Payment-Receipt` header) drops
+    ///   the cell. The on-chain `settle_and_finalize` is presumed to
+    ///   have landed; retrying against a stale cell would point at a
+    ///   dead channel.
     ///
     /// Returns `ActiveSessionMissing(channel_id)` when no cell is
-    /// registered for this `channel_id`. The lookup is async because
-    /// it briefly locks each cell to read its channel id; concurrent
-    /// voucher signing on unrelated cells is unaffected.
+    /// registered for this `channel_id`.
     pub async fn close(&self, channel_id: &Pubkey) -> Result<CloseReceipt, ClientError> {
-        let ((payee, mint), _cell) = self
+        let ((payee, mint), cell) = self
             .registry
             .lookup_by_channel_id(channel_id)
             .await
             .ok_or(ClientError::ActiveSessionMissing(*channel_id))?;
 
+        // `tokio::sync::Mutex`, so the guard is `Send` and can span
+        // the HTTP awaits below.
+        let mut guard = cell.lock().await;
+
+        let challenge = self.request_close_challenge(channel_id).await?;
+
+        // Reject challenges that don't bind to this channel. A
+        // mismatched method/intent or a different (or missing)
+        // `method_details.channel_id` means the server handed back a
+        // stale or unrelated challenge; signing against it would commit
+        // a voucher to the wrong session.
+        if challenge.method.as_str() != "solana" {
+            return Err(ClientError::ProtocolViolation(format!(
+                "close challenge mismatch: method={}, expected solana",
+                challenge.method.as_str()
+            )));
+        }
+        if challenge.intent.as_str() != "session" {
+            return Err(ClientError::ProtocolViolation(format!(
+                "close challenge mismatch: intent={}, expected session",
+                challenge.intent.as_str()
+            )));
+        }
+        let session_request = decode_session_request(&challenge)?;
+        let expected_channel_b58 = bs58::encode(channel_id.to_bytes()).into_string();
+        match session_request.method_details.channel_id.as_deref() {
+            Some(actual) if actual == expected_channel_b58 => {}
+            Some(other) => {
+                return Err(ClientError::ProtocolViolation(format!(
+                    "close challenge mismatch: methodDetails.channelId={other}, expected {expected_channel_b58}"
+                )));
+            }
+            None => {
+                return Err(ClientError::ProtocolViolation(
+                    "close challenge mismatch: methodDetails.channelId is missing".into(),
+                ));
+            }
+        }
+
+        // `prior_signed` captures the watermark just before
+        // `sign_close_voucher_if_needed` advanced it; the close POST
+        // below rolls back to it on a non-2xx response, mirroring the
+        // rollback in `charge_against_cell`. `None` means no voucher
+        // was signed (the lock-settled branch), so there's nothing to
+        // roll back.
+        let (signed_voucher, prior_signed) = self
+            .sign_close_voucher_if_needed(&mut guard, &session_request)
+            .await?;
+
+        let payload = ClosePayload {
+            challenge_id: challenge.id.clone(),
+            channel_id: expected_channel_b58.clone(),
+            voucher: signed_voucher,
+        };
+        let body = build_credential_body(&SessionAction::Close(payload))?;
+        let close_url = derive_endpoint_url(&self.server_base_url, EndpointAction::Close);
+        let resp = match self.http.post(close_url).json(&body).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Transport failure: we don't know whether the server
+                // saw the request. Rewind so a retry signs at the same
+                // target instead of climbing past it; the server's
+                // replay protection rejects the duplicate if it did
+                // land.
+                rewind_signed_cumulative_inner(&mut guard, prior_signed);
+                return Err(ClientError::ProtocolViolation(format!("POST close: {e}")));
+            }
+        };
+
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body_bytes = drain_with_cap(resp, self.max_body_bytes, "close").await?;
+        if !status.is_success() {
+            // Rewind so the next retry doesn't double-bump the watermark.
+            rewind_signed_cumulative_inner(&mut guard, prior_signed);
+            return Err(http_error_from(status, &headers, &body_bytes)?);
+        }
+
+        // 2xx: server acknowledged the close, the on-chain
+        // `settle_and_finalize` is presumed landed. Drop the cell
+        // unconditionally below so future fetches don't retry against a
+        // dead channel.
+        let receipt_opt = parse_receipt_from_headers(&headers)?;
+
+        let receipt = match receipt_opt {
+            Some(receipt) => {
+                // Receipt must reference the channel we asked to close.
+                if receipt.reference != expected_channel_b58 {
+                    drop(guard);
+                    self.registry.forget(&payee, &mint);
+                    return Err(ClientError::ProtocolViolation(format!(
+                        "close receipt reference {} does not match channel {expected_channel_b58}",
+                        receipt.reference
+                    )));
+                }
+                // 2xx with an `errorCode` in the receipt extras is the
+                // server signalling failure through the wrong channel.
+                // Trust the typed code over the status line.
+                if let Some(code) = receipt
+                    .extras
+                    .get("errorCode")
+                    .and_then(|v| serde_json::from_value::<MppErrorCode>(v.clone()).ok())
+                {
+                    drop(guard);
+                    self.registry.forget(&payee, &mint);
+                    return Err(ClientError::Http(status, Some(code)));
+                }
+                receipt
+            }
+            None => {
+                // No receipt header on a 2xx. Synthesize a stub with
+                // `status: "unknown"` so callers can tell the merchant
+                // didn't emit one; the close is still presumed landed,
+                // so the watermark stays advanced.
+                SessionReceipt {
+                    method: "solana".into(),
+                    intent: "session".into(),
+                    reference: expected_channel_b58.clone(),
+                    status: "unknown".into(),
+                    accepted_cumulative: None,
+                    spent: None,
+                    tx_hash: None,
+                    extras: serde_json::Map::new(),
+                }
+            }
+        };
+
+        // Release the guard before `forget` so a concurrent caller
+        // hitting the same `(payee, mint)` from a future `fetch`
+        // doesn't block on a doomed cell while we tear it out. No
+        // rollback on the 2xx path: the merchant accepted the
+        // watermark, so the signed cumulative stays committed.
+        drop(guard);
         self.registry.forget(&payee, &mint);
 
+        let refunded = receipt
+            .extras
+            .get("refunded")
+            .and_then(parse_optional_u64_field);
         Ok(CloseReceipt {
             channel_id: *channel_id,
-            tx_hash: None,
-            refunded: None,
-            accepted_cumulative: None,
-            raw: SessionReceipt {
-                method: "solana".into(),
-                intent: "session".into(),
-                reference: bs58::encode(channel_id.to_bytes()).into_string(),
-                status: "pending".into(),
-                accepted_cumulative: None,
-                spent: None,
-                tx_hash: None,
-                extras: serde_json::Map::new(),
-            },
+            tx_hash: receipt.tx_hash.clone(),
+            refunded,
+            accepted_cumulative: receipt.accepted_cumulative,
+            raw: receipt,
         })
+    }
+
+    /// POST `/channel/close-challenge` with the channel id and decode
+    /// the `PaymentChallenge` from the JSON body.
+    async fn request_close_challenge(
+        &self,
+        channel_id: &Pubkey,
+    ) -> Result<PaymentChallenge, ClientError> {
+        let url = derive_endpoint_url(&self.server_base_url, EndpointAction::CloseChallenge);
+        let body = serde_json::json!({
+            "channelId": bs58::encode(channel_id.to_bytes()).into_string(),
+        });
+        let resp = self
+            .http
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ClientError::ProtocolViolation(format!("POST close-challenge: {e}")))?;
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = drain_with_cap(resp, self.max_body_bytes, "close-challenge").await?;
+        if !status.is_success() {
+            return Err(http_error_from(status, &headers, &bytes)?);
+        }
+        serde_json::from_slice::<PaymentChallenge>(&bytes).map_err(|e| {
+            ClientError::ProtocolViolation(format!("close-challenge JSON decode: {e}"))
+        })
+    }
+
+    /// Sign a final voucher when `signed_cumulative > 0`, otherwise
+    /// return `(None, None)` and let the server take the lock-settled
+    /// branch. On the apply-voucher path the second tuple element is
+    /// the watermark recorded just before `sign_voucher` advanced it,
+    /// for the caller to roll back if the close POST fails.
+    ///
+    /// Takes a borrowed guard so the caller keeps the cell lock across
+    /// the surrounding HTTP round-trips.
+    async fn sign_close_voucher_if_needed(
+        &self,
+        guard: &mut tokio::sync::MutexGuard<'_, (OpenedChannel, ActiveSession)>,
+        session_request: &SessionRequest,
+    ) -> Result<(Option<SignedVoucher>, Option<u64>), ClientError> {
+        let current_signed = guard.1.signed_cumulative();
+        if current_signed == 0 {
+            return Ok((None, None));
+        }
+
+        // Reapply server caps so the close voucher's TTL and delta
+        // floor match the server's advertised values from this
+        // challenge.
+        let resolved = self
+            .policy
+            .apply_server_caps(&session_request.method_details)?;
+
+        // Floor the bump at 1; a server-advertised
+        // `min_voucher_delta = 0` would otherwise not produce a
+        // strictly-monotonic watermark.
+        let bump = resolved.min_voucher_delta.max(1);
+        let expires_at = compute_expires_at(resolved.voucher_ttl_seconds);
+        let target = current_signed
+            .checked_add(bump)
+            .ok_or(ClientError::VoucherArithmeticOverflow)?;
+        let voucher = guard.1.sign_voucher(target, expires_at).await?;
+        Ok((Some(voucher), Some(current_signed)))
+    }
+}
+
+/// Restore `signed_cumulative` to `prior` against a held guard;
+/// no-op when `prior` is `None`.
+fn rewind_signed_cumulative_inner(
+    guard: &mut tokio::sync::MutexGuard<'_, (OpenedChannel, ActiveSession)>,
+    prior: Option<u64>,
+) {
+    if let Some(prior) = prior {
+        guard.1.set_signed_cumulative(prior);
+    }
+}
+
+/// Parse a `serde_json::Value` as a `u64`. The server emits
+/// `refunded` as a decimal string; some clients may produce it as an
+/// integer. Both shapes parse; anything else returns `None`.
+fn parse_optional_u64_field(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.as_u64(),
+        _ => None,
     }
 }
 
@@ -678,6 +917,13 @@ fn build_credential_body(action: &SessionAction) -> Result<serde_json::Value, Cl
 enum EndpointAction {
     Open,
     TopUp,
+    Close,
+    /// `POST /channel/close-challenge` returns a fresh `PaymentChallenge`
+    /// bound to the close intent for a known channel id. The open and
+    /// voucher flows get their challenge from a 402 on the metered GET;
+    /// close hits a known channel directly, so the SDK asks for one
+    /// here.
+    CloseChallenge,
 }
 
 impl EndpointAction {
@@ -685,6 +931,8 @@ impl EndpointAction {
         match self {
             EndpointAction::Open => "open",
             EndpointAction::TopUp => "topup",
+            EndpointAction::Close => "close",
+            EndpointAction::CloseChallenge => "close-challenge",
         }
     }
 }
@@ -829,6 +1077,8 @@ mod tests {
     use solana_keychain::MemorySigner;
     use solana_sdk::signature::Keypair;
     use tokio::sync::Mutex;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::client::session::policy::ClientPolicy;
     use crate::protocol::core::types::Base64UrlJson;
@@ -1076,6 +1326,381 @@ mod tests {
         for c in &cells[1..] {
             assert!(Arc::ptr_eq(&first, c), "all callers share the same cell");
         }
+    }
+
+    /// Pin the close URLs so an accidental rename of `EndpointAction`
+    /// variants surfaces here rather than in a live HTTP miss.
+    #[test]
+    fn endpoint_action_close_paths_are_stable() {
+        let base = "https://merchant.example";
+        assert_eq!(
+            derive_endpoint_url(base, EndpointAction::Close),
+            "https://merchant.example/channel/close"
+        );
+        assert_eq!(
+            derive_endpoint_url(base, EndpointAction::CloseChallenge),
+            "https://merchant.example/channel/close-challenge"
+        );
+    }
+
+    /// Build a client pointed at a wiremock server with a registered
+    /// cell for a fresh `(payee, mint)`, seeded to the supplied
+    /// `signed_cumulative` and `deposit`.
+    async fn fixture_with_cell(
+        server_base_url: String,
+        signed_cumulative: u64,
+        deposit: u64,
+    ) -> (MppSessionClient, Pubkey, Pubkey, Pubkey, Arc<dyn SolanaSigner>) {
+        let payee = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let channel_id = Pubkey::new_unique();
+        let kp = Keypair::new();
+        let signer: Arc<dyn SolanaSigner> =
+            Arc::new(MemorySigner::from_bytes(&kp.to_bytes()).expect("signer"));
+
+        let mut active = ActiveSession::new(channel_id, signer.clone(), 0, deposit);
+        if signed_cumulative > 0 {
+            active
+                .sign_voucher(signed_cumulative, None)
+                .await
+                .expect("seed voucher signs");
+        }
+        let opened = OpenedChannel {
+            channel_id,
+            payee,
+            mint,
+            deposit,
+            splits: vec![],
+            authorized_signer: signer.pubkey(),
+            salt: 0,
+            canonical_bump: 254,
+            program_id: Pubkey::new_from_array([0xA0u8; 32]),
+            expires_at: None,
+        };
+        let registry = Arc::new(SessionRegistry::new());
+        registry
+            .get_or_open(&payee, &mint, move || async move { Ok((opened, active)) })
+            .await
+            .expect("seed cell inserts");
+
+        let client = MppSessionClient {
+            http: reqwest::Client::new(),
+            rpc: stub_rpc(),
+            signer: signer.clone(),
+            program: Pubkey::new_from_array([0xA0u8; 32]),
+            policy: ClientPolicy::default(),
+            registry,
+            server_base_url,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        };
+        (client, payee, mint, channel_id, signer)
+    }
+
+    /// Build a close-challenge JSON body the merchant will emit
+    /// verbatim. Mirrors `build_challenge_for_close` output shape.
+    fn close_challenge_json(channel_id: &Pubkey) -> serde_json::Value {
+        let payee = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let mut request = sample_request("0", &payee, &mint);
+        request.method_details.channel_id =
+            Some(bs58::encode(channel_id.to_bytes()).into_string());
+        request.method_details.min_voucher_delta = Some("1".into());
+        let raw = Base64UrlJson::from_value(
+            &serde_json::to_value(&request).expect("session request encodes"),
+        )
+        .expect("base64url encodes");
+        serde_json::to_value(PaymentChallenge::new(
+            "close-ch-1", "MPP Payment", "solana", "session", raw,
+        ))
+        .expect("challenge serializes")
+    }
+
+    /// Build a `Receipt` header value the merchant returns on a
+    /// successful close. Matches the server-side `Receipt::success`
+    /// shape with close-specific extras attached.
+    fn close_receipt_header(channel_id: &Pubkey, accepted: u64, refunded: u64) -> String {
+        let receipt = crate::protocol::core::Receipt::success(
+            crate::protocol::core::MethodName::from("solana"),
+            bs58::encode(channel_id.to_bytes()).into_string(),
+            "close-ch-1",
+        )
+        .with_voucher_amounts(accepted, accepted)
+        .with_close_amounts("close-tx-sig-1", refunded);
+        receipt.to_header().expect("receipt encodes")
+    }
+
+    /// Mount the happy-path close-challenge mock so the follow-up
+    /// `POST /channel/close` has something to consume. `.expect(1)`
+    /// asserts the close flow hits the challenge endpoint exactly once
+    /// per close.
+    async fn mount_close_challenge_mock(server: &MockServer, channel_id: &Pubkey) {
+        Mock::given(method("POST"))
+            .and(path("/channel/close-challenge"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(close_challenge_json(channel_id)),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// Build a `Receipt` header value carrying `status: "error"` and
+    /// a typed `errorCode` in extras. The wire `ReceiptStatus` enum
+    /// only carries `Success`, so the error branch goes out as a
+    /// free-form JSON string and the client surfaces the typed
+    /// `errorCode` via the receipt's `extras` flatten.
+    fn error_receipt_header_with_code(channel_id: &Pubkey, code: &str) -> String {
+        let value = serde_json::json!({
+            "status": "error",
+            "method": "solana",
+            "timestamp": "2026-05-12T00:00:00Z",
+            "reference": bs58::encode(channel_id.to_bytes()).into_string(),
+            "challengeId": "close-ch-1",
+            "errorCode": code,
+        });
+        let bytes = serde_json_canonicalizer::to_string(&value).expect("jcs");
+        crate::protocol::core::base64url_encode(bytes.as_bytes())
+    }
+
+    #[tokio::test]
+    async fn close_round_trip_with_voucher_populates_receipt() {
+        let server = MockServer::start().await;
+        let (client, _payee, _mint, channel_id, _signer) =
+            fixture_with_cell(server.uri(), 500, 10_000).await;
+
+        mount_close_challenge_mock(&server, &channel_id).await;
+
+        Mock::given(method("POST"))
+            .and(path("/channel/close"))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                "Payment-Receipt",
+                close_receipt_header(&channel_id, 501, 9_499).as_str(),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let receipt = client.close(&channel_id).await.expect("close succeeds");
+
+        assert_eq!(receipt.channel_id, channel_id);
+        assert_eq!(receipt.tx_hash.as_deref(), Some("close-tx-sig-1"));
+        assert_eq!(receipt.refunded, Some(9_499));
+        assert_eq!(receipt.accepted_cumulative, Some(501));
+        // Cell dropped on success: a second close against the same
+        // channel must surface `ActiveSessionMissing`.
+        assert!(matches!(
+            client.close(&channel_id).await,
+            Err(ClientError::ActiveSessionMissing(missing)) if missing == channel_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn close_with_zero_cumulative_omits_voucher() {
+        let server = MockServer::start().await;
+        let (client, _payee, _mint, channel_id, _signer) =
+            fixture_with_cell(server.uri(), 0, 10_000).await;
+
+        mount_close_challenge_mock(&server, &channel_id).await;
+
+        // Body matcher pins the wire shape: matching `channelId` and
+        // `challengeId`. `build_credential_body` strips the `action`
+        // tag (the route already encodes the action), so the bare
+        // `ClosePayload` is what hits the wire. `body_partial_json`
+        // doesn't enforce absence, so the missing `voucher` is checked
+        // explicitly against the recorded request below.
+        let close_path = "/channel/close";
+        Mock::given(method("POST"))
+            .and(path(close_path))
+            .and(body_partial_json(serde_json::json!({
+                "channelId": bs58::encode(channel_id.to_bytes()).into_string(),
+                "challengeId": "close-ch-1",
+            })))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                "Payment-Receipt",
+                close_receipt_header(&channel_id, 0, 10_000).as_str(),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.close(&channel_id).await.expect("close succeeds");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("requests recorded");
+        let close_post = requests
+            .iter()
+            .find(|r| r.url.path() == close_path)
+            .expect("close POST recorded");
+        let body: serde_json::Value =
+            serde_json::from_slice(&close_post.body).expect("body parses");
+        assert!(
+            body.get("voucher").is_none(),
+            "close POST must omit voucher on zero-cumulative path, body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_error_response_surfaces_typed_code_and_keeps_cell() {
+        let server = MockServer::start().await;
+        let (client, payee, mint, channel_id, _signer) =
+            fixture_with_cell(server.uri(), 500, 10_000).await;
+
+        mount_close_challenge_mock(&server, &channel_id).await;
+
+        Mock::given(method("POST"))
+            .and(path("/channel/close"))
+            .respond_with(ResponseTemplate::new(400).insert_header(
+                "Payment-Receipt",
+                error_receipt_header_with_code(&channel_id, "challengeExpired").as_str(),
+            ))
+            .mount(&server)
+            .await;
+
+        match client.close(&channel_id).await {
+            Ok(_) => panic!("error response must surface as ClientError"),
+            Err(ClientError::Http(status, Some(code))) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(code, MppErrorCode::ChallengeExpired);
+            }
+            Err(other) => panic!("expected Http(_, Some(code)), got {other:?}"),
+        }
+
+        // Cell stays in the registry so the caller can retry.
+        assert!(
+            client.registry.lookup(&payee, &mint).is_some(),
+            "failed close must leave the cell in place for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_against_unknown_channel_returns_active_session_missing() {
+        let kp = Keypair::new();
+        let signer: Arc<dyn SolanaSigner> =
+            Arc::new(MemorySigner::from_bytes(&kp.to_bytes()).expect("signer"));
+        let client = MppSessionClient {
+            http: reqwest::Client::new(),
+            rpc: stub_rpc(),
+            signer,
+            program: Pubkey::new_from_array([0xA0u8; 32]),
+            policy: ClientPolicy::default(),
+            registry: Arc::new(SessionRegistry::new()),
+            server_base_url: "http://unused.invalid".into(),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        };
+        let bogus = Pubkey::new_unique();
+        match client.close(&bogus).await {
+            Ok(_) => panic!("close against unknown channel must reject"),
+            Err(ClientError::ActiveSessionMissing(missing)) => {
+                assert_eq!(missing, bogus);
+            }
+            Err(other) => panic!("expected ActiveSessionMissing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_rejects_malformed_challenge_body() {
+        let server = MockServer::start().await;
+        let (client, payee, mint, channel_id, _signer) =
+            fixture_with_cell(server.uri(), 500, 10_000).await;
+
+        Mock::given(method("POST"))
+            .and(path("/channel/close-challenge"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"not": "a challenge"})),
+            )
+            .mount(&server)
+            .await;
+
+        match client.close(&channel_id).await {
+            Err(ClientError::ProtocolViolation(msg)) => {
+                assert!(
+                    msg.contains("close-challenge"),
+                    "expected close-challenge decode error, got {msg}"
+                );
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
+        }
+
+        assert!(
+            client.registry.lookup(&payee, &mint).is_some(),
+            "malformed challenge must leave the cell in place for retry"
+        );
+    }
+
+    /// 2xx with no `Payment-Receipt` header: client drops the cell
+    /// and returns a stub `CloseReceipt` with `status: "unknown"`,
+    /// since the on-chain `settle_and_finalize` is presumed landed.
+    #[tokio::test]
+    async fn close_2xx_without_receipt_header_drops_cell_and_returns_stub() {
+        let server = MockServer::start().await;
+        let (client, payee, mint, channel_id, _signer) =
+            fixture_with_cell(server.uri(), 500, 10_000).await;
+
+        mount_close_challenge_mock(&server, &channel_id).await;
+
+        Mock::given(method("POST"))
+            .and(path("/channel/close"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let receipt = client
+            .close(&channel_id)
+            .await
+            .expect("missing-header 2xx is treated as success");
+
+        assert_eq!(receipt.channel_id, channel_id);
+        assert!(receipt.tx_hash.is_none());
+        assert!(receipt.refunded.is_none());
+        assert!(receipt.accepted_cumulative.is_none());
+        assert_eq!(receipt.raw.status, "unknown");
+        assert_eq!(
+            receipt.raw.reference,
+            bs58::encode(channel_id.to_bytes()).into_string()
+        );
+
+        assert!(
+            client.registry.lookup(&payee, &mint).is_none(),
+            "2xx close must drop the cell even without a receipt header"
+        );
+    }
+
+    /// 2xx with an `errorCode` in receipt extras: status line says
+    /// success but the typed code says otherwise. Client surfaces the
+    /// error and still drops the cell, since the channel state is no
+    /// longer salvageable either way.
+    #[tokio::test]
+    async fn close_2xx_with_error_code_receipt_surfaces_as_error() {
+        let server = MockServer::start().await;
+        let (client, payee, mint, channel_id, _signer) =
+            fixture_with_cell(server.uri(), 500, 10_000).await;
+
+        mount_close_challenge_mock(&server, &channel_id).await;
+
+        Mock::given(method("POST"))
+            .and(path("/channel/close"))
+            .respond_with(ResponseTemplate::new(200).insert_header(
+                "Payment-Receipt",
+                error_receipt_header_with_code(&channel_id, "challengeExpired").as_str(),
+            ))
+            .mount(&server)
+            .await;
+
+        match client.close(&channel_id).await {
+            Err(ClientError::Http(status, Some(code))) => {
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(code, MppErrorCode::ChallengeExpired);
+            }
+            other => panic!("expected Http(OK, Some(ChallengeExpired)), got {other:?}"),
+        }
+
+        assert!(
+            client.registry.lookup(&payee, &mint).is_none(),
+            "2xx-with-error-code drops the cell: the channel state is gone on chain"
+        );
     }
 
     fn stub_rpc() -> Arc<dyn MppRpcClient> {
