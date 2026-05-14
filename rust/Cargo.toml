@@ -223,6 +223,10 @@ required-features = ["server", "client"]
 name = "session_server"
 required-features = ["server"]
 
+[[example]]
+name = "http_session_demo"
+required-features = ["server", "client"]
+
 [[test]]
 name = "charge_integration"
 required-features = ["server", "client"]
